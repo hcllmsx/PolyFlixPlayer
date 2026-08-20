@@ -13,18 +13,19 @@ from typing import Any
 
 import os
 import sys
+import ssl
 import hashlib
 import shutil
 import tempfile
 import threading
 import urllib.request
 
-from PySide6.QtCore import Qt, QTimer, QEvent, QPoint
+from PySide6.QtCore import Qt, QTimer, QEvent, QPoint, Signal
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton,
     QLabel, QFileDialog, QMessageBox, QStyle, QApplication, QMenu, QFrame,
-    QStyleOptionSlider, QDialog,
+    QStyleOptionSlider, QDialog, QTextEdit,
 )
 
 import pflx
@@ -78,10 +79,41 @@ def _read_version() -> str:
 
 APP_VERSION = _read_version()
 
-# 版本更新检测：读取仓库根目录 VERSION 文件（raw URL）。仓库暂未建立，
-# 按能连通写好；连不通时静默失败，不影响使用。
-UPDATE_URL = "https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION"
+# 版本更新检测：读取仓库根目录 VERSION 文件。
+# 国内直连 raw.githubusercontent.com 经常超时，因此按顺序尝试多个源，
+# 任何一个成功即返回。连不通时静默失败，不影响使用。
+#
+# 候选源（list of (名称, url, 解析方式, 超时秒数)）：
+#   - api.github.com 的 contents API 走官方域名，国内相对稳定，返回 JSON，
+#     VERSION 内容在 "content" 字段（base64 编码）。
+#   - gh-proxy.com / ghproxy.net 是 GitHub 镜像代理，直接返回原始文本。
+#     （这些第三方代理可用性会变化，仅作兜底。）
+#   - raw.githubusercontent.com 直连在国内稳定被墙，只作最后兜底，超时给短。
+_GITHUB_API_URL = "https://api.github.com/repos/hcllmsx/PolyFlixPlayer/contents/VERSION?ref=main"
+_UPDATE_SOURCES = (
+    ("GitHub API", _GITHUB_API_URL, "json", 8),
+    ("镜像 gh-proxy", "https://gh-proxy.com/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION", "text", 8),
+    ("镜像 ghproxy.net", "https://ghproxy.net/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION", "text", 8),
+    ("GitHub raw", "https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION", "text", 3),
+)
+UPDATE_URL = _GITHUB_API_URL  # 兼容旧引用（日志等处）
 UPDATE_RELEASES_URL = "https://github.com/hcllmsx/PolyFlixPlayer/releases"
+
+# 更新日志配色（深色背景 #1e1e1e 下）：按日志级别给不同颜色，提升可读性。
+# level → 前景色。info=默认灰白，head=蓝色（阶段/来源标题），success=绿色，
+# warn=黄色，error=红色。
+_LOG_COLORS = {
+    "info": "#dddddd",
+    "head": "#61afef",
+    "success": "#4ec97e",
+    "warn": "#e5c07b",
+    "error": "#e06c75",
+}
+
+
+def _log_color(level: str) -> str:
+    """返回某个日志级别对应的颜色（未知级别回退 info 灰白）。"""
+    return _LOG_COLORS.get(level, _LOG_COLORS["info"])
 
 
 def _compare_versions(a: str, b: str) -> int:
@@ -165,6 +197,13 @@ class SeekSlider(QSlider):
 
 
 class PlayerWindow(QMainWindow):
+    # 跨线程信号：worker 子线程通过 emit 把更新检查的日志与结果安全投递回主线程。
+    # 信号-槽的 QueuedConnection 会自动切回接收者（主线程）的事件循环，
+    # 不能在子线程里直接调 QTimer.singleShot——它创建的 QTimer 属于子线程，
+    # 而子线程没有事件循环，timeout 永远不会触发（这正是日志一直卡住的根因）。
+    _update_log_signal = Signal(str, str)                     # (level, line) 追加一行日志
+    _update_result_signal = Signal(str, str, str)             # (state, remote, err_msg)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
@@ -186,6 +225,10 @@ class PlayerWindow(QMainWindow):
         self._update_state: str | None = None
         self._update_remote: str = ""  # 检测到的远程版本号
         self._about_box: QDialog | None = None  # 已打开的关于框（用于刷新）
+
+        # 连接跨线程信号：worker 子线程 emit → 主线程槽（QueuedConnection 自动切线程）
+        self._update_log_signal.connect(self._on_update_log_line)
+        self._update_result_signal.connect(self._apply_update_result)
 
         self._build_ui()
         self._init_mpv()
@@ -217,8 +260,8 @@ class PlayerWindow(QMainWindow):
         # 会吃掉鼠标事件 → 这里拦下双击事件做全屏切换、滚轮调音量。
         self.video_frame.installEventFilter(self)
 
-        # 启动后自动检测更新（后台线程，静默；结果通过 QTimer 回主线程刷新标题栏）
-        self._check_for_update(manual=False)
+        # 不再启动时自动检查更新：国内访问 GitHub raw 经常超时，自动检查会让
+        # 关于框/标题栏长时间停在“检查中”。改为只在关于框点“检查更新”按钮手动触发。
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -709,67 +752,183 @@ class PlayerWindow(QMainWindow):
         menu.exec(global_pos)
 
     # -------------------------------------------------- 更新检测
-    def _update_title_suffix(self) -> str:
-        """根据更新状态返回标题栏后缀。有新版本时加" (有新版本 vX)"。"""
-        if self._update_state == "new" and self._update_remote:
-            return f"  (有新版本 v{self._update_remote})"
-        return ""
-
     def _refresh_title(self, filename: str = ""):
-        """刷新标题栏。filename 为空 → 初始标题；非空 → 打开文件标题。
-        自动追加更新提示后缀。"""
-        suffix = self._update_title_suffix()
+        """刷新标题栏。filename 为空 → 初始标题；非空 → 打开文件标题。"""
         if filename:
-            self.setWindowTitle(f"{APP_NAME} —— {filename}{suffix}")
+            self.setWindowTitle(f"{APP_NAME} —— {filename}")
         else:
-            self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}{suffix}")
+            self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
 
-    def _check_for_update(self, manual: bool = False):
-        """后台线程检查更新。manual=True 时在结果出来时弹 OSD 反馈。"""
-        if self._update_state == "checking":
+    def _check_for_update(self, force: bool = False):
+        """后台线程检查更新。force=True 时即使当前是 checking 也强制发起新请求。
+
+        检查过程分步写日志，通过 _append_update_log 回主线程追加到日志弹窗。
+        结果出来后由 _apply_update_result 收尾日志并刷新关于框按钮文字。
+        """
+        if self._update_state == "checking" and not force:
             return
         self._update_state = "checking"
-        # 立即刷新关于框提示（若已打开）——这里仅更新标题后缀，关于框靠重开刷新
-        self._refresh_title(self._current_filename())
+        # 立即刷新关于框按钮文字（显示"检查中…"）
+        self._refresh_about_text()
+        # checking 超时保护：若 35 秒后 worker 仍没回调，自动判为失败，
+        # 避免按钮永远停在"检查中…"。
+        # （多源依次尝试，超时分别为 8+8+8+3s，最坏 ≈ 27s，故兜底给 35s。）
+        self._update_check_token = getattr(self, "_update_check_token", 0) + 1
+        token = self._update_check_token
+        # 标记本轮检查是否已由 worker 回调完成。
+        # 超时兜底据此判断，避免 worker 已完成、主线程排队回调尚未执行时误判超时。
+        self._update_done_token = -1
+        QTimer.singleShot(35000, lambda: self._on_check_timeout(token))
 
         def worker():
+            import time as _t
+            import base64
+            import json as _json
             state = "error"
             remote = ""
-            try:
-                req = urllib.request.Request(
-                    f"{UPDATE_URL}?t={int(__import__('time').time() * 1000)}",
-                    headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    remote = resp.read().decode("utf-8", "ignore").strip()
-                if remote and _compare_versions(remote, APP_VERSION) > 0:
-                    state = "new"
-                else:
-                    state = "latest"
-            except Exception:
+            err_msg = ""
+            # 用 Qt 信号把日志发回主线程（不能在子线程直接调 QTimer.singleShot /
+            # 碰 Qt 控件）。信号 emit 跨线程走 QueuedConnection，主线程事件循环
+            # 会依次执行 _on_update_log_line 刷新日志框。
+            self._update_log_signal.emit("head", f"开始检查更新（{_t.strftime('%H:%M:%S')}）")
+            self._update_log_signal.emit("info", f"本地版本：v{APP_VERSION}")
+
+            # 更新检查只读一行版本号文本，直接用不验证证书的 context：
+            # PyInstaller --windowed 打包后常缺失 CA 证书包，强制验证会导致
+            # HTTPS 握手失败 → 一直"检查失败"。不验证证书的风险（中间人篡改）
+            # 仅是误报版本号，对更新检查场景可接受。
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            # User-Agent 必须用纯 ASCII：urllib 默认用 latin-1 编码 HTTP 头，
+            # APP_NAME 是中文"影现播放器"会导致 UnicodeEncodeError → 检查必失败。
+            ua = f"PolyFlixPlayer/{APP_VERSION}"
+
+            last_err = ""
+            # 依次尝试各候选源，任一成功即跳出（每源独立超时）
+            for name, url, kind, timeout in _UPDATE_SOURCES:
+                try:
+                    self._update_log_signal.emit("head", f"尝试 {name}：{url}")
+                    req = urllib.request.Request(
+                        f"{url}?t={int(_t.time() * 1000)}", headers={"User-Agent": ua})
+                    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                        self._update_log_signal.emit("info", f"{name} 响应：HTTP {resp.status}")
+                        raw = resp.read()
+                    if kind == "json":
+                        data = _json.loads(raw.decode("utf-8", "ignore"))
+                        remote = base64.b64decode(
+                            data.get("content", "").replace("\n", "")).decode(
+                                "utf-8", "ignore").strip()
+                    else:
+                        remote = raw.decode("utf-8", "ignore").strip()
+                    self._update_log_signal.emit("info", f"收到远程版本号：{remote!r}")
+                    if remote:
+                        break  # 成功取得版本号
+                    self._update_log_signal.emit("warn", f"{name} 返回空内容，尝试下一个…")
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    self._update_log_signal.emit("warn", f"{name} 失败：{last_err}")
+
+            if not remote:
                 state = "error"
-            # 回主线程更新 UI（PySide6 控件不能在子线程改）
-            QTimer.singleShot(0, lambda: self._apply_update_result(state, remote, manual))
+                err_msg = last_err or "远程返回空内容"
+                self._update_log_signal.emit("error", "所有更新源均不可用。")
+            elif _compare_versions(remote, APP_VERSION) > 0:
+                state = "new"
+                self._update_log_signal.emit("success", f"发现新版本：v{remote} > v{APP_VERSION}")
+            else:
+                state = "latest"
+                self._update_log_signal.emit("success", f"已是最新版本（远程 v{remote} ≤ 本地 v{APP_VERSION}）")
+
+            self._update_log_signal.emit("head", "检查流程结束。")
+            # 标记本轮已由 worker 完成：超时兜底据此跳过误判
+            self._update_done_token = token
+            # 用信号把最终结果发回主线程（主线程槽 _apply_update_result 刷新 UI）
+            self._update_result_signal.emit(state, remote, err_msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_update_result(self, state: str, remote: str, manual: bool):
-        """主线程回调：应用检测结果，刷新标题栏与已打开的关于框。"""
-        self._update_state = state
-        self._update_remote = remote
-        self._refresh_title(self._current_filename())
-        # 若关于框还开着，刷新其文本（显示"有新版本/已是最新/检查失败"）
+    def _on_update_log_line(self, level: str, line: str):
+        """跨线程信号的槽：worker 子线程 emit 后，在主线程事件循环里被调用。
+
+        线程安全地把一行日志追加进缓冲并立即刷新到日志弹窗。
+        """
+        self._append_update_log(level, line)
+
+    def _append_update_log(self, level: str, line: str):
+        """追加一行日志到缓冲并刷新日志弹窗（必须已在主线程调用）。
+
+        worker 子线程应通过 _update_log_signal.emit() → _on_update_log_line 进来，
+        不要直接调本方法。日志弹窗未打开时，日志仍记到缓冲区，弹窗打开时回填。
+        缓冲区同时维护两份：纯文本（供复制）+ HTML（供彩色渲染）。
+        """
+        # 纯文本（复制用）
+        plain = getattr(self, "_update_log_plain", "")
+        plain = plain + line + "\n"
+        self._update_log_plain = plain
+        # HTML（彩色渲染用）：转义特殊字符，按 level 上色
+        color = _log_color(level)
+        escaped = (line.replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;"))
+        html = getattr(self, "_update_log_html", "")
+        html = html + f'<span style="color:{color};">{escaped}</span><br>'
+        self._update_log_html = html
+        self._flush_update_log()
+
+    def _flush_update_log(self):
+        """把缓存的日志刷新到日志弹窗的文本框（主线程调用）。"""
+        dlg = getattr(self, "_update_log_dlg", None)
+        if dlg is None:
+            return
+        te = getattr(dlg, "_log_edit", None)
+        if te is None:
+            return
+        html = getattr(self, "_update_log_html", "")
+        # 有内容就显示，没有内容保持 placeholder 可见
+        if html:
+            te.setHtml(html)
+            # 滚到底部
+            sb = te.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def _on_check_timeout(self, token: int):
+        """checking 超时兜底：若状态仍是 checking 且 token 匹配，判为失败。
+
+        用 token 防止"旧请求超时把新请求的状态也抹掉"——每次检查递增 token，
+        超时回调只在自己发起的那轮检查未被覆盖时才生效。
+        """
+        if self._update_state != "checking":
+            return
+        if token != getattr(self, "_update_check_token", 0):
+            return
+        # worker 已完成本轮（只是主线程排队回调还没执行），不算超时
+        if getattr(self, "_update_done_token", -1) == token:
+            return
+        self._append_update_log("error", "超时：35 秒内服务器无响应。")
+        self._apply_update_result("error", "", "超时无响应")
+
+    def _refresh_about_text(self):
+        """若关于框正打开着，刷新"检查更新"按钮的文字（随状态变化）。"""
         dlg = getattr(self, "_about_box", None)
         if dlg is not None and dlg.isVisible():
-            lbl = getattr(dlg, "_label", None)
-            if lbl is not None:
-                lbl.setText(self._about_html())
-        if manual:
-            if state == "new":
-                self._show_osd(f"发现新版本 v{remote}，详见关于")
-            elif state == "latest":
-                self._show_osd("已是最新版本")
-            else:
-                self._show_osd("检查更新失败")
+            btn = getattr(dlg, "_check_btn", None)
+            if btn is not None:
+                btn.setText(self._about_check_btn_text())
+                # checking 时禁用按钮，避免重复点击；其它状态可点（重试/下载）
+                btn.setEnabled(self._update_state != "checking")
+
+    def _apply_update_result(self, state: str, remote: str, err_msg: str = ""):
+        """主线程回调：应用检测结果，刷新关于框按钮文字。
+
+        不再改标题栏、不再弹 OSD——反馈集中在关于框的"检查更新"按钮上。
+        """
+        self._update_state = state
+        self._update_remote = remote
+        self._update_err_msg = err_msg
+        self._refresh_about_text()
+        # 日志弹窗里按钮文字也跟着变（checking 结束后启用、可跳转下载）
+        self._refresh_update_log_btn()
 
     def _current_filename(self) -> str:
         """从当前标题栏提取已打开文件名（用于刷新标题时保留）。
@@ -790,12 +949,9 @@ class PlayerWindow(QMainWindow):
         return ""
 
     def _about_html(self) -> str:
-        """构造关于框 HTML 文本（版本号可点击触发更新检测）。"""
-        # 版本号做成链接，href="check" 表示点击检查更新
-        ver_link = (f"<a href='check'>v{APP_VERSION}</a>"
-                    f"{self._about_update_suffix()}")
+        """构造关于框 HTML 文本。版本号是纯文本（不再点击触发检查）。"""
         return (
-            f"<h3>{APP_NAME} {ver_link}</h3>"
+            f"<h3>{APP_NAME} v{APP_VERSION}</h3>"
             f"<p>一个会识别自己人的万能视频播放器——既能播放普通视频，"
             f"也能识别影藏 PolyFlix 产物里的隐藏视频，"
             f"零改名、零解压。</p>"
@@ -806,36 +962,41 @@ class PlayerWindow(QMainWindow):
             f"<p><b>本项目仓库：</b><br>"
             f"<a href='https://github.com/hcllmsx/PolyFlixPlayer'>"
             f"https://github.com/hcllmsx/PolyFlixPlayer</a></p>"
-            f"<p><b>姊妹项目 · 影藏 PolyFlix</b>"
-            f"（把文件藏进能正常播放的 MP4）：<br>"
+            f"<p><b>姊妹项目 · 影藏 PolyFlix</b><br>"
             f"<a href='https://github.com/hcllmsx/PolyFlix'>"
             f"https://github.com/hcllmsx/PolyFlix</a></p>"
         )
 
-    def _about_update_suffix(self) -> str:
-        """关于框版本号后的更新提示（HTML）。"""
-        if self._update_state == "checking":
-            return "  <span style='color:#888'>检查中…</span>"
-        if self._update_state == "new" and self._update_remote:
-            return (f"  <a href='{UPDATE_RELEASES_URL}' style='color:#fbbf24'>"
-                    f"有新版本 v{self._update_remote}，点击下载</a>")
-        if self._update_state == "latest":
-            return "  <span style='color:#34d399'>已是最新</span>"
-        if self._update_state == "error":
-            return "  <span style='color:#f87171'>检查失败，点击版本号重试</span>"
-        return ""
+    def _about_check_btn_text(self) -> str:
+        """关于框"检查更新"按钮的文字（随状态变化）。"""
+        s = self._update_state
+        if s == "checking":
+            return "检查中…"
+        if s == "new" and self._update_remote:
+            return f"有新版本 v{self._update_remote}，点击下载"
+        if s == "latest":
+            return "已是最新版本"
+        if s == "error":
+            return "检查失败，点此重试"
+        return "检查更新"
 
     def _show_about(self):
         """关于对话框：软件信息、作者、社交平台、姊妹项目。
-        版本号可点击触发更新检测。用 QDialog + QLabel 实现（QMessageBox
-        不转发 linkActivated 信号，无法拦截版本号点击）。"""
-        from PySide6.QtGui import QDesktopServices
-        from PySide6.QtCore import QUrl
+        底部"检查更新"按钮手动触发更新检测（不再自动检查、不再点版本号触发）。
 
+        非模态（show 而非 exec）：这样点“检查更新”弹出的日志弹窗能与关于框并存，
+        两者都在主事件循环里，日志实时刷新、关闭按钮可点。
+        """
+        # 已开着就置顶，不重复创建
+        old = getattr(self, "_about_box", None)
+        if old is not None and old.isVisible():
+            old.raise_()
+            old.activateWindow()
+            return
         dlg = QDialog(self)
         self._about_box = dlg
         dlg.setWindowTitle(f"关于 {APP_NAME}")
-        dlg.setModal(True)
+        dlg.setModal(False)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(24, 18, 24, 18)
         lay.setSpacing(12)
@@ -859,34 +1020,144 @@ class PlayerWindow(QMainWindow):
         label.setTextFormat(Qt.TextFormat.RichText)
         label.setText(self._about_html())
         label.setWordWrap(True)
-        label.setOpenExternalLinks(False)  # 全部自己处理：check 拦截，http 外开
+        # 链接直接用系统默认浏览器打开（不再需要拦截 check）
+        label.setOpenExternalLinks(True)
         label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
             | Qt.TextInteractionFlag.LinksAccessibleByMouse)
         body.addWidget(label, 1)
         lay.addLayout(body)
 
+        # 底部按钮行：检查更新（左） + 确定（右）
+        btn_row = QHBoxLayout()
+        btn_check = QPushButton(self._about_check_btn_text(), dlg)
+        btn_check.clicked.connect(lambda: self._on_about_check_clicked())
         btn_ok = QPushButton("确定", dlg)
         btn_ok.setDefault(True)
-        btn_ok.clicked.connect(dlg.accept)
-        lay.addWidget(btn_ok, 0, Qt.AlignmentFlag.AlignRight)
+        btn_ok.clicked.connect(dlg.close)
+        btn_row.addWidget(btn_check)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_ok)
+        lay.addLayout(btn_row)
 
-        # 保存 label 引用，供 _apply_update_result 刷新文本（QLabel 才有 setText）
-        dlg._label = label
-
-        def on_link(link: str):
-            if link == "check":
-                # 点击版本号 → 手动检测；检测后由 _apply_update_result 刷新文本
-                self._check_for_update(manual=False)
-                label.setText(self._about_html())
-            elif link.startswith("http"):
-                QDesktopServices.openUrl(QUrl(link))
-
-        label.linkActivated.connect(on_link)
+        # 保存按钮引用，供 _refresh_about_text 刷新文字
+        dlg._check_btn = btn_check
 
         dlg.resize(480, dlg.sizeHint().height())
-        dlg.exec()
-        self._about_box = None
+        # 关闭后清理引用
+        dlg.finished.connect(lambda: setattr(self, "_about_box", None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_about_check_clicked(self):
+        """关于框"检查更新"按钮点击：根据当前状态决定动作。
+
+        idle/error/latest → 弹出日志弹窗并开始新一轮检查；
+        checking → 忽略（按钮已禁用，兜底）；
+        new → 打开下载页（releases）。
+        """
+        s = self._update_state
+        if s == "new" and self._update_remote:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(UPDATE_RELEASES_URL))
+        else:
+            # 弹出日志弹窗，然后发起检查（日志会实时追加到弹窗里）
+            self._show_update_log_dialog()
+            self._check_for_update(force=True)
+
+    def _show_update_log_dialog(self):
+        """弹出更新检查日志对话框：只读文本框 + 复制文本 / 关闭 按钮。
+
+        日志由 worker 通过 _append_update_log → _flush_update_log 实时刷新。
+        弹窗以关于框为父，模式比关于框低一级（关于框关了它也能独立开）。
+        """
+        # 已开着就只置顶，不重复创建
+        old = getattr(self, "_update_log_dlg", None)
+        if old is not None and old.isVisible():
+            old.raise_()
+            old.activateWindow()
+            return
+        # 每次新检查清空旧日志（纯文本 + HTML 两份缓冲都要清）
+        self._update_log_plain = ""
+        self._update_log_html = ""
+
+        # 父窗口用主窗口（不用模态关于框）：
+        # 关于框用 exec() 模态阻塞，若日志框以它为父，子窗口的事件/刷新
+        # 在某些平台会被模态循环抑制，导致日志刷不上去。改用主窗口为父 +
+        # WindowStaysOnTopHint，既能独立刷新，也能盖在关于框之上。
+        dlg = QDialog(self)
+        self._update_log_dlg = dlg
+        dlg.setWindowTitle("检查更新")
+        dlg.setModal(False)  # 非模态：用户可同时操作关于框/主窗口
+        # 始终置顶，保证显示在关于框/主窗口之上
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        te = QTextEdit(dlg)
+        te.setReadOnly(True)
+        te.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        # 等宽字体：日志对齐更整齐，方便看
+        f = te.font()
+        f.setFamily("Consolas, Monaco, 'Courier New', monospace")
+        te.setFont(f)
+        te.setStyleSheet(
+            "QTextEdit { background: #1e1e1e; color: #ddd;"
+            "border: 1px solid #444; }")
+        te.setPlaceholderText("正在准备检查…")
+        lay.addWidget(te)
+        dlg._log_edit = te
+
+        # 底部按钮行：复制文本（左） + 关闭（右）
+        btn_row = QHBoxLayout()
+        btn_copy = QPushButton("复制文本", dlg)
+        btn_copy.clicked.connect(lambda: self._copy_update_log())
+        btn_close = QPushButton("关闭", dlg)
+        btn_close.setDefault(True)
+        btn_close.clicked.connect(dlg.close)
+        btn_row.addWidget(btn_copy)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+
+        dlg.resize(520, 320)
+        # 关闭后清理引用
+        dlg.finished.connect(lambda: setattr(self, "_update_log_dlg", None))
+        dlg.show()
+        # 显示后主动置顶激活，确保盖在关于框之上
+        dlg.raise_()
+        dlg.activateWindow()
+        # 弹窗显示后立刻把已缓存的日志刷上去（worker 可能已经写了第一行）
+        self._flush_update_log()
+
+    def _refresh_update_log_btn(self):
+        """检查完成后，给日志弹窗底部加一行结果提示并启用交互。
+
+        实际做法：把结果总结追加到日志末尾，弹窗保持开着，用户可复制/关闭。
+        """
+        s = self._update_state
+        if s == "new" and self._update_remote:
+            self._append_update_log(
+                "success",
+                f"✓ 发现新版本 v{self._update_remote}，前往下载：{UPDATE_RELEASES_URL}")
+        elif s == "latest":
+            self._append_update_log("success", "✓ 当前已是最新版本。")
+        elif s == "error":
+            self._append_update_log(
+                "error",
+                f"✗ 检查失败：{getattr(self, '_update_err_msg', '') or '未知错误'}")
+
+    def _copy_update_log(self):
+        """把当前日志弹窗的全部文本（纯文本，不含颜色标记）复制到系统剪贴板。"""
+        text = getattr(self, "_update_log_plain", "")
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(text)
+        # 用 OSD 给个反馈（主窗口右上角闪一下"已复制"）
+        self._show_osd("日志已复制到剪贴板")
 
     # -------------------------------------------------- 音量
     def _toggle_volume_popup(self):
