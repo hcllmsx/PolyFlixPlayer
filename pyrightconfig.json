@@ -1,0 +1,17 @@
+{
+    // 关闭对"运行无影响、且在混合类型 dict（如 PflxInfo=dict[str, Any]）场景下不可避免"的严格告警。
+    // 这些规则不影响程序正确性，仅类型严谨度偏好。
+    "typeCheckingMode": "strict",
+    "reportExplicitAny": "none",
+    "reportAny": "none",
+    // 第三方库（PySide6 / mpv）缺少类型存根导致的系统性噪音
+    "reportUnknownMemberType": "none",
+    "reportUnknownVariableType": "none",
+    "reportUnknownParameterType": "none",
+    "reportUnknownArgumentType": "none",
+    "reportUnknownCallable": "none",
+    "reportMissingTypeStubs": "none",
+    "reportMissingModuleSource": "none",
+    "reportUnusedCallResult": "none",
+    "reportImplicitStringConcatenation": "none"
+}

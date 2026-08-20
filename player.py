@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import os
 import sys
 import hashlib
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 import pflx
+from pflx import PflxInfo
 
 # python-mpv 通过 %PATH% 搜索 libmpv-2.dll：把脚本所在目录注入 PATH，
 # 实现" dll 与脚本同目录即可用"（官方文档推荐做法）。
@@ -107,10 +110,10 @@ VIDEO_EXTS = " ".join("*." + e for e in (
 ))
 
 
-def extract_hidden(path: str) -> tuple[str, pflx.__dict__] | tuple[None, dict | None]:
+def extract_hidden(path: str) -> tuple[str, PflxInfo] | tuple[None, dict[str, Any] | None]:
     """若是影藏产物，抽取隐藏视频到临时目录，返回 (临时文件路径, scan信息)。
     不是产物返回 (None, None)。"""
-    info = pflx.scan(path)
+    info: PflxInfo | None = pflx.scan(path)
     if info is None:
         return None, None
     if info["encrypted"]:
@@ -122,7 +125,7 @@ def extract_hidden(path: str) -> tuple[str, pflx.__dict__] | tuple[None, dict | 
     tag = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:12]
     # 隐藏视频格式未知，先不带扩展名交给 mpv（mpv 按内容探测）；带 .bin 避免被当普通文本
     tmp = os.path.join(PLAYER_TEMP_DIR, f"pflx_{tag}.bin")
-    pflx.extract_payload(path, tmp, info)
+    _ = pflx.extract_payload(path, tmp, info)
     return tmp, info
 
 
@@ -174,10 +177,10 @@ class PlayerWindow(QMainWindow):
         self.mpv = None
         self.playing_source = ""      # 当前播放的文件（产物 → 临时文件）
         self.product_source = ""      # 打开的原始产物路径（用于导出/提示）
-        self.product_info: dict | None = None
+        self.product_info: PflxInfo | None = None
         self._has_media = False        # 是否已载入可播放的媒体（空格/Enter/双击只在载入后响应）
         self._fullscreen_controls_hidden = False  # 全屏时控制条是否已藏起
-        self._track_lists: dict = {}  # 缓存轨道信息（audio/sub），按需刷新
+        self._track_lists: dict[str, Any] = {}  # 缓存轨道信息（audio/sub），按需刷新
         self._volume_popup: QFrame | None = None  # 音量弹出面板
         # 更新检测状态：None=未检测/idle, "checking", "new"(新版本), "latest", "error"
         self._update_state: str | None = None
@@ -478,6 +481,7 @@ class PlayerWindow(QMainWindow):
             return
 
         if hidden_path is not None:
+            assert info is not None
             self.product_source = path
             self.product_info = info
             self.btn_export.setVisible(True)

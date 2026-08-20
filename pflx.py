@@ -34,6 +34,15 @@ from __future__ import annotations
 import os
 import struct
 import zlib
+from typing import Any, Callable
+
+
+# 进度回调类型：(已处理字节数, 总字节数) -> None
+ProgressCallback = Callable[[int, int], None]
+
+
+# 各解析/构建函数返回的 dict 结构（键固定，值类型混合，故用 Any）
+PflxInfo = dict[str, Any]
 
 # ---- 格式常量（两个项目共用，修改须同步 PolyFlixPlayer/pflx.py） ----
 MAGIC = b"PFLX"
@@ -97,7 +106,8 @@ def free_box_total_size(payload_len: int, name: str | None = None) -> int:
 
 
 def write_free_box(src_path: str, out_path: str, flags: int = 0,
-                   name: str | None = None, progress=None) -> dict:
+                   name: str | None = None,
+                   progress: ProgressCallback | None = None) -> PflxInfo:
     """把 src_path 的全部字节封装成 free box 写入 out_path（流式，内存恒定）。
 
     out 文件布局：box 头（8/16 字节）+ PFLX 头（22 + name_len 字节）+ 载荷。
@@ -113,27 +123,27 @@ def write_free_box(src_path: str, out_path: str, flags: int = 0,
     with open(src_path, "rb") as src, open(out_path, "wb") as out:
         # box 头：size + 'free'（超 4GB 时 size=1 + largesize）
         if box_size <= _LARGE_SIZE_THRESHOLD:
-            out.write(struct.pack(">I4s", box_size, _BOX_TYPE_FREE))
+            _ = out.write(struct.pack(">I4s", box_size, _BOX_TYPE_FREE))
         else:
-            out.write(struct.pack(">I4sQ", 1, _BOX_TYPE_FREE, box_size))
+            _ = out.write(struct.pack(">I4sQ", 1, _BOX_TYPE_FREE, box_size))
         # PFLX 头（crc 先占位，两遍不行——载荷可能极大，所以 CRC 边写边算，
         # 但头部必须在载荷前面，因此先把 crc 字段置 0，写完载荷后 seek 回去补写）
         header_pos = out.tell()
-        out.write(make_header(payload_len, 0, flags, name))
+        _ = out.write(make_header(payload_len, 0, flags, name))
         # 流式拷贝载荷并计算 CRC
         done = 0
         while True:
             chunk = src.read(8 * 1024 * 1024)
             if not chunk:
                 break
-            out.write(chunk)
+            _ = out.write(chunk)
             crc = zlib.crc32(chunk, crc)
             done += len(chunk)
             if progress:
                 progress(done, payload_len)
         # 回补真实 CRC
-        out.seek(header_pos)
-        out.write(make_header(payload_len, crc, flags, name))
+        _ = out.seek(header_pos)
+        _ = out.write(make_header(payload_len, crc, flags, name))
 
     return {
         "box_size": box_size,
@@ -147,7 +157,7 @@ def write_free_box(src_path: str, out_path: str, flags: int = 0,
 # --------------------------------------------------------------------------- #
 # 解析（影现播放器侧使用；影藏侧用它做产物检测）
 # --------------------------------------------------------------------------- #
-def scan(path: str) -> dict | None:
+def scan(path: str) -> PflxInfo | None:
     """扫描 MP4 顶层 box 链，定位 PFLX 载荷。
 
     返回：
@@ -231,9 +241,9 @@ def scan(path: str) -> dict | None:
                                 "file_size": file_size,
                             }
                     # 普通 free box（无 PFLX 魔数）→ 跳过，继续扫
-                    f.seek(offset + box_size)
+                    _ = f.seek(offset + box_size)
                 else:
-                    f.seek(offset + box_size)
+                    _ = f.seek(offset + box_size)
                 offset += box_size
     except OSError:
         return None
@@ -249,7 +259,7 @@ def is_pflx_product(path: str) -> bool:
     return info["payload_offset"] + info["payload_len"] <= info["file_size"]
 
 
-def verify_payload_crc(path: str, info: dict | None = None) -> bool:
+def verify_payload_crc(path: str, info: PflxInfo | None = None) -> bool:
     """流式校验载荷 CRC32（播放器打开产物时可选用，大文件耗时与全盘读取相当）。"""
     if info is None:
         info = scan(path)
@@ -257,22 +267,24 @@ def verify_payload_crc(path: str, info: dict | None = None) -> bool:
         return False
     crc = 0
     remaining = info["payload_len"]
+    payload_offset = info["payload_offset"]
+    crc32_expected = info["crc32"]
     with open(path, "rb") as f:
-        f.seek(info["payload_offset"])
+        _ = f.seek(payload_offset)
         while remaining > 0:
             chunk = f.read(min(8 * 1024 * 1024, remaining))
             if not chunk:
                 return False
             crc = zlib.crc32(chunk, crc)
             remaining -= len(chunk)
-    return (crc & 0xFFFFFFFF) == info["crc32"]
+    return (crc & 0xFFFFFFFF) == crc32_expected
 
 
 # --------------------------------------------------------------------------- #
 # 导出（影现播放器的"导出隐藏视频"功能；测试也用它验证往返一致性）
 # --------------------------------------------------------------------------- #
-def extract_payload(path: str, dest_path: str, info: dict | None = None,
-                    progress=None) -> dict:
+def extract_payload(path: str, dest_path: str, info: PflxInfo | None = None,
+                    progress: ProgressCallback | None = None) -> PflxInfo:
     """把 PFLX 载荷原样抽出到 dest_path（流式）。返回统计 dict。"""
     if info is None:
         info = scan(path)
@@ -281,21 +293,24 @@ def extract_payload(path: str, dest_path: str, info: dict | None = None,
     if info["payload_offset"] + info["payload_len"] > info["file_size"]:
         raise ValueError("载荷长度与文件大小不符，文件可能已损坏")
     remaining = info["payload_len"]
+    payload_offset = info["payload_offset"]
+    crc32_expected = info["crc32"]
     crc = 0
     with open(path, "rb") as src, open(dest_path, "wb") as out:
-        src.seek(info["payload_offset"])
+        _ = src.seek(payload_offset)
         done = 0
         while remaining > 0:
             chunk = src.read(min(8 * 1024 * 1024, remaining))
             if not chunk:
                 raise ValueError("读取提前结束，文件可能已损坏")
-            out.write(chunk)
+            _ = out.write(chunk)
             crc = zlib.crc32(chunk, crc)
             remaining -= len(chunk)
             done += len(chunk)
             if progress:
                 progress(done, info["payload_len"])
-    if (crc & 0xFFFFFFFF) != info["crc32"]:
-        raise ValueError(f"CRC32 校验失败（读得 {crc & 0xFFFFFFFF:08x}，"
-                         f"应为 {info['crc32']:08x}），文件可能已损坏")
+    if (crc & 0xFFFFFFFF) != crc32_expected:
+        raise ValueError(
+            f"CRC32 校验失败（读得 {crc & 0xFFFFFFFF:08x}，应为 {info['crc32']:08x}），文件可能已损坏"
+        )
     return {"payload_len": info["payload_len"], "crc32": crc & 0xFFFFFFFF}
