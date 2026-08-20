@@ -1,0 +1,53 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== PyInstaller 打包产物 =====
+build/
+dist/
+*.spec
+
+# ===== 运行/测试临时文件 =====
+_temp/
+test_*.py
+*.mp4
+*.mkv
+*.flv
+*.webm
+*.avi
+*.mov
+*.bin
+
+# ===== libmpv 运行时依赖（体积大，用户自行下载） =====
+libmpv-2.dll
+libmpv*.dll
+libmpv*.dll.a
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 项目内部脚本（不入库） =====
+1-dev_run.bat
+2-build_run.bat
+build_exe.py
+make_zip.py
+version_info.txt
+CLAUDE.md
