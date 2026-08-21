@@ -84,19 +84,19 @@ APP_VERSION = _read_version()
 # 任何一个成功即返回。连不通时静默失败，不影响使用。
 #
 # 候选源（list of (名称, url, 解析方式, 超时秒数)）：
-#   - api.github.com 的 contents API 走官方域名，国内相对稳定，返回 JSON，
-#     VERSION 内容在 "content" 字段（base64 编码）。
+#   - raw.githubusercontent.com 是 GitHub 官方 CDN，直接返回纯文本版本号，
+#     限流宽松、比 contents API 稳定；放在第一源。
 #   - gh-proxy.com / ghproxy.net 是 GitHub 镜像代理，直接返回原始文本。
 #     （这些第三方代理可用性会变化，仅作兜底。）
-#   - raw.githubusercontent.com 直连在国内稳定被墙，只作最后兜底，超时给短。
-_GITHUB_API_URL = "https://api.github.com/repos/hcllmsx/PolyFlixPlayer/contents/VERSION?ref=main"
+# 注：原先用 api.github.com 的 contents API（返回 base64 JSON），但匿名
+# 请求易触发 GitHub 限流，限流时故意返回 404 而非 403，造成误报；故弃用。
+_RAW_URL = "https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION"
 _UPDATE_SOURCES = (
-    ("GitHub API", _GITHUB_API_URL, "json", 8),
+    ("GitHub raw", _RAW_URL, "text", 8),
     ("镜像 gh-proxy", "https://gh-proxy.com/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION", "text", 8),
     ("镜像 ghproxy.net", "https://ghproxy.net/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION", "text", 8),
-    ("GitHub raw", "https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION", "text", 3),
 )
-UPDATE_URL = _GITHUB_API_URL  # 兼容旧引用（日志等处）
+UPDATE_URL = _RAW_URL  # 兼容旧引用（日志等处）
 UPDATE_RELEASES_URL = "https://github.com/hcllmsx/PolyFlixPlayer/releases"
 
 # 更新日志配色（深色背景 #1e1e1e 下）：按日志级别给不同颜色，提升可读性。
