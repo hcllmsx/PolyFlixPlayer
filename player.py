@@ -107,6 +107,7 @@ _LOG_COLORS = {
     "head": "#61afef",
     "success": "#4ec97e",
     "warn": "#e5c07b",
+    "new": "#e06c75",      # 发现新版本：醒目红，与"已是最新"绿色区分
     "error": "#e06c75",
 }
 
@@ -838,7 +839,7 @@ class PlayerWindow(QMainWindow):
                 self._update_log_signal.emit("error", "所有更新源均不可用。")
             elif _compare_versions(remote, APP_VERSION) > 0:
                 state = "new"
-                self._update_log_signal.emit("success", f"发现新版本：v{remote} > v{APP_VERSION}")
+                self._update_log_signal.emit("new", f"发现新版本：v{remote} > v{APP_VERSION}")
             else:
                 state = "latest"
                 self._update_log_signal.emit("success", f"已是最新版本（远程 v{remote} ≤ 本地 v{APP_VERSION}）")
@@ -1222,7 +1223,7 @@ class PlayerWindow(QMainWindow):
         s = self._update_state
         if s == "new" and self._update_remote:
             self._append_update_log(
-                "success",
+                "new",
                 f"✓ 发现新版本 v{self._update_remote}，前往下载：{UPDATE_RELEASES_URL}")
         elif s == "latest":
             self._append_update_log("success", "✓ 当前已是最新版本。")
