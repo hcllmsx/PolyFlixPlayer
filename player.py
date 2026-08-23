@@ -256,12 +256,11 @@ class PlayerWindow(QMainWindow):
         for w in (self.btn_open, self.btn_play, self.btn_export, self.btn_mute,
                   self.btn_speed, self.btn_audio, self.btn_sub, self.slider):
             w.setFocusPolicy(Qt.NoFocus)
-        # video_frame 装事件过滤器：mpv 通过 wid 直接渲染进它的原生窗口，
         # 会吃掉鼠标事件 → 这里拦下双击事件做全屏切换、滚轮调音量。
         self.video_frame.installEventFilter(self)
 
-        # 不再启动时自动检查更新：国内访问 GitHub raw 经常超时，自动检查会让
-        # 关于框/标题栏长时间停在“检查中”。改为只在关于框点“检查更新”按钮手动触发。
+        # 启动后自动在后台无感检查更新（失败/已是最新无需提醒，发现新版本才弹窗+改标题）
+        QTimer.singleShot(1000, lambda: self._check_for_update(silent=True))
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -754,13 +753,15 @@ class PlayerWindow(QMainWindow):
     # -------------------------------------------------- 更新检测
     def _refresh_title(self, filename: str = ""):
         """刷新标题栏。filename 为空 → 初始标题；非空 → 打开文件标题。"""
+        suf = f"  (有新版本 v{self._update_remote})" if self._update_state == "new" and self._update_remote else ""
         if filename:
-            self.setWindowTitle(f"{APP_NAME} —— {filename}")
+            self.setWindowTitle(f"{APP_NAME} —— {filename}{suf}")
         else:
-            self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+            self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}{suf}")
 
-    def _check_for_update(self, force: bool = False):
+    def _check_for_update(self, force: bool = False, silent: bool = False):
         """后台线程检查更新。force=True 时即使当前是 checking 也强制发起新请求。
+        silent=True 时为自动无感检查（不弹日志框，失败或最新不提示，发现新版本才弹窗并改标题）。
 
         检查过程分步写日志，通过 _append_update_log 回主线程追加到日志弹窗。
         结果出来后由 _apply_update_result 收尾日志并刷新关于框按钮文字。
@@ -768,6 +769,7 @@ class PlayerWindow(QMainWindow):
         if self._update_state == "checking" and not force:
             return
         self._update_state = "checking"
+        self._update_is_silent = silent
         # 立即刷新关于框按钮文字（显示"检查中…"）
         self._refresh_about_text()
         # checking 超时保护：若 35 秒后 worker 仍没回调，自动判为失败，
@@ -919,16 +921,95 @@ class PlayerWindow(QMainWindow):
                 btn.setEnabled(self._update_state != "checking")
 
     def _apply_update_result(self, state: str, remote: str, err_msg: str = ""):
-        """主线程回调：应用检测结果，刷新关于框按钮文字。
-
-        不再改标题栏、不再弹 OSD——反馈集中在关于框的"检查更新"按钮上。
-        """
+        """主线程回调：应用检测结果，刷新关于框按钮文字与新版本提示。"""
         self._update_state = state
         self._update_remote = remote
         self._update_err_msg = err_msg
         self._refresh_about_text()
         # 日志弹窗里按钮文字也跟着变（checking 结束后启用、可跳转下载）
         self._refresh_update_log_btn()
+
+        # 发现新版本：刷新标题栏，并弹出新版本提示弹窗
+        if state == "new" and remote:
+            self._refresh_title(self._current_filename())
+            self._show_new_version_dialog(remote)
+
+    def _show_new_version_dialog(self, remote: str):
+        """弹出发现新版本提示对话框。"""
+        old = getattr(self, "_new_ver_dlg", None)
+        if old is not None and old.isVisible():
+            old.raise_()
+            old.activateWindow()
+            return
+
+        dlg = QDialog(self)
+        self._new_ver_dlg = dlg
+        dlg.setWindowTitle("发现新版本")
+        dlg.setModal(False)
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(16)
+
+        # 头部：图标 + 标题
+        header_lay = QHBoxLayout()
+        header_lay.setSpacing(16)
+
+        if getattr(self, "_logo_sq_pix", None) is not None and not self._logo_sq_pix.isNull():
+            logo = QLabel(dlg)
+            pix = self._logo_sq_pix.scaled(
+                64, 64, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            logo.setPixmap(pix)
+            logo.setFixedSize(64, 64)
+            logo.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            header_lay.addWidget(logo, 0, Qt.AlignmentFlag.AlignTop)
+
+        info_label = QLabel(dlg)
+        info_label.setTextFormat(Qt.TextFormat.RichText)
+        info_label.setText(
+            f"<h3 style='margin:0 0 8px 0;'>发现新版本</h3>"
+            f"<p style='margin:0 0 6px 0; color:#bbb;'>当前版本：v{APP_VERSION} &nbsp;➔&nbsp; "
+            f"最新版本：<b style='color:#4ec97e;'>v{remote}</b></p>"
+            f"<p style='margin:0; color:#888; font-size:12px;'>"
+            f"{APP_NAME} 发布了新版本，建议前往下载更新以体验最新特性与优化。</p>"
+        )
+        info_label.setWordWrap(True)
+        header_lay.addWidget(info_label, 1)
+        lay.addLayout(header_lay)
+
+        # 底部按钮行：稍后（次按钮） + 前往下载（主按钮）
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+
+        btn_later = QPushButton("稍后", dlg)
+        btn_later.clicked.connect(dlg.close)
+        btn_row.addWidget(btn_later)
+
+        btn_download = QPushButton("前往下载", dlg)
+        btn_download.setDefault(True)
+        btn_download.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: #fff; font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1d4ed8; }"
+        )
+
+        def _on_download():
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(UPDATE_RELEASES_URL))
+            dlg.close()
+
+        btn_download.clicked.connect(_on_download)
+        btn_row.addWidget(btn_download)
+
+        lay.addLayout(btn_row)
+
+        dlg.resize(420, dlg.sizeHint().height())
+        dlg.finished.connect(lambda: setattr(self, "_new_ver_dlg", None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _current_filename(self) -> str:
         """从当前标题栏提取已打开文件名（用于刷新标题时保留）。

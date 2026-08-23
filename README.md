@@ -1,6 +1,7 @@
 # 影现播放器 PolyFlixPlayer
 
-影藏 [PolyFlix](https://github.com/hcllmsx/PolyFlix) 的姊妹项目 —— 一个"会识别自己人"的万能视频播放器。
+影藏 [PolyFlix](https://github.com/hcllmsx/PolyFlix) 的姊妹项目 —— 一个"会识别自己人"的万能视频播放器（桌面端）。
+移动端版本请参见：[PolyFlixPlayer-Mobile](https://github.com/hcllmsx/PolyFlixPlayer-Mobile)（基于 Flutter + media_kit）。
 
 ## 它做什么
 
