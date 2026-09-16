@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../utils/platform_utils.dart';
 
@@ -72,7 +74,7 @@ abstract final class UpdateChecker {
   }
 }
 
-class ForceUpdateDialog extends StatelessWidget {
+class ForceUpdateDialog extends StatefulWidget {
   const ForceUpdateDialog({
     super.key,
     required this.remoteVersion,
@@ -83,8 +85,50 @@ class ForceUpdateDialog extends StatelessWidget {
   final String currentVersion;
 
   @override
+  State<ForceUpdateDialog> createState() => _ForceUpdateDialogState();
+}
+
+class _ForceUpdateDialogState extends State<ForceUpdateDialog> {
+  /// 是否处于"复制兜底"状态：系统浏览器打开发布页失败时，退回复制地址到
+  /// 剪贴板，并临时把按钮文字换成复制成功的反馈。
+  bool _copyFallback = false;
+  Timer? _resetTimer;
+
+  /// 「前往下载」：优先调用系统默认浏览器直接打开发布页；
+  /// 打开失败（无默认浏览器关联、被拦截等）才退回复制地址。
+  ///
+  /// 反馈不能走 SnackBar：本弹窗挂在 Navigator 的 root overlay 上，蒙版
+  /// 层级天然高于 ScaffoldMessenger 的 SnackBar（Windows / Android 一致），
+  /// 提示会被黑色蒙版盖住，所以反馈直接画在按钮文字上。
+  Future<void> _openDownload() async {
+    final uri = Uri.parse(UpdateChecker.releaseUrl);
+    var opened = false;
+    try {
+      opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      opened = false;
+    }
+    if (opened || !mounted) return;
+
+    Clipboard.setData(ClipboardData(text: UpdateChecker.releaseUrl));
+    setState(() => _copyFallback = true);
+    _resetTimer?.cancel();
+    _resetTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _copyFallback = false);
+    });
+  }
+
+  @override
+  void dispose() {
+    _resetTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final remoteVersion = widget.remoteVersion;
+    final currentVersion = widget.currentVersion;
 
     return PopScope(
       canPop: false,
@@ -153,13 +197,8 @@ class ForceUpdateDialog extends StatelessWidget {
               const SizedBox(width: 12),
               Expanded(
                 child: FilledButton(
-                  onPressed: () {
-                    Clipboard.setData(const ClipboardData(text: UpdateChecker.releaseUrl));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('已复制最新版本下载地址到剪贴板。')),
-                    );
-                  },
-                  child: const Text('前往下载'),
+                  onPressed: _openDownload,
+                  child: Text(_copyFallback ? '已复制地址 ✓' : '前往下载'),
                 ),
               ),
             ],
