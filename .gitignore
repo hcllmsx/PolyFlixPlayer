@@ -1,53 +1,123 @@
-# ===== Python =====
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
+# 本地构建脚本（仅在本机使用，不纳入版本管理）
+1-run_menu.bat
+build_menu.ps1
+flutter-apk.lnk
 
-# ===== 虚拟环境 =====
-.venv/
-venv/
-env/
-
-# ===== PyInstaller 打包产物 =====
-build/
-dist/
-*.spec
-
-# ===== 运行/测试临时文件 =====
-_temp/
-test_*.py
-*.mp4
-*.mkv
-*.flv
-*.webm
-*.avi
-*.mov
-*.bin
-
-# ===== libmpv 运行时依赖（体积大，用户自行下载） =====
-libmpv-2.dll
-libmpv*.dll
-libmpv*.dll.a
-
-# ===== IDE / 编辑器 =====
-.vscode/
-.idea/
+# Miscellaneous
+*.class
+*.log
+*.pyc
 *.swp
-*.swo
-*~
-
-# ===== 系统文件 =====
 .DS_Store
 Thumbs.db
-desktop.ini
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+_temp/
+bugreport*.zip
 
-# ===== 项目内部脚本（不入库） =====
-1-dev_run.bat
-2-build_run.bat
-build_exe.py
-make_zip.py
-version_info.txt
-CLAUDE.md
+
+/ios/
+
+
+# Desktop platforms
+# Windows 为受支持的桌面平台，工程需纳入版本管理（勿忽略）。
+/macos/
+/linux/
+
+# IntelliJ / Android Studio related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Visual Studio Code
+.vscode/
+
+# Flutter / Dart / Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+build/
+**/build/
+dist/
+**/dist/
+/coverage/
+
+# Android related
+**/android/**/gradle-wrapper.jar
+**/android/.gradle/
+**/android/.kotlin/
+**/android/captures/
+**/android/local.properties
+**/android/**/[gG]enerated[pP]lugin[rR]egistrant.*
+**/android/key.properties
+*.jks
+*.keystore
+**/android/**/build/
+.cxx/
+
+# iOS / macOS related
+**/ios/**/*.mode1v3
+**/ios/**/*.mode2v3
+**/ios/**/*.moved-aside
+**/ios/**/*.pbxuser
+**/ios/**/*.perspectivev3
+**/ios/**/*sync/
+**/ios/**/.sconsign.dblite
+**/ios/**/.tags*
+**/ios/**/.vagrant/
+**/ios/**/DerivedData/
+**/ios/**/Icon?
+**/ios/**/Pods/
+**/ios/**/.symlinks/
+**/ios/**/profile
+**/ios/**/xcuserdata
+**/ios/.generated/
+**/ios/Flutter/App.framework
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/app.flx
+**/ios/Flutter/app.zip
+**/ios/Flutter/flutter_assets/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/ServiceDefinitions.json
+**/ios/Runner/[gG]enerated[pP]lugin[rR]egistrant.*
+
+# macOS specific
+**/macos/Flutter/ephemeral/
+**/macos/Flutter/[gG]enerated[pP]lugin[rR]egistrant.*
+**/macos/Pods/
+
+# Windows specific
+**/windows/flutter/ephemeral/
+**/windows/flutter/[gG]enerated[pP]lugin[rR]egistrant.*
+**/windows/flutter/generated_plugins.cmake
+
+# Linux specific
+**/linux/flutter/ephemeral/
+**/linux/flutter/[gG]enerated[pP]lugin[rR]egistrant.*
+**/linux/flutter/generated_plugins.cmake
+
+# Exceptions to above rules
+!**/android/gradlew
+!**/android/gradlew.bat
+!**/android/**/gradle-wrapper.jar
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Widget Preview related
+.widget_preview/
