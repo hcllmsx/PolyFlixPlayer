@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
 import '../utils/native_file_helper.dart';
@@ -72,6 +73,27 @@ class _SettingsPageState extends State<SettingsPage> {
       i++;
     }
     return '${val.toStringAsFixed(val < 10 && i > 0 ? 2 : 1)} ${suffixes[i]}';
+  }
+
+  /// 打开"建议反馈"问卷（腾讯文档）。用系统默认浏览器打开，
+  /// 与关于页的"开源链接 / 联系作者"行为一致。
+  Future<void> _openFeedback() async {
+    const url = 'https://docs.qq.com/form/page/DRHJ3bmd6Q3RqaENT';
+    final uri = Uri.parse(url);
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('无法打开链接: $url')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('打开链接失败: $e')),
+        );
+      }
+    }
   }
 
   @override
@@ -210,6 +232,17 @@ class _SettingsPageState extends State<SettingsPage> {
                       ),
                     );
                   },
+                ),
+                const Divider(height: 1, indent: 56),
+                ListTile(
+                  leading: Icon(
+                    Icons.feedback_outlined,
+                    color: scheme.primary,
+                  ),
+                  title: const Text('建议反馈'),
+                  subtitle: const Text('通过问卷告诉我们你的想法'),
+                  trailing: const Icon(Icons.open_in_new_rounded, size: 18),
+                  onTap: _openFeedback,
                 ),
               ],
             ),

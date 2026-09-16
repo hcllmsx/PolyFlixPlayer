@@ -64,6 +64,10 @@ flutter build apk --split-per-abi
 flutter build appbundle --release
 ```
 
+## 反馈与建议
+
+遇到问题或有新想法？欢迎通过问卷告诉我们：[软件意见建议反馈收集表](https://docs.qq.com/form/page/DRHJ3bmd6Q3RqaENT)。你的反馈会直接影响后续的更新方向。
+
 ## 开源协议
 
 本项目基于 [GNU General Public License v3.0](LICENSE)（GPL-3.0）开源。
