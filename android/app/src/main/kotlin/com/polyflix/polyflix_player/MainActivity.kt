@@ -100,10 +100,41 @@ class MainActivity : FlutterActivity() {
                     val clearedBytes = clearAppCache(this)
                     result.success(clearedBytes)
                 }
+                "getModelsDirPath" -> {
+                    val modelsDir = File(filesDir, "models/whisper")
+                    if (!modelsDir.exists()) modelsDir.mkdirs()
+                    result.success(modelsDir.absolutePath)
+                }
+                "getModelsSize" -> {
+                    val modelsDir = File(filesDir, "models")
+                    result.success(getFolderSize(modelsDir))
+                }
+                "clearModels" -> {
+                    val modelsDir = File(filesDir, "models")
+                    val before = getFolderSize(modelsDir)
+                    modelsDir.deleteRecursivelySafe()
+                    result.success(before)
+                }
+                "getDeviceCapabilities" -> {
+                    val runtime = Runtime.getRuntime()
+                    val totalMemMB = runtime.maxMemory() / (1024 * 1024)
+                    val cpuCores = runtime.availableProcessors()
+                    // 获取系统总物理内存（更准确）
+                    val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                    val memInfo = android.app.ActivityManager.MemoryInfo()
+                    activityManager.getMemoryInfo(memInfo)
+                    val systemRamMB = memInfo.totalMem / (1024 * 1024)
+                    result.success(mapOf(
+                        "cpuCores" to cpuCores,
+                        "systemRamMB" to systemRamMB,
+                        "jvmMaxMemMB" to totalMemMB
+                    ))
+                }
                 else -> result.notImplemented()
             }
         }
     }
+
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)

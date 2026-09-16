@@ -47,6 +47,13 @@ dependencies:
   desktop_drop: ^0.8.4
   window_manager: ^0.5.2
 
+  # AI 字幕子系统（语音识别 + 模型管理）
+  whisper_ggml: ^2.6.0
+  path_provider: ^2.1.5
+  crypto: ^3.0.6
+  http: ^1.3.0
+  ffi: ^2.1.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

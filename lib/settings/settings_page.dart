@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../subtitle/model_manager.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'about_page.dart';
@@ -21,11 +22,89 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _clearingCache = false;
   String _currentVersion = '26.8.23';
 
+  // AI 字幕模型状态
+  Set<String> _downloadedModels = {};
+  final Map<String, double> _downloadProgress = {};
+
   @override
   void initState() {
     super.initState();
     _refreshCacheSize();
     _loadLocalVersion();
+    _refreshModels();
+  }
+
+  Future<void> _refreshModels() async {
+    final list = await ModelManager.instance.getDownloadedModels();
+    if (mounted) {
+      setState(() {
+        _downloadedModels = list.toSet();
+      });
+    }
+  }
+
+  Future<void> _downloadModel(WhisperModelInfo model) async {
+    if (_downloadProgress.containsKey(model.id)) return;
+    setState(() => _downloadProgress[model.id] = 0.0);
+
+    try {
+      await ModelManager.instance.downloadModel(
+        model.id,
+        onProgress: (received, total) {
+          if (mounted && total > 0) {
+            setState(() {
+              _downloadProgress[model.id] = received / total;
+            });
+          }
+        },
+      );
+      await _refreshModels();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('模型 ${model.displayName} 下载完成')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('下载失败: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _downloadProgress.remove(model.id));
+      }
+    }
+  }
+
+  Future<void> _deleteModel(WhisperModelInfo model) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除模型'),
+        content: Text('确定要删除 ${model.displayName} 吗？\n删除后如需使用需重新下载。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await ModelManager.instance.deleteModel(model.id);
+      await _refreshModels();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已删除模型 ${model.displayName}')),
+        );
+      }
+    }
   }
 
   Future<void> _loadLocalVersion() async {
@@ -184,6 +263,74 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ],
           const SizedBox(height: 18),
+          const _SectionTitle(title: 'AI 语音字幕 (实验性)'),
+          Card(
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ListenableBuilder(
+                  listenable: aiSubtitleEnabled,
+                  builder: (context, _) {
+                    return SwitchListTile(
+                      secondary: Icon(
+                        Icons.auto_awesome_rounded,
+                        color: scheme.primary,
+                      ),
+                      title: const Text('启用 AI 字幕功能'),
+                      subtitle: const Text(
+                        '在播放视频时自动识别音频并生成字幕。独立于内置字幕，无字幕或需外挂均可开启。',
+                      ),
+                      value: aiSubtitleEnabled.value,
+                      onChanged: (value) => setAiSubtitleEnabled(value),
+                    );
+                  },
+                ),
+                const Divider(height: 1),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  child: Row(
+                    children: [
+                      Text(
+                        '离线语音模型管理',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: scheme.primary,
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(
+                        '已检测到 ${_downloadedModels.length}/${availableModels.length} 个模型就绪',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 4,
+                  ),
+                  child: Text(
+                    '模型保存在专用目录，清理应用临时缓存不会误删模型。支持自动识别项目 _temp/models/whisper/ 中的模型。',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                for (final model in availableModels)
+                  _buildModelItem(model, scheme),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
           const _SectionTitle(title: '存储与空间'),
           Card(
             clipBehavior: Clip.antiAlias,
@@ -196,7 +343,7 @@ class _SettingsPageState extends State<SettingsPage> {
               subtitle: Text(
                 _loadingCache
                     ? '正在计算缓存大小…'
-                    : '当前临时缓存占用: ${_formatBytes(_cacheBytes)}',
+                    : '当前临时缓存占用: ${_formatBytes(_cacheBytes)}（不包含离线语音模型）',
               ),
               trailing: _clearingCache
                   ? const SizedBox(
@@ -261,6 +408,61 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildModelItem(WhisperModelInfo model, ColorScheme scheme) {
+    final isDownloaded = _downloadedModels.contains(model.id);
+    final progress = _downloadProgress[model.id];
+    final isDownloading = progress != null;
+
+    return ListTile(
+      leading: Icon(
+        isDownloaded ? Icons.check_circle_outline_rounded : Icons.download_for_offline_outlined,
+        color: isDownloaded ? Colors.green : scheme.onSurfaceVariant,
+      ),
+      title: Text(
+        model.displayName,
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+      ),
+      subtitle: isDownloading
+          ? Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LinearProgressIndicator(value: progress > 0 ? progress : null),
+                  const SizedBox(height: 2),
+                  Text(
+                    '下载中 ${(progress * 100).toStringAsFixed(1)}%',
+                    style: TextStyle(fontSize: 11, color: scheme.primary),
+                  ),
+                ],
+              ),
+            )
+          : Text(
+              isDownloaded ? '已下载并就绪' : '约 ${_formatBytes(model.sizeBytes)}',
+              style: TextStyle(
+                fontSize: 12,
+                color: isDownloaded ? Colors.green : scheme.onSurfaceVariant,
+              ),
+            ),
+      trailing: isDownloading
+          ? const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : isDownloaded
+              ? IconButton(
+                  icon: const Icon(Icons.delete_outline_rounded, size: 20),
+                  tooltip: '删除模型',
+                  onPressed: () => _deleteModel(model),
+                )
+              : FilledButton.tonal(
+                  onPressed: () => _downloadModel(model),
+                  child: const Text('下载'),
+                ),
     );
   }
 }

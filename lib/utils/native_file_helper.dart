@@ -49,15 +49,61 @@ abstract final class NativeFileHelper {
         .toList();
   }
 
-  /// 桌面端自有缓存目录：%TEMP%\PolyFlixPlayer\。
-  ///
-  /// 播放为流式（不落盘），当前该目录基本为空；约定未来一切可能产生的
-  /// 本地缓存都放进这里，缓存统计/清理只动这个目录，绝不碰 %TEMP% 里
-  /// 其他程序的文件。
+  // ─────────────────────────────────────────────────
+  // 目录结构：
+  //   PolyFlixPlayer/
+  //   ├── cache/         ← 普通缓存（可安全清理）
+  //   │   └── subtitles/ ← 已生成的字幕缓存
+  //   └── models/        ← 模型目录（清理缓存时跳过）
+  //       └── whisper/   ← Whisper ASR 模型
+  //
+  // 清理缓存只动 cache/，不碰 models/。
+  // ─────────────────────────────────────────────────
+
+  /// 桌面端缓存目录：%TEMP%\PolyFlixPlayer\cache\
   static Directory _desktopCacheDir() {
     final base = Directory.systemTemp.path;
     final sep = Platform.pathSeparator;
-    return Directory('$base${sep}PolyFlixPlayer');
+    return Directory('$base${sep}PolyFlixPlayer${sep}cache');
+  }
+
+  /// 桌面端模型目录：%TEMP%\PolyFlixPlayer\models\
+  static Directory _desktopModelsDir() {
+    final base = Directory.systemTemp.path;
+    final sep = Platform.pathSeparator;
+    return Directory('$base${sep}PolyFlixPlayer${sep}models');
+  }
+
+  /// 桌面端字幕缓存目录：%TEMP%\PolyFlixPlayer\cache\subtitles\
+  static Directory desktopSubtitleCacheDir() {
+    final base = _desktopCacheDir().path;
+    final sep = Platform.pathSeparator;
+    return Directory('$base${sep}subtitles');
+  }
+
+  /// 桌面端 Whisper 模型目录：%TEMP%\PolyFlixPlayer\models\whisper\
+  static Directory desktopWhisperModelDir() {
+    final base = _desktopModelsDir().path;
+    final sep = Platform.pathSeparator;
+    return Directory('$base${sep}whisper');
+  }
+
+  /// 获取模型存放目录路径（跨平台）。
+  ///
+  /// Android 端使用 filesDir（系统不会自动清理），桌面端使用
+  /// %TEMP%\PolyFlixPlayer\models\whisper\。
+  static Future<String> getWhisperModelDirPath() async {
+    if (Platform.isAndroid) {
+      try {
+        final path = await _channel.invokeMethod<String>('getModelsDirPath');
+        if (path != null && path.isNotEmpty) return path;
+      } catch (_) {}
+      // Fallback：用 cacheDir 的兄弟目录
+      return '/data/data/com.polyflix.polyflix_player/files/models/whisper';
+    }
+    final dir = desktopWhisperModelDir();
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return dir.path;
   }
 
   /// 递归统计目录大小（字节）。目录不存在或中途出错均按已统计到的返回。
@@ -77,7 +123,9 @@ abstract final class NativeFileHelper {
     return total;
   }
 
-  /// 获取当前应用缓存总大小（字节）
+  /// 获取当前应用缓存总大小（字节）。
+  ///
+  /// 只统计 cache/ 目录，不含模型文件。
   static Future<int> getCacheSizeBytes() async {
     if (Platform.isAndroid) {
       try {
@@ -86,14 +134,31 @@ abstract final class NativeFileHelper {
       } catch (_) {}
       return 0;
     }
-    // 桌面端：统计自有缓存目录
+    // 桌面端：统计 cache/ 目录
     try {
       return await _directorySize(_desktopCacheDir());
     } catch (_) {}
     return 0;
   }
 
-  /// 清理应用缓存，返回已释放的字节数
+  /// 获取模型文件占用空间（字节）。
+  static Future<int> getModelsSizeBytes() async {
+    if (Platform.isAndroid) {
+      try {
+        final size = await _channel.invokeMethod<int>('getModelsSize');
+        return size ?? 0;
+      } catch (_) {}
+      return 0;
+    }
+    try {
+      return await _directorySize(_desktopModelsDir());
+    } catch (_) {}
+    return 0;
+  }
+
+  /// 清理应用缓存，返回已释放的字节数。
+  ///
+  /// **只清理 cache/ 目录，不动 models/ 目录。**
   static Future<int> clearCache() async {
     int cleared = 0;
     if (Platform.isAndroid) {
@@ -101,7 +166,7 @@ abstract final class NativeFileHelper {
         cleared = (await _channel.invokeMethod<int>('clearCache')) ?? 0;
       } catch (_) {}
     } else {
-      // 桌面端：删除自有缓存目录（连同内容），下次使用时按需重建
+      // 桌面端：删除 cache/ 目录（连同内容），下次使用时按需重建
       try {
         final dir = _desktopCacheDir();
         if (dir.existsSync()) {
@@ -113,6 +178,27 @@ abstract final class NativeFileHelper {
     try {
       await FilePicker.clearTemporaryFiles();
     } catch (_) {}
+    return cleared;
+  }
+
+  /// 删除所有已下载的模型文件，返回已释放的字节数。
+  ///
+  /// 仅在用户从模型管理界面主动调用时使用。
+  static Future<int> clearModels() async {
+    int cleared = 0;
+    if (Platform.isAndroid) {
+      try {
+        cleared = (await _channel.invokeMethod<int>('clearModels')) ?? 0;
+      } catch (_) {}
+    } else {
+      try {
+        final dir = _desktopModelsDir();
+        if (dir.existsSync()) {
+          cleared = await _directorySize(dir);
+          await dir.delete(recursive: true);
+        }
+      } catch (_) {}
+    }
     return cleared;
   }
 }

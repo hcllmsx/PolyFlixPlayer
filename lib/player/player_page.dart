@@ -22,6 +22,9 @@ import 'package:window_manager/window_manager.dart';
 import '../pflx/pflx.dart';
 import '../pflx/pflx_stream_server.dart';
 import '../settings/app_settings.dart';
+import '../subtitle/ai_subtitle_sheet.dart';
+import '../subtitle/subtitle_generator.dart';
+import '../subtitle/subtitle_overlay.dart';
 import '../utils/platform_utils.dart';
 
 /// 桌面端单次调节音量的步进值（键盘 ↑/↓）。
@@ -116,6 +119,16 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 正在退出播放页，防止退出流程被重复触发。
   bool _closing = false;
 
+  // ---------------- AI 字幕状态 ----------------
+  /// AI 字幕是否正在显示。
+  bool _aiSubtitleActive = false;
+
+  /// AI 字幕是否正在运行 ASR 识别。
+  bool _aiSubtitleRunning = false;
+
+  /// ASR 进度与状态监听器。
+  StreamSubscription<AsrProgress>? _asrProgressSub;
+
   // ---------------- 桌面端专用状态 ----------------
   /// 当前音量（0~100）。移动端音量交给系统管理，桌面端由滑块/键盘调节。
   double _volume = 100;
@@ -158,11 +171,25 @@ class _PlayerPageState extends State<PlayerPage> {
         systemNavigationBarIconBrightness: Brightness.light,
       ));
     }
+    _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
+    _asrProgressSub = SubtitleGenerator.instance.progressStream.listen((p) {
+      if (!mounted) return;
+      setState(() {
+        _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
+        if (p.state == AsrState.completed) {
+          _aiSubtitleActive = true;
+          _showOsd('AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)');
+        } else if (p.state == AsrState.error) {
+          _showOsd(p.message ?? 'AI 语音识别失败');
+        }
+      });
+    });
     _initPlayer();
   }
 
   @override
   void dispose() {
+    _asrProgressSub?.cancel();
     _cancelAutoHide();
     _osdTimer?.cancel();
     _keyboardFocus.dispose();
@@ -181,6 +208,9 @@ class _PlayerPageState extends State<PlayerPage> {
         systemNavigationBarIconBrightness: Brightness.dark,
       ));
     }
+    // 释放 AI 字幕资源
+    SubtitleGenerator.instance.cancel();
+    SubtitleGenerator.instance.releaseModel();
     // 不在这里同步销毁 player 和 streamServer：_closePlayer 已先暂停播放
     // 并停止了 streamServer。底层资源（mpv 纹理）延迟释放，确保 Flutter
     // 渲染管线完成当前帧的合成、不再引用该纹理后才真正回收。
@@ -468,11 +498,27 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _selectSubtitle(String id) async {
     if (id == _kSubtitlesOff) {
       await _player.setSubtitleTrack(SubtitleTrack.no());
+      if (_aiSubtitleActive) {
+        setState(() => _aiSubtitleActive = false);
+      }
       _showOsd('字幕已关闭');
+      return;
+    }
+    if (id == '__ai_subtitle__') {
+      if (SubtitleGenerator.instance.entries.isNotEmpty) {
+        await _player.setSubtitleTrack(SubtitleTrack.no());
+        setState(() => _aiSubtitleActive = true);
+        _showOsd('字幕：AI 语音识别字幕');
+      } else {
+        await _showAiSubtitleSheet();
+      }
       return;
     }
     final track = _subtitleTracks.where((t) => t.id == id).firstOrNull;
     if (track == null) return;
+    if (_aiSubtitleActive) {
+      setState(() => _aiSubtitleActive = false);
+    }
     await _player.setSubtitleTrack(track);
     _showOsd('字幕：${_subtitleLabel(track)}');
   }
@@ -725,14 +771,19 @@ class _PlayerPageState extends State<PlayerPage> {
         Center(
           child: Video(controller: _controller, controls: NoVideoControls),
         ),
+        // AI 字幕叠加层（独立于内置字幕，可同时显示）
+        if (_aiSubtitleActive)
+          SubtitleOverlay(
+            generator: SubtitleGenerator.instance,
+            position: currentPosition,
+            visible: true,
+          ),
         _PlayerScrim(showControls: _controlsVisible),
         _PlayerTopBar(
           visible: _controlsVisible,
           title: _title,
           isPflx: _sourceIsPflx,
-          closeIcon: isDesktopPlatform
-              ? Icons.close_rounded
-              : Icons.keyboard_arrow_down_rounded,
+          closeIcon: Icons.arrow_back_rounded,
           onClose: _closePlayer,
         ),
         // 画面中央的大号播放/进退按钮只服务触屏；桌面端点底部控制条即可。
@@ -850,6 +901,26 @@ class _PlayerPageState extends State<PlayerPage> {
           tooltip: '字幕',
           icon: const Icon(Icons.subtitles_outlined, color: Colors.white),
         ),
+        // AI 字幕按钮（常驻可见，点击弹出控制面板）
+        IconButton(
+          onPressed: _showAiSubtitleSheet,
+          tooltip: 'AI 语音识别字幕',
+          icon: _aiSubtitleRunning
+              ? SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                )
+              : Icon(
+                  Icons.auto_awesome_rounded,
+                  color: _aiSubtitleActive
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.white,
+                ),
+        ),
       ],
     );
   }
@@ -886,25 +957,34 @@ class _PlayerPageState extends State<PlayerPage> {
       showDragHandle: true,
       builder: (context) => _TrackSelectionSheet(
         title: '字幕',
-        subtitle: '选择要显示的字幕轨道。',
+        subtitle: '选择要显示的字幕轨道，或开启离线 AI 语音识别字幕。',
         options: [
           _TrackOption(
             id: _kSubtitlesOff,
             label: '关闭字幕',
-            selected: _activeSubtitleId == null,
+            selected: _activeSubtitleId == null && !_aiSubtitleActive,
           ),
           for (final t in _subtitleTracks)
             _TrackOption(
               id: t.id,
               label: _subtitleLabel(t),
-              selected: t.id == _activeSubtitleId,
+              selected: t.id == _activeSubtitleId && !_aiSubtitleActive,
             ),
+          _TrackOption(
+            id: '__ai_subtitle__',
+            label: _aiSubtitleRunning
+                ? 'AI 语音识别字幕 (识别中…)'
+                : 'AI 语音识别字幕',
+            selected: _aiSubtitleActive,
+          ),
         ],
         footerNote:
-            _subtitleTracks.isEmpty ? '该视频没有内嵌字幕' : null,
+            _subtitleTracks.isEmpty ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）' : null,
       ),
     );
-    if (selected != null) await _selectSubtitle(selected);
+    if (selected != null) {
+      await _selectSubtitle(selected);
+    }
   }
 
   /// 桌面端控制条右侧附加区：音量滑块 + 音轨 + 字幕。
@@ -977,7 +1057,7 @@ class _PlayerPageState extends State<PlayerPage> {
             _trackMenuItem(
               value: _kSubtitlesOff,
               label: '关闭字幕',
-              selected: _activeSubtitleId == null,
+              selected: _activeSubtitleId == null && !_aiSubtitleActive,
             ),
             if (subtitleTracks.isEmpty)
               _infoMenuItem('该视频没有内嵌字幕')
@@ -987,10 +1067,39 @@ class _PlayerPageState extends State<PlayerPage> {
                 _trackMenuItem(
                   value: t.id,
                   label: _subtitleLabel(t),
-                  selected: t.id == _activeSubtitleId,
+                  selected: t.id == _activeSubtitleId && !_aiSubtitleActive,
                 ),
             ],
+            // AI 语音识别字幕（作为与内置字幕平级的标准字幕轨）
+            const PopupMenuDivider(),
+            _trackMenuItem(
+              value: '__ai_subtitle__',
+              label: _aiSubtitleRunning
+                  ? 'AI 语音识别字幕 (识别中…)'
+                  : 'AI 语音识别字幕',
+              selected: _aiSubtitleActive,
+            ),
           ],
+        ),
+        // 桌面端独立的 AI 语音字幕快捷按钮（点击弹出控制面板）
+        IconButton(
+          onPressed: _showAiSubtitleSheet,
+          tooltip: 'AI 语音识别字幕',
+          icon: _aiSubtitleRunning
+              ? SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                )
+              : Icon(
+                  Icons.auto_awesome_rounded,
+                  color: _aiSubtitleActive
+                      ? Theme.of(context).colorScheme.primary
+                      : Colors.white,
+                ),
         ),
       ],
     );
@@ -1074,6 +1183,24 @@ class _PlayerPageState extends State<PlayerPage> {
       builder: (context) => _SpeedSheet(current: _speed),
     );
     if (speed != null) await _setSpeed(speed);
+  }
+
+  // ------------------------------------------------------------ AI 字幕
+
+  /// 打开 AI 语音识别字幕设置与控制面板。
+  Future<void> _showAiSubtitleSheet() async {
+    setState(() => _controlsVisible = true);
+    await AiSubtitleSheet.show(
+      context: context,
+      videoPath: _streamServer?.url ?? _sourcePath,
+      isAiSubtitleActive: _aiSubtitleActive,
+      onToggleSubtitleActive: (active) {
+        setState(() => _aiSubtitleActive = active);
+      },
+      onSeekTo: (position) {
+        _player.seek(position);
+      },
+    );
   }
 }
 
@@ -1209,7 +1336,7 @@ class _PlayerTopBar extends StatelessWidget {
                 child: Row(
                   children: [
                     _RoundControl(
-                      tooltip: '退出播放',
+                      tooltip: '返回',
                       icon: closeIcon,
                       onPressed: onClose,
                     ),
