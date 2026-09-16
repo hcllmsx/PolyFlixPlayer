@@ -8,11 +8,11 @@ import '../utils/platform_utils.dart';
 
 abstract final class UpdateChecker {
   static const String primaryUrl =
-      'https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer-Mobile/main/VERSION';
+      'https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION';
   static const String backupUrl =
-      'https://gh-proxy.com/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer-Mobile/main/VERSION';
+      'https://gh-proxy.com/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION';
   static const String releaseUrl =
-      'https://github.com/hcllmsx/PolyFlixPlayer-Mobile/releases';
+      'https://github.com/hcllmsx/PolyFlixPlayer/releases';
 
   static Future<String> getLocalVersion() async {
     try {

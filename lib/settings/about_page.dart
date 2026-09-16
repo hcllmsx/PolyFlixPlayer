@@ -228,7 +228,7 @@ class _AboutPageState extends State<AboutPage> {
                   title: const Text('开源链接'),
                   subtitle: const Text('点击查看 github 仓库'),
                   trailing: const Icon(Icons.open_in_new_rounded, size: 18),
-                  onTap: () => _openUrl('https://github.com/hcllmsx/PolyFlixPlayer-Mobile'),
+                  onTap: () => _openUrl('https://github.com/hcllmsx/PolyFlixPlayer'),
                 ),
                 const Divider(height: 1, indent: 56),
                 ListTile(
