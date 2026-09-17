@@ -276,7 +276,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       color: scheme.primary,
                     ),
                     title: const Text('短片不记进度'),
-                    subtitle: const Text('短于这个长度的视频不记播放进度（短片从头看一遍很快）。'),
+                    subtitle: const Text('短于这个长度的视频不记播放进度。'),
                     trailing: DropdownButton<int>(
                       value: resumeMinVideoSeconds.value,
                       focusColor: Colors.transparent,
