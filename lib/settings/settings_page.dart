@@ -386,9 +386,11 @@ class _SettingsPageState extends State<SettingsPage> {
                         size: 20, color: scheme.primary),
                     title: const Text('模型下载源', style: TextStyle(fontSize: 13)),
                     subtitle: Text(
-                      modelDownloadSource.value == 'mirror'
-                          ? '国内镜像 hf-mirror（官方源不可达时选这个）'
-                          : '自动：先试官方源，失败自动回退国内镜像',
+                      switch (modelDownloadSource.value) {
+                        'mirror' => '仅国内镜像 hf-mirror',
+                        'official' => '仅 HuggingFace 官方源',
+                        _ => '默认：先国内镜像，失败回退官方源',
+                      },
                       style: TextStyle(
                         fontSize: 11,
                         color: scheme.onSurfaceVariant,
@@ -401,6 +403,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       items: const [
                         DropdownMenuItem(value: 'auto', child: Text('自动', style: TextStyle(fontSize: 13))),
                         DropdownMenuItem(value: 'mirror', child: Text('仅镜像', style: TextStyle(fontSize: 13))),
+                        DropdownMenuItem(value: 'official', child: Text('仅官方', style: TextStyle(fontSize: 13))),
                       ],
                       onChanged: (v) {
                         if (v != null) setModelDownloadSource(v);

@@ -3,8 +3,9 @@
 /// 模型文件存放在独立的 models/ 目录下（与 cache/ 分离），清理缓存
 /// 时不会被误删。用户可通过设置页的"管理模型"入口手动管理。
 ///
-/// 下载 URL 支持可配置：开发阶段先从 HuggingFace 下载，之后用户
-/// 上传到自己的存储桶后替换链接即可。
+/// 下载 URL 支持多源回退：默认走国内镜像 hf-mirror，失败自动回退
+/// HuggingFace 官方源，两者都不可用时用户可用"导入模型"离线加载。
+/// 若将来改为自建存储桶分发，只需把自定义源加到 [ModelManager] 的源列表里。
 library;
 
 import 'dart:io';
@@ -56,7 +57,7 @@ class WhisperModelInfo {
   /// 国内镜像地址（hf-mirror）。
   ///
   /// 国内网络直连 huggingface.co 会被拒（而且 Dart 的 HttpClient 不读系统代理），
-  /// 实测 hf-mirror 可直连，因此作为自动回退的备用下载源。
+  /// 实测 hf-mirror 可直连，因此作为**默认下载源**，官方源只在其失败时兜底。
   String get mirrorUrl =>
       'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/$fileName';
 }
@@ -258,12 +259,17 @@ class ModelManager {
 
     // 下载到临时文件，完成后再重命名，避免中断产生的残文件
     final tmpFile = File('$filePath.downloading');
+
+    // 下载源顺序：面向国内用户，默认**镜像优先**，失败再回退官方 HF。
+    // 镜像本身不可用时也不会白等——连接超时会直接跳到下一个源。
+    final preferMirror = modelDownloadSource.value != 'official';
+    final preferOfficial = modelDownloadSource.value != 'mirror';
     final sources = <({String label, String url})>[
-      if (modelDownloadSource.value != 'mirror') (
+      if (preferMirror) (label: '国内镜像 hf-mirror', url: info.mirrorUrl),
+      if (preferOfficial) (
         label: 'HuggingFace 官方源',
         url: info.downloadUrl
       ),
-      (label: '国内镜像 hf-mirror', url: info.mirrorUrl),
     ];
 
     Object? lastError;

@@ -45,8 +45,12 @@ final ValueNotifier<bool> aiAsrForceCpu = ValueNotifier<bool>(false);
 
 /// Whisper 模型下载源。
 ///
-/// - `auto`（默认）：先试 HuggingFace 官方源，失败自动回退国内镜像 hf-mirror；
-/// - `mirror`：直接走国内镜像，适合官方源被墙、不想白等的用户。
+/// 本应用面向国内用户，因此**默认就走国内镜像**：
+/// - `auto`（默认）：先试国内镜像 hf-mirror，失败再回退 HuggingFace 官方源；
+/// - `mirror`：只走国内镜像；
+/// - `official`：只走 HuggingFace 官方源（海外用户或镜像异常时用）。
+///
+/// 三个源都连不上时，还可以用设置页的"导入模型"手动加载离线下载的 ggml 文件。
 ///
 /// 之所以需要这个开关：Dart 的 HttpClient **不读取 Windows 系统代理**，
 /// 即使本机挂了代理，应用内下载也是直连——国内直连 huggingface.co 会被拒。
@@ -65,7 +69,8 @@ Future<void> loadAppSettings() async {
     aiAsrThreadCount.value = prefs.getInt(_kAiAsrThreads) ?? 0;
     aiAsrForceCpu.value = prefs.getBool(_kAiAsrForceCpu) ?? false;
     final source = prefs.getString(_kModelDownloadSource) ?? 'auto';
-    modelDownloadSource.value = source == 'mirror' ? 'mirror' : 'auto';
+    modelDownloadSource.value =
+        const ['mirror', 'official'].contains(source) ? source : 'auto';
   } catch (_) {
     // 读取失败时保留默认值，不能因为设置读不出来就启动不了。
   }
