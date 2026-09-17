@@ -19,6 +19,13 @@ const String _kAiSubtitleEnabled = 'aiSubtitleEnabled';
 const String _kAiAsrModelId = 'aiAsrModelId';
 const String _kAiAsrThreads = 'aiAsrThreads';
 const String _kAiAsrForceCpu = 'aiAsrForceCpu';
+const String _kResumePlayback = 'resumePlayback';
+const String _kResumeMinVideoSeconds = 'resumeMinVideoSeconds';
+
+/// "短片不记进度"可选档位（秒）。0 = 不限制。
+///
+/// 放在这里而不是设置页里：读取时要用它校验存储值，避免脏数据落到界面上。
+const List<int> resumeMinVideoOptions = [0, 30, 60, 120, 300];
 
 /// 打开视频后是否让播放窗口自动适应视频画面比例（仅桌面端生效）。
 ///
@@ -49,6 +56,19 @@ final ValueNotifier<int> aiAsrThreadCount = ValueNotifier<int>(0);
 /// 引擎包也会以 `-ng` 启动，退回 CPU 推理，不用删掉引擎包。
 final ValueNotifier<bool> aiAsrForceCpu = ValueNotifier<bool>(false);
 
+/// 是否记录播放进度（"续播"）。
+///
+/// 开启：退出播放时记住看到哪儿，下次打开同一个视频从那里继续，播放列表
+/// 卡片上也会显示上次看到的位置（▶ 12:34）。
+/// 关闭：不写也不读进度记录（已有记录保留着，重新打开开关即可恢复）。
+final ValueNotifier<bool> resumePlaybackEnabled = ValueNotifier<bool>(true);
+
+/// "短片不记进度"的阈值（秒）；0 表示不限制（所有视频都记）。
+///
+/// 短片从头再看一遍也就分把钟，记进度反而添乱；但"多短算短"因人而异，
+/// 所以给几档让用户自己定（见 [resumeMinVideoOptions]）。
+final ValueNotifier<int> resumeMinVideoSeconds = ValueNotifier<int>(60);
+
 /// 从本地存储载入设置，应在 runApp 之前调用一次。
 Future<void> loadAppSettings() async {
   final store = AppStore.instance;
@@ -63,6 +83,12 @@ Future<void> loadAppSettings() async {
       : 'tiny';
   aiAsrThreadCount.value = store.getInt(_kAiAsrThreads, 0);
   aiAsrForceCpu.value = store.getBool(_kAiAsrForceCpu, false);
+  resumePlaybackEnabled.value = store.getBool(_kResumePlayback, true);
+  final resumeMin = store.getInt(_kResumeMinVideoSeconds, 60);
+  // 只接受档位里存在的值，脏数据回退到 1 分钟
+  resumeMinVideoSeconds.value = resumeMinVideoOptions.contains(resumeMin)
+      ? resumeMin
+      : 60;
 }
 
 /// 写入"窗口适应视频比例"开关。
@@ -93,4 +119,16 @@ Future<void> setAiAsrThreadCount(int value) async {
 Future<void> setAiAsrForceCpu(bool value) async {
   aiAsrForceCpu.value = value;
   await AppStore.instance.setBool(_kAiAsrForceCpu, value);
+}
+
+/// 写入"记录播放进度（续播）"开关。
+Future<void> setResumePlaybackEnabled(bool value) async {
+  resumePlaybackEnabled.value = value;
+  await AppStore.instance.setBool(_kResumePlayback, value);
+}
+
+/// 写入"短片不记进度"的阈值（秒，0 = 不限制）。
+Future<void> setResumeMinVideoSeconds(int value) async {
+  resumeMinVideoSeconds.value = value;
+  await AppStore.instance.setInt(_kResumeMinVideoSeconds, value);
 }

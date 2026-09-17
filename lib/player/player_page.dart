@@ -22,8 +22,10 @@ import 'package:window_manager/window_manager.dart';
 import '../pflx/pflx.dart';
 import '../pflx/pflx_stream_server.dart';
 import '../settings/app_settings.dart';
+import '../settings/playback_progress.dart';
 import '../subtitle/ai_subtitle_sheet.dart';
 import '../subtitle/ai_task_manager.dart';
+import '../subtitle/model_manager.dart';
 import '../subtitle/subtitle_generator.dart';
 import '../subtitle/subtitle_overlay.dart';
 import '../utils/platform_utils.dart';
@@ -36,6 +38,12 @@ const int _kSeekStepSeconds = 10;
 
 /// 字幕菜单里"关闭字幕"项的哨兵值（不会与真实轨道 id 冲突）。
 const String _kSubtitlesOff = '__off__';
+
+/// 播放进度落盘步长：位置每前进 5 秒写一次。
+///
+/// 不按每个 position 事件写（大约 4 次/秒），也不必攒到退出才写 ——
+/// 进程被强杀时最多丢 5 秒进度，而写的是 1KB 左右的 JSON，代价可以忽略。
+const Duration _kProgressSaveStep = Duration(seconds: 5);
 
 /// "窗口适应视频比例"使用的基准客户区尺寸（逻辑像素）。
 ///
@@ -54,9 +62,31 @@ bool windowFitAppliedInPlayer = false;
 
 /// 支持拖入播放的视频扩展名。
 const Set<String> _kSupportedVideoExtensions = {
-  'mp4', 'mkv', 'mov', 'avi', 'flv', 'wmv', 'webm', 'ts', 'm4v',
-  '3gp', 'rmvb', 'f4v', 'mpg', 'mpeg', 'vob', 'ogv', 'm2ts', 'mts',
-  'divx', 'asf', 'rm', 'dat', 'h264', 'h265', 'hevc',
+  'mp4',
+  'mkv',
+  'mov',
+  'avi',
+  'flv',
+  'wmv',
+  'webm',
+  'ts',
+  'm4v',
+  '3gp',
+  'rmvb',
+  'f4v',
+  'mpg',
+  'mpeg',
+  'vob',
+  'ogv',
+  'm2ts',
+  'mts',
+  'divx',
+  'asf',
+  'rm',
+  'dat',
+  'h264',
+  'h265',
+  'hevc',
 };
 
 bool _isVideoPath(String path) {
@@ -130,6 +160,23 @@ class _PlayerPageState extends State<PlayerPage> {
   /// ASR 进度与状态监听器。
   StreamSubscription<AsrProgress>? _asrProgressSub;
 
+  /// 当前播放源是否已经检查过"本地有没有 AI 字幕缓存"。
+  /// 每次切换播放源都要重置，否则新视频不会自动恢复字幕。
+  bool _aiCacheChecked = false;
+
+  /// 恢复 AI 字幕的延时器。
+  ///
+  /// 轨道列表与时长是两个独立事件，谁先谁后不确定，而"有没有内嵌字幕"直接
+  /// 决定 AI 字幕要不要自动显示。所以收到任一信号都重新计时，等 500ms 内
+  /// 不再有新信号（说明 mpv 已把轨道报全）才真正做判断。
+  Timer? _aiRestoreDebounce;
+
+  /// 当前播放源的时长是否已读到。
+  ///
+  /// 不能直接看 [_duration]：换片时它还留着上一个视频的值，会让"轨道是否
+  /// 已报全"的判断提前通过。
+  bool _durationKnown = false;
+
   // ---------------- 桌面端专用状态 ----------------
   /// 当前音量（0~100）。移动端音量交给系统管理，桌面端由滑块/键盘调节。
   double _volume = 100;
@@ -142,6 +189,17 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 操作反馈浮层文案（音量/静音/切轨等瞬时提示），null 表示不显示。
   String? _osdText;
   Timer? _osdTimer;
+
+  // ---------------- 播放进度（续播） ----------------
+  /// 读到续播位置后暂存，等媒体加载完再 seek（此时 seek 才生效）。
+  Duration? _pendingResume;
+
+  /// 上次已落盘的播放位置，用于按 [_kProgressSaveStep] 节流写盘。
+  Duration _lastRecordedPosition = Duration.zero;
+
+  /// 是否在进度条上方浮出"从头播放"按钮（续播后短暂出现）。
+  bool _showRestartButton = false;
+  Timer? _restartHintTimer;
 
   /// 是否有文件正被拖到画面上方。
   bool _dropActive = false;
@@ -165,12 +223,14 @@ class _PlayerPageState extends State<PlayerPage> {
     // SystemChrome 只在移动端有意义；桌面端调用是空操作，直接跳过更清晰。
     if (isMobilePlatform) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.light,
-        systemNavigationBarColor: Colors.black,
-        systemNavigationBarIconBrightness: Brightness.light,
-      ));
+      SystemChrome.setSystemUIOverlayStyle(
+        const SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.light,
+          systemNavigationBarColor: Colors.black,
+          systemNavigationBarIconBrightness: Brightness.light,
+        ),
+      );
     }
     _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
     _asrProgressSub = SubtitleGenerator.instance.progressStream.listen((p) {
@@ -178,15 +238,18 @@ class _PlayerPageState extends State<PlayerPage> {
       // 识别用的是同一个全局生成器：只有当完成的这批字幕属于"当前播放的视频"
       // 时才自动显示，否则会给正在看的另一部片子叠上别人的字幕。
       final activeKey = _streamServer?.url ?? _sourcePath;
-      final forThisVideo =
-          SubtitleGenerator.instance.holdsEntriesFor(activeKey);
+      final forThisVideo = SubtitleGenerator.instance.holdsEntriesFor(
+        activeKey,
+      );
 
       setState(() {
         _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
         if (p.state == AsrState.completed) {
           if (forThisVideo) {
             _aiSubtitleActive = true;
-            _showOsd('AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)');
+            _showOsd(
+              'AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)',
+            );
           } else {
             _showOsd('AI 字幕识别完成（属于其他视频，未在此画面显示）');
           }
@@ -210,8 +273,10 @@ class _PlayerPageState extends State<PlayerPage> {
   void dispose() {
     aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
     _asrProgressSub?.cancel();
+    _aiRestoreDebounce?.cancel();
     _cancelAutoHide();
     _osdTimer?.cancel();
+    _restartHintTimer?.cancel();
     _keyboardFocus.dispose();
     if (isMobilePlatform) {
       SystemChrome.setPreferredOrientations([
@@ -221,12 +286,14 @@ class _PlayerPageState extends State<PlayerPage> {
         DeviceOrientation.landscapeRight,
       ]);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.dark,
-        systemNavigationBarColor: Colors.transparent,
-        systemNavigationBarIconBrightness: Brightness.dark,
-      ));
+      SystemChrome.setSystemUIOverlayStyle(
+        const SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.dark,
+          systemNavigationBarColor: Colors.transparent,
+          systemNavigationBarIconBrightness: Brightness.dark,
+        ),
+      );
     }
     // 不在这里同步销毁 player 和 streamServer：_closePlayer 已先暂停播放
     // 并停止了 streamServer。底层资源（mpv 纹理）延迟释放，确保 Flutter
@@ -234,8 +301,12 @@ class _PlayerPageState extends State<PlayerPage> {
     final player = _player;
     final server = _streamServer;
     Future.delayed(const Duration(milliseconds: 150), () {
-      try { server?.stop(); } catch (_) {}
-      try { player.dispose(); } catch (_) {}
+      try {
+        server?.stop();
+      } catch (_) {}
+      try {
+        player.dispose();
+      } catch (_) {}
     });
     super.dispose();
   }
@@ -269,14 +340,24 @@ class _PlayerPageState extends State<PlayerPage> {
           _scheduleAutoHide();
         } else {
           _cancelAutoHide();
+          // 暂停时立刻落一次进度：用户按了暂停往往会直接关掉播放器
+          _recordProgressNow();
         }
       }
     });
     _player.stream.position.listen((value) {
       if (mounted && !_scrubbing) setState(() => _position = value);
+      _maybeRecordProgress(value);
     });
     _player.stream.duration.listen((value) {
       if (mounted) setState(() => _duration = value);
+      // 时长到位说明 mpv 已读完文件头，此时判断"有没有内嵌字幕"才有依据，
+      // 也只有这时 seek 到续播位置才会生效。
+      if (value > Duration.zero) {
+        _durationKnown = true;
+        _scheduleAiSubtitleRestore();
+        _maybeApplyResume();
+      }
     });
     // 音量双向同步：滑块调节 / 系统变化都反映到本地状态。
     _player.stream.volume.listen((value) {
@@ -288,6 +369,7 @@ class _PlayerPageState extends State<PlayerPage> {
       setState(() => _tracks = value);
       // 轨道信息到位后，主动把字幕真正加载上（见方法内注释）。
       _maybeAutoSelectSubtitle();
+      _scheduleAiSubtitleRestore();
     });
     // 视频尺寸到位后，按设置把窗口调成视频比例。
     _player.stream.width.listen((_) => _maybeFitWindowToVideo());
@@ -307,6 +389,16 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _openSource(String path, PflxInfo? info) async {
     _autoSubtitleApplied = false;
     _windowFitApplied = false;
+    _aiCacheChecked = false;
+    _durationKnown = false;
+    _aiRestoreDebounce?.cancel();
+    _restartHintTimer?.cancel();
+    _showRestartButton = false;
+    _pendingResume = null;
+    _lastRecordedPosition = Duration.zero;
+    // 续播位置：只有播放列表里的视频才有记录（拖进来的临时文件查不到），
+    // 先查出来存着，等媒体加载完（时长事件）再 seek —— 提前 seek 会被丢弃。
+    _pendingResume = await PlaybackProgressStore.resumePositionOf(path);
     await _streamServer?.stop();
     _streamServer = null;
     if (info != null) {
@@ -331,7 +423,8 @@ class _PlayerPageState extends State<PlayerPage> {
     });
     try {
       final info = scan(path);
-      final isPflx = info != null &&
+      final isPflx =
+          info != null &&
           info['payload_offset'] + info['payload_len'] <= info['file_size'];
       await _openSource(path, isPflx ? info : null);
       if (!mounted) return;
@@ -358,6 +451,8 @@ class _PlayerPageState extends State<PlayerPage> {
     if (isDesktopPlatform) return;
     _cancelAutoHide();
     if (!_playing || !_controlsVisible || _scrubbing) return;
+    // "从头播放"提示还在时先别隐藏：它跟着控制条一起显示
+    if (_showRestartButton) return;
     _hideTimer = Timer(const Duration(seconds: 4), () {
       if (mounted && _playing && _controlsVisible && !_scrubbing) {
         setState(() => _controlsVisible = false);
@@ -507,18 +602,18 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   String _audioLabel(AudioTrack t) => _trackLabel(
-        id: t.id,
-        title: t.title,
-        language: t.language,
-        codec: t.codec,
-      );
+    id: t.id,
+    title: t.title,
+    language: t.language,
+    codec: t.codec,
+  );
 
   String _subtitleLabel(SubtitleTrack t) => _trackLabel(
-        id: t.id,
-        title: t.title,
-        language: t.language,
-        codec: t.codec,
-      );
+    id: t.id,
+    title: t.title,
+    language: t.language,
+    codec: t.codec,
+  );
 
   Future<void> _selectAudio(String id) async {
     final track = _audioTracks.where((t) => t.id == id).firstOrNull;
@@ -551,9 +646,7 @@ class _PlayerPageState extends State<PlayerPage> {
         final role = _hasTranslation
             ? '副字幕'
             : (_activeSubtitleId == null ? '主字幕' : '副字幕');
-        _showOsd(_aiSubtitleActive
-            ? '$role：AI 语音识别字幕'
-            : '已关闭$role：AI 语音识别字幕');
+        _showOsd(_aiSubtitleActive ? '$role：AI 语音识别字幕' : '已关闭$role：AI 语音识别字幕');
       } else {
         await _showAiSubtitleSheet();
       }
@@ -563,9 +656,11 @@ class _PlayerPageState extends State<PlayerPage> {
     if (track == null) return;
     // 不动 _aiSubtitleActive：内置字幕与 AI 字幕可以同时显示
     await _player.setSubtitleTrack(track);
-    _showOsd(_aiSubtitleActive
-        ? '主字幕：${_subtitleLabel(track)}（AI 副字幕同时显示）'
-        : '主字幕：${_subtitleLabel(track)}');
+    _showOsd(
+      _aiSubtitleActive
+          ? '主字幕：${_subtitleLabel(track)}（AI 副字幕同时显示）'
+          : '主字幕：${_subtitleLabel(track)}',
+    );
   }
 
   /// 打开视频后主动选中一条字幕，让它真正显示出来。
@@ -588,6 +683,106 @@ class _PlayerPageState extends State<PlayerPage> {
     if (mounted) _showOsd('主字幕：${_subtitleLabel(target)}');
   }
 
+  /// 安排一次"恢复 AI 字幕"检查（带 500ms 去抖）。
+  ///
+  /// 轨道列表与时长是先后不定的两个事件，而"视频有没有内嵌字幕"决定了
+  /// AI 字幕要不要自动显示，所以每收到一个信号都重新计时，等 500ms 内不再有
+  /// 新信号（说明 mpv 已把轨道报全）才真正做判断，避免误判成"没有内嵌字幕"。
+  void _scheduleAiSubtitleRestore() {
+    if (_aiCacheChecked) return;
+    _aiRestoreDebounce?.cancel();
+    _aiRestoreDebounce = Timer(
+      const Duration(milliseconds: 500),
+      _maybeRestoreAiSubtitle,
+    );
+  }
+
+  /// 打开视频后自动恢复"上次识别过的 AI 字幕"（本地有该视频缓存时才生效）。
+  ///
+  /// 优先级：**内嵌字幕 > AI 字幕**
+  ///  1. 视频**有**内嵌字幕：自动选中内嵌字幕作主字幕，AI 字幕只做"就绪预载"
+  ///     —— 缓存读进生成器但不在画面上显示，两行字幕同时出现太干扰阅读；
+  ///     此时点一下 AI 字幕按钮就能立刻显示，不需要重新识别；
+  ///  2. 视频**没有**内嵌字幕：直接把缓存的 AI 字幕作为主字幕显示出来，
+  ///     打开视频就有字幕，不用再手动开启；
+  ///  3. 多个模型都识别过：优先"上次使用的模型"（[aiAsrModelId]），它没有
+  ///     缓存时在其余缓存里挑体积最大（精度最高）的那份。
+  ///
+  /// 每个播放源只判断一次（由 [_aiCacheChecked] 控制）。
+  Future<void> _maybeRestoreAiSubtitle() async {
+    if (_aiCacheChecked) return;
+    // 轨道还没报全时不下结论：已经有轨道、或本视频时长已读到，才算信息可信
+    if (_subtitleTracks.isEmpty && !_durationKnown) return;
+    _aiCacheChecked = true;
+    // 总开关关着就不自作主张
+    if (!aiSubtitleEnabled.value) return;
+
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    final generator = SubtitleGenerator.instance;
+
+    // 生成器里已经载着本视频的字幕（刚识别完就退出、又进来）：直接按需显示
+    if (generator.holdsEntriesFor(activeKey)) {
+      if (_subtitleTracks.isEmpty && !_aiSubtitleActive) {
+        setState(() => _aiSubtitleActive = true);
+        _showOsd('已自动显示 AI 语音识别字幕');
+      }
+      return;
+    }
+
+    final restored = await _loadAiSubtitleCache(activeKey);
+    if (restored == null || !mounted) return;
+
+    if (_subtitleTracks.isNotEmpty) {
+      _showOsd(
+        'AI 字幕已就绪（${restored.modelId.toUpperCase()} · ${restored.count} 条），'
+        '可在字幕菜单中显示',
+      );
+      return;
+    }
+
+    setState(() => _aiSubtitleActive = true);
+    _showOsd(
+      '已自动显示 AI 语音识别字幕（${restored.modelId.toUpperCase()} · ${restored.count} 条）',
+    );
+  }
+
+  /// 从本地缓存里挑一份适合当前视频的 AI 字幕并载入生成器。
+  ///
+  /// 返回实际使用的模型与条数；该视频没有任何缓存时返回 null。
+  Future<({String modelId, int count})?> _loadAiSubtitleCache(
+    String activeKey,
+  ) async {
+    final manager = AiTaskManager.instance;
+    final cachedIds = await manager.getCachedModelIds(activeKey);
+    if (cachedIds.isEmpty) return null;
+
+    // 上次使用的模型优先；其余按"模型越大越靠前"排 —— 同一条视频有多份缓存时
+    // 优先用精度更高的那份，识别早已做过，这里没必要再为速度让步。
+    final preferred = aiAsrModelId.value;
+    final ordered = cachedIds.toList()
+      ..sort((a, b) {
+        if (a == preferred) return -1;
+        if (b == preferred) return 1;
+        return _modelWeight(b).compareTo(_modelWeight(a));
+      });
+
+    for (final id in ordered) {
+      final cached = await manager.loadCachedSubtitles(activeKey, modelId: id);
+      if (cached == null || cached.isEmpty) continue;
+      SubtitleGenerator.instance.setEntries(
+        cached,
+        videoPath: activeKey,
+        markCompleted: true,
+      );
+      return (modelId: id, count: cached.length);
+    }
+    return null;
+  }
+
+  /// 模型在清单里的位置（越靠后体积越大、精度越高）。
+  static int _modelWeight(String modelId) =>
+      availableModels.indexWhere((m) => m.id == modelId);
+
   /// 退出播放页。
   ///
   /// 这里只负责离开，不做窗口还原：改窗口尺寸会让引擎重新布局重绘，在播放器
@@ -604,17 +799,20 @@ class _PlayerPageState extends State<PlayerPage> {
     try {
       await _player.pause();
     } catch (_) {}
-    // 2. 提前停止流式服务（如有），减少 dispose 中的工作量。
+    // 2. 落一次播放进度：下次打开这个视频从当前位置继续。
+    //    放在 pause 之后 —— 位置已经稳定，记的就是用户实际看到的地方。
+    await _recordProgressNow();
+    // 3. 提前停止流式服务（如有），减少 dispose 中的工作量。
     try {
       _streamServer?.stop();
       _streamServer = null;
     } catch (_) {}
-    // 3. 等一帧，让 Flutter 渲染管线完成当前帧的合成，
+    // 4. 等一帧，让 Flutter 渲染管线完成当前帧的合成，
     //    之后的帧就不会再引用播放器纹理了。
     if (!mounted) return;
     await Future.delayed(const Duration(milliseconds: 100));
     if (!mounted) return;
-    // 4. 现在安全 pop。
+    // 5. 现在安全 pop。
     Navigator.of(context).pop();
   }
 
@@ -670,10 +868,12 @@ class _PlayerPageState extends State<PlayerPage> {
     // 通知首页：返回后需要把窗口还原（见 windowFitAppliedInPlayer 注释）。
     windowFitAppliedInPlayer = true;
     try {
-      await windowManager.setSize(Size(
-        targetClientWidth + chromeWidth,
-        targetClientHeight + chromeHeight,
-      ));
+      await windowManager.setSize(
+        Size(
+          targetClientWidth + chromeWidth,
+          targetClientHeight + chromeHeight,
+        ),
+      );
     } catch (_) {
       // 调整失败不影响播放。
     }
@@ -699,9 +899,97 @@ class _PlayerPageState extends State<PlayerPage> {
   void _showOsd(String text) {
     _osdTimer?.cancel();
     setState(() => _osdText = text);
-    _osdTimer = Timer(const Duration(milliseconds: 1600), () {
-      if (mounted) setState(() => _osdText = null);
+    _osdTimer = Timer(const Duration(milliseconds: 1600), _clearOsd);
+  }
+
+  /// 收起 OSD 提示。
+  void _clearOsd() {
+    _osdTimer?.cancel();
+    if (!mounted) return;
+    setState(() => _osdText = null);
+  }
+
+  // ------------------------------------------------------------ 播放进度（续播）
+
+  /// 媒体加载完成后跳到上次的播放位置（每个播放源只做一次）。
+  ///
+  /// 必须在时长事件里做：mpv 没读完文件头时 seek 会被直接丢弃，
+  /// 那样就成了"记录了却续不上"。
+  Future<void> _maybeApplyResume() async {
+    final target = _pendingResume;
+    if (target == null) return;
+    _pendingResume = null;
+    await _player.seek(target);
+    _lastRecordedPosition = target;
+    if (!mounted) return;
+    _showOsd('已从 ${_formatDuration(target)} 继续播放');
+    _showRestartHint();
+  }
+
+  /// 续播后在进度条上方浮出"从头播放"按钮，几秒后自动收起。
+  ///
+  /// 放在进度条正上方而不是右上角的 OSD 里：它是个**可点的操作**，
+  /// 位置要贴着播放进度条；OSD 是纯提示，两者混在一起既不好点也不好看。
+  void _showRestartHint() {
+    _restartHintTimer?.cancel();
+    setState(() {
+      _showRestartButton = true;
+      // 移动端控制条 4 秒后自动隐藏，会把这个按钮一起带走：
+      // 按钮在场时先别隐藏，给它留出点击时间（见 _scheduleAutoHide）。
+      _controlsVisible = true;
     });
+    _cancelAutoHide();
+    _restartHintTimer = Timer(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      setState(() => _showRestartButton = false);
+      _scheduleAutoHide();
+    });
+  }
+
+  /// 收起"从头播放"按钮。
+  void _hideRestartHint() {
+    _restartHintTimer?.cancel();
+    _restartHintTimer = null;
+    if (!mounted) return;
+    setState(() => _showRestartButton = false);
+    _scheduleAutoHide();
+  }
+
+  /// 从头播放：回到片头并清掉续播记录。
+  Future<void> _restartFromBeginning() async {
+    _hideRestartHint();
+    await _player.seek(Duration.zero);
+    _pendingResume = null;
+    _lastRecordedPosition = Duration.zero;
+    await PlaybackProgressStore.clear(_sourcePath);
+    if (mounted) _showOsd('已从头播放');
+  }
+
+  /// 播放中按 [_kProgressSaveStep] 节流记录进度，避免每个 position 事件都写盘。
+  ///
+  /// 片源还没加载完（_[_durationKnown] 为 false）时位置没有意义 —— 换片途中
+  /// `state.position` 可能还是上一个视频的值，写下去就成了张冠李戴的续播点。
+  void _maybeRecordProgress(Duration position) {
+    if (!_durationKnown) return;
+    if ((position - _lastRecordedPosition).abs() < _kProgressSaveStep) return;
+    _lastRecordedPosition = position;
+    PlaybackProgressStore.record(
+      _sourcePath,
+      position: position,
+      duration: _duration,
+    );
+  }
+
+  /// 立即记录当前进度（暂停、退出播放页时调用）。
+  Future<void> _recordProgressNow() async {
+    if (!_durationKnown) return;
+    final position = _player.state.position;
+    _lastRecordedPosition = position;
+    await PlaybackProgressStore.record(
+      _sourcePath,
+      position: position,
+      duration: _duration,
+    );
   }
 
   Future<void> _changeVolume(double delta) async {
@@ -860,20 +1148,23 @@ class _PlayerPageState extends State<PlayerPage> {
           position: currentPosition,
           duration: _duration,
           speed: _speed,
-          desktopControls: isDesktopPlatform ? _buildDesktopTrackControls() : null,
-          mobileTrackControls:
-              isMobilePlatform ? _buildMobileTrackControls() : null,
+          showRestartHint: _showRestartButton,
+          desktopControls: isDesktopPlatform
+              ? _buildDesktopTrackControls()
+              : null,
+          mobileTrackControls: isMobilePlatform
+              ? _buildMobileTrackControls()
+              : null,
           onPlayPause: _togglePlayback,
           onSpeedTap: () => _showSpeedSheet(),
           onToggleOrientation: _toggleOrientation,
+          onRestart: _restartFromBeginning,
           onScrubStart: _onScrubStart,
           onScrubUpdate: _onScrubUpdate,
           onScrubEnd: _onScrubEnd,
         ),
         if (_switchingSource)
-          const Center(
-            child: CircularProgressIndicator(color: Colors.white),
-          ),
+          const Center(child: CircularProgressIndicator(color: Colors.white)),
         // 本视频正在识别时的常驻提示（右上角）：切走再回来依然在，
         // 不像 OSD 那样一闪即逝。点一下直接打开 AI 面板。
         //
@@ -932,10 +1223,7 @@ class _PlayerPageState extends State<PlayerPage> {
       },
       child: Stack(
         fit: StackFit.expand,
-        children: [
-          player,
-          if (_dropActive) const _PlayerDropHint(),
-        ],
+        children: [player, if (_dropActive) const _PlayerDropHint()],
       ),
     );
   }
@@ -1041,14 +1329,14 @@ class _PlayerPageState extends State<PlayerPage> {
               id: '__ai_subtitle__',
               label: _aiSubtitleRunning
                   ? 'AI 语音识别字幕 (识别中…)'
-                  : (_aiIsPrimary
-                      ? 'AI 语音识别字幕（主字幕）'
-                      : 'AI 语音识别字幕（副字幕）'),
+                  : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）'),
               selected: _aiSubtitleActive,
             ),
         ],
         footerNote: _subtitleTracks.isEmpty
-            ? (aiSubtitleEnabled.value ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）' : '该视频没有内嵌字幕')
+            ? (aiSubtitleEnabled.value
+                  ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）'
+                  : '该视频没有内嵌字幕')
             : null,
       ),
     );
@@ -1149,9 +1437,7 @@ class _PlayerPageState extends State<PlayerPage> {
                 value: '__ai_subtitle__',
                 label: _aiSubtitleRunning
                     ? 'AI 语音识别字幕 (识别中…)'
-                    : (_aiIsPrimary
-                        ? 'AI 语音识别字幕（主字幕）'
-                        : 'AI 语音识别字幕（副字幕）'),
+                    : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）'),
                 selected: _aiSubtitleActive,
               ),
             ],
@@ -1298,8 +1584,9 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 其他视频正在识别时的提示。返回 true 表示用户选择"取消那个任务"。
   Future<bool> _showOtherVideoBusyDialog(AiTask other) async {
-    final percent =
-        other.percent > 0 ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%' : null;
+    final percent = other.percent > 0
+        ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%'
+        : null;
     final result = await showDialog<bool>(
       context: context,
       // 半透明蒙版：明确表示"这个面板现在打不开"，而不是让用户以为按钮坏了
@@ -1320,7 +1607,11 @@ class _PlayerPageState extends State<PlayerPage> {
             const SizedBox(height: 10),
             const Text(
               '同一时间只能识别一个视频：等它完成，或先取消那个任务，再来识别本视频。',
-              style: TextStyle(fontSize: 12.5, height: 1.6, color: Colors.white60),
+              style: TextStyle(
+                fontSize: 12.5,
+                height: 1.6,
+                color: Colors.white60,
+              ),
             ),
           ],
         ),
@@ -1396,7 +1687,10 @@ class _PlayerOsd extends StatelessWidget {
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 9,
+                ),
                 child: Text(
                   text,
                   style: const TextStyle(
@@ -1430,7 +1724,11 @@ class _PlayerScrim extends StatelessWidget {
             gradient: LinearGradient(
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
-              colors: [Color(0x66000000), Colors.transparent, Color(0x99000000)],
+              colors: [
+                Color(0x66000000),
+                Colors.transparent,
+                Color(0x99000000),
+              ],
               stops: [0, .46, 1],
             ),
           ),
@@ -1500,14 +1798,19 @@ class _PlayerTopBar extends StatelessWidget {
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
-                                isPflx ? Icons.auto_awesome_rounded : Icons.movie_outlined,
+                                isPflx
+                                    ? Icons.auto_awesome_rounded
+                                    : Icons.movie_outlined,
                                 color: const Color(0xFFD5D1FF),
                                 size: 13,
                               ),
                               const SizedBox(width: 4),
                               Text(
                                 isPflx ? 'PFLX 隐藏视频' : '本地视频',
-                                style: const TextStyle(color: Color(0xFFD5D1FF), fontSize: 12),
+                                style: const TextStyle(
+                                  color: Color(0xFFD5D1FF),
+                                  fontSize: 12,
+                                ),
                               ),
                             ],
                           ),
@@ -1618,6 +1921,46 @@ class _CenterControls extends StatelessWidget {
   }
 }
 
+/// 进度条上方的"从头播放"小按钮。
+///
+/// 续播时浮出来，提示"这条视频是从中间接着播的，想从头看就点这里"；
+/// 几秒后自动收起（见播放页的 `_showRestartHint`）。
+class _RestartFromStartChip extends StatelessWidget {
+  const _RestartFromStartChip({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black.withValues(alpha: .55),
+      borderRadius: BorderRadius.circular(20),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.restart_alt_rounded, size: 16, color: Colors.white),
+              SizedBox(width: 6),
+              Text(
+                '从头播放',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _PlayerBottomControls extends StatelessWidget {
   const _PlayerBottomControls({
     required this.visible,
@@ -1630,9 +1973,11 @@ class _PlayerBottomControls extends StatelessWidget {
     required this.onPlayPause,
     required this.onSpeedTap,
     required this.onToggleOrientation,
+    required this.onRestart,
     required this.onScrubStart,
     required this.onScrubUpdate,
     required this.onScrubEnd,
+    this.showRestartHint = false,
     this.desktopControls,
     this.mobileTrackControls,
   });
@@ -1644,9 +1989,14 @@ class _PlayerBottomControls extends StatelessWidget {
   final Duration position;
   final Duration duration;
   final double speed;
+
+  /// 是否显示进度条上方的"从头播放"小按钮（续播后短暂出现）。
+  final bool showRestartHint;
+
   final VoidCallback onPlayPause;
   final VoidCallback onSpeedTap;
   final VoidCallback onToggleOrientation;
+  final VoidCallback onRestart;
   final ValueChanged<double> onScrubStart;
   final ValueChanged<double> onScrubUpdate;
   final ValueChanged<double> onScrubEnd;
@@ -1660,7 +2010,10 @@ class _PlayerBottomControls extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final total = duration.inMilliseconds.toDouble();
-    final current = position.inMilliseconds.toDouble().clamp(0.0, total <= 0 ? 1.0 : total);
+    final current = position.inMilliseconds.toDouble().clamp(
+      0.0,
+      total <= 0 ? 1.0 : total,
+    );
     return Align(
       alignment: Alignment.bottomCenter,
       child: SafeArea(
@@ -1679,6 +2032,18 @@ class _PlayerBottomControls extends StatelessWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // "从头播放"小按钮：续播后浮在进度条正上方居中
+                    AnimatedSize(
+                      duration: const Duration(milliseconds: 180),
+                      curve: Curves.easeOut,
+                      alignment: Alignment.bottomCenter,
+                      child: showRestartHint
+                          ? Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: _RestartFromStartChip(onTap: onRestart),
+                            )
+                          : const SizedBox.shrink(),
+                    ),
                     SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         trackHeight: 4,
@@ -1686,8 +2051,12 @@ class _PlayerBottomControls extends StatelessWidget {
                         inactiveTrackColor: Colors.white.withValues(alpha: .28),
                         thumbColor: Colors.white,
                         overlayColor: Colors.white.withValues(alpha: .14),
-                        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
-                        overlayShape: const RoundSliderOverlayShape(overlayRadius: 18),
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 7,
+                        ),
+                        overlayShape: const RoundSliderOverlayShape(
+                          overlayRadius: 18,
+                        ),
                       ),
                       child: Slider(
                         value: current,
@@ -1705,7 +2074,9 @@ class _PlayerBottomControls extends StatelessWidget {
                           onPressed: onPlayPause,
                           tooltip: playing ? '暂停' : '播放',
                           icon: Icon(
-                            playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                            playing
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
                             color: Colors.white,
                           ),
                         ),
@@ -1733,8 +2104,13 @@ class _PlayerBottomControls extends StatelessWidget {
                           onPressed: onSpeedTap,
                           style: TextButton.styleFrom(
                             foregroundColor: Colors.white,
-                            backgroundColor: Colors.white.withValues(alpha: .16),
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            backgroundColor: Colors.white.withValues(
+                              alpha: .16,
+                            ),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
                             minimumSize: Size.zero,
                             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                           ),
@@ -1786,7 +2162,11 @@ class _SpeedSheet extends StatelessWidget {
           children: [
             const Text(
               '播放速度',
-              style: TextStyle(color: Colors.white, fontSize: 21, fontWeight: FontWeight.w700),
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 21,
+                fontWeight: FontWeight.w700,
+              ),
             ),
             const SizedBox(height: 6),
             const Text(
@@ -1908,10 +2288,7 @@ class _TrackSelectionSheet extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 6),
-            Text(
-              subtitle,
-              style: const TextStyle(color: Color(0xFFCBC7D2)),
-            ),
+            Text(subtitle, style: const TextStyle(color: Color(0xFFCBC7D2))),
             const SizedBox(height: 8),
             for (final option in options)
               _TrackOptionTile(
@@ -2037,8 +2414,9 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
     if (task == null || !task.isRunning) return const SizedBox.shrink();
 
     final scheme = Theme.of(context).colorScheme;
-    final percentText =
-        task.percent > 0 ? ' ${(task.percent * 100).toStringAsFixed(0)}%' : '';
+    final percentText = task.percent > 0
+        ? ' ${(task.percent * 100).toStringAsFixed(0)}%'
+        : '';
 
     return Material(
       color: Colors.transparent,

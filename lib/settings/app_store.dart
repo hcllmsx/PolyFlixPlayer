@@ -85,6 +85,15 @@ class AppStore {
     return null;
   }
 
+  /// 读取一层 JSON 对象（如播放进度记录：路径 → 进度对象）。
+  ///
+  /// 嵌套的值保持原样返回，调用方自行按需取用；类型不符时返回 null。
+  Map<String, dynamic>? getMap(String key) {
+    final value = _data[key];
+    if (value is Map) return value.cast<String, dynamic>();
+    return null;
+  }
+
   Future<void> setBool(String key, bool value) => _write(key, value);
 
   Future<void> setInt(String key, int value) => _write(key, value);
@@ -93,6 +102,9 @@ class AppStore {
 
   Future<void> setStringList(String key, List<String> value) =>
       _write(key, List<String>.from(value));
+
+  Future<void> setMap(String key, Map<String, Object?> value) =>
+      _write(key, value);
 
   /// 写内存 + 落盘。缩进 JSON：文件很小，方便用户直接查看甚至手改。
   Future<void> _write(String key, Object? value) async {

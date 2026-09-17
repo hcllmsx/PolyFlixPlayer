@@ -244,28 +244,76 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
         ),
-        if (isDesktopPlatform) ...[
-          const SizedBox(height: 18),
-          const _SectionTitle(title: '播放'),
-          Card(
-            clipBehavior: Clip.antiAlias,
-            child: ListenableBuilder(
-              listenable: fitWindowToVideo,
-              builder: (context, _) {
-                return SwitchListTile(
-                  secondary: Icon(
-                    Icons.aspect_ratio_rounded,
-                    color: scheme.primary,
+        const SizedBox(height: 18),
+        const _SectionTitle(title: '播放'),
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: ListenableBuilder(
+            listenable: Listenable.merge([
+              resumePlaybackEnabled,
+              resumeMinVideoSeconds,
+              fitWindowToVideo,
+            ]),
+            builder: (context, _) => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SwitchListTile(
+                  secondary: Icon(Icons.history_rounded, color: scheme.primary),
+                  title: const Text('记录播放进度'),
+                  subtitle: const Text(
+                    '退出时记住看到哪儿，下次打开同一个视频继续播放；'
+                    '播放列表卡片上会显示上次看到的位置。',
                   ),
-                  title: const Text('窗口适应视频比例'),
-                  subtitle: const Text('打开视频后把播放窗口调整成该视频的画面比例，尽量减少黑边。'),
-                  value: fitWindowToVideo.value,
-                  onChanged: (value) => setFitWindowToVideo(value),
-                );
-              },
+                  value: resumePlaybackEnabled.value,
+                  onChanged: (value) => setResumePlaybackEnabled(value),
+                ),
+                // 关掉续播后，下面这条设置就没有意义了，一起收起来
+                if (resumePlaybackEnabled.value) ...[
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: Icon(
+                      Icons.movie_filter_outlined,
+                      color: scheme.primary,
+                    ),
+                    title: const Text('短片不记进度'),
+                    subtitle: const Text('短于这个长度的视频不记播放进度（短片从头看一遍很快）。'),
+                    trailing: DropdownButton<int>(
+                      value: resumeMinVideoSeconds.value,
+                      focusColor: Colors.transparent,
+                      underline: const SizedBox.shrink(),
+                      items: [
+                        for (final seconds in resumeMinVideoOptions)
+                          DropdownMenuItem<int>(
+                            value: seconds,
+                            child: Text(
+                              _resumeThresholdLabel(seconds),
+                              style: const TextStyle(fontSize: 13),
+                            ),
+                          ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) setResumeMinVideoSeconds(value);
+                      },
+                    ),
+                  ),
+                ],
+                if (isDesktopPlatform) ...[
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    secondary: Icon(
+                      Icons.aspect_ratio_rounded,
+                      color: scheme.primary,
+                    ),
+                    title: const Text('窗口适应视频比例'),
+                    subtitle: const Text('打开视频后把播放窗口调整成该视频的画面比例，尽量减少黑边。'),
+                    value: fitWindowToVideo.value,
+                    onChanged: (value) => setFitWindowToVideo(value),
+                  ),
+                ],
+              ],
             ),
           ),
-        ],
+        ),
         const SizedBox(height: 18),
         const _SectionTitle(title: 'AI 语音字幕 (实验性)'),
         Card(
@@ -301,51 +349,77 @@ class _SettingsPageState extends State<SettingsPage> {
                   );
                 },
               ),
-              const Divider(height: 1),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                child: Row(
-                  children: [
-                    _cardSectionTitle('离线语音模型管理'),
-                    const Spacer(),
-                    Text(
-                      '已检测到 ${_downloadedModels.length} 个模型就绪',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: scheme.onSurfaceVariant,
+              // 总开关关掉后，模型与引擎这些关联设置一起收起来 ——
+              // 功能都关了还铺一屏设置，翻起来累。
+              ListenableBuilder(
+                listenable: aiSubtitleEnabled,
+                builder: (context, _) {
+                  if (!aiSubtitleEnabled.value) return const SizedBox.shrink();
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Divider(height: 1),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                        child: Row(
+                          children: [
+                            _cardSectionTitle('离线语音模型管理'),
+                            const SizedBox(width: 12),
+                            // 用 Expanded + 省略号而不是 Spacer：Spacer 只能吸收
+                            // 多余空间，窗口挤到不够宽时它救不了溢出。
+                            Expanded(
+                              child: Text(
+                                '已检测到 ${_downloadedModels.length} 个模型就绪',
+                                textAlign: TextAlign.end,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
-                ),
+                      const SizedBox(height: 4),
+                      // 只列出已导入的模型：模型清单有四十多个，全列出来长得没法看，
+                      // 对照表 / 选用 / 删除统一走「浏览全部模型」面板。
+                      if (_downloadedModels.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                          child: Text(
+                            '尚未导入任何模型。点「浏览全部模型」看对照表 → 按文件名去网盘下载 → '
+                            '回到这里点「导入模型」。只需导入你要用的那一个。',
+                            style: TextStyle(
+                              fontSize: 12,
+                              height: 1.5,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                        )
+                      else
+                        for (final model in availableModels)
+                          if (_downloadedModels.contains(model.id))
+                            _buildModelItem(model, scheme),
+                      _sectionActionRow([
+                        _SectionAction(
+                          label: '浏览全部模型',
+                          onPressed: _browseModels,
+                        ),
+                        _SectionAction(label: '导入模型', onPressed: _importModel),
+                        _SectionAction(
+                          label: '模型目录',
+                          onPressed: _openModelDirectory,
+                        ),
+                      ]),
+                      const Divider(height: 1),
+                      _buildAsrPerformanceRow(scheme),
+                      const SizedBox(height: 8),
+                    ],
+                  );
+                },
               ),
-              const SizedBox(height: 4),
-              // 只列出已导入的模型：模型清单有四十多个，全列出来长得没法看，
-              // 对照表 / 选用 / 删除统一走「浏览全部模型」面板。
-              if (_downloadedModels.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                  child: Text(
-                    '尚未导入任何模型。点「浏览全部模型」看对照表 → 按文件名去网盘下载 → '
-                    '回到这里点「导入模型」。只需导入你要用的那一个。',
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.5,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ),
-                )
-              else
-                for (final model in availableModels)
-                  if (_downloadedModels.contains(model.id))
-                    _buildModelItem(model, scheme),
-              _sectionActionRow([
-                _SectionAction(label: '浏览全部模型', onPressed: _browseModels),
-                _SectionAction(label: '导入模型', onPressed: _importModel),
-                _SectionAction(label: '模型目录', onPressed: _openModelDirectory),
-              ]),
-              const Divider(height: 1),
-              _buildAsrPerformanceRow(scheme),
-              const SizedBox(height: 8),
             ],
           ),
         ),
@@ -986,6 +1060,13 @@ class _SectionAction {
 
   final String label;
   final Future<void> Function() onPressed;
+}
+
+/// "短片不记进度"档位的显示文案（秒 → 不限制 / 30 秒 / 1 分钟 …）。
+String _resumeThresholdLabel(int seconds) {
+  if (seconds <= 0) return '不限制';
+  if (seconds < 60) return '$seconds 秒';
+  return '${seconds ~/ 60} 分钟';
 }
 
 class _SectionTitle extends StatelessWidget {

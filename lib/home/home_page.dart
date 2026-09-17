@@ -15,6 +15,7 @@ import '../pflx/pflx.dart';
 import '../player/player_page.dart';
 import '../settings/app_settings.dart';
 import '../settings/app_store.dart';
+import '../settings/playback_progress.dart';
 import '../settings/settings_page.dart';
 import '../settings/update_service.dart';
 import '../subtitle/ai_task_manager.dart';
@@ -67,6 +68,12 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final List<_LibraryItem> _items = [];
   bool _scanning = false;
+
+  /// 各视频的续播位置（卡片上显示"已看至 xx:xx"）。
+  ///
+  /// 与播放页读的是同一份记录（`library.json` 的 `playbackPositions`），
+  /// 只是这边批量取出来做展示，真正的 seek 由播放页自己完成。
+  final Map<String, Duration> _resumeAt = {};
 
   /// 是否有文件正被拖到窗口上方（用于显示投放提示层）。
   bool _dropActive = false;
@@ -131,6 +138,20 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _items.clear();
       _items.addAll(items);
+    });
+    await _refreshResumeMarkers();
+  }
+
+  /// 刷新"已看至 xx:xx"标记（载入列表、从播放页返回后调用）。
+  Future<void> _refreshResumeMarkers() async {
+    final positions = await PlaybackProgressStore.resumePositions(
+      _items.map((e) => e.path),
+    );
+    if (!mounted) return;
+    setState(() {
+      _resumeAt
+        ..clear()
+        ..addAll(positions);
     });
   }
 
@@ -343,6 +364,10 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() => _dropEnabled = true);
 
+    // 播放页可能刚更新了续播位置：回来时刷新卡片上的"已看至"标记
+    await _refreshResumeMarkers();
+    if (!mounted) return;
+
     // 只有播放页确实按视频比例调过窗口才还原，否则会覆盖用户自己调整的尺寸。
     if (sizeBefore != null && windowFitAppliedInPlayer) {
       windowFitAppliedInPlayer = false;
@@ -361,8 +386,14 @@ class _HomePageState extends State<HomePage> {
   void _removeItem(_LibraryItem item) {
     final index = _items.indexWhere((e) => e.path == item.path);
     if (index < 0) return;
-    setState(() => _items.removeAt(index));
+    setState(() {
+      _items.removeAt(index);
+      _resumeAt.remove(item.path);
+    });
     _LibraryStorage.save(_items);
+    // 视频移出播放列表后，它的续播记录也就没意义了：一并清掉，
+    // 免得库里留下永远不会被用到的孤儿进度。
+    PlaybackProgressStore.clear(item.path);
 
     final messenger = ScaffoldMessenger.of(context);
     messenger.hideCurrentSnackBar();
@@ -536,13 +567,22 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
             SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
-                child: _HomeTabBar(
-                  current: _activeHomeTab,
-                  playlistCount: _items.length,
-                  onChanged: (value) => setState(() => _homeTab = value),
-                ),
+              child: Column(
+                children: [
+                  Padding(
+                    // 左右各减掉选项卡自身的留白，文字起点与列表内容（20）对齐
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20 - _HomeTabBar.paddingX,
+                    ),
+                    child: _HomeTabBar(
+                      current: _activeHomeTab,
+                      playlistCount: _items.length,
+                      onChanged: (value) => setState(() => _homeTab = value),
+                    ),
+                  ),
+                  // 与宽屏一致：下划线落在分割线上，和下方列表连成一体
+                  const Divider(height: 1, thickness: 1),
+                ],
               ),
             ),
             if (_activeHomeTab == 1)
@@ -576,6 +616,7 @@ class _HomePageState extends State<HomePage> {
                           padding: const EdgeInsets.only(bottom: 12),
                           child: _VideoLibraryCard(
                             item: item,
+                            resumeAt: _resumeAt[item.path],
                             onOpen: () => _open(item),
                             onExport: () => _export(item),
                             onDelete: () => _removeItem(item),
@@ -739,7 +780,14 @@ class _HomePageState extends State<HomePage> {
       children: [
         // 顶部面板 Header（标题位置换成选项卡）
         Container(
-          padding: const EdgeInsets.fromLTRB(20, 16, 12, 12),
+          // 左右各减掉选项卡自身的留白，文字起点仍与原来（20）一致；
+          // 底部不留白：好让选中态下划线正好压在下面这条分割线上。
+          padding: const EdgeInsets.fromLTRB(
+            20 - _HomeTabBar.paddingX,
+            8,
+            12 - _HomeTabBar.paddingX,
+            0,
+          ),
           decoration: BoxDecoration(
             border: Border(
               bottom: BorderSide(
@@ -814,6 +862,7 @@ class _HomePageState extends State<HomePage> {
                             padding: const EdgeInsets.only(bottom: 10),
                             child: _VideoLibraryCard(
                               item: item,
+                              resumeAt: _resumeAt[item.path],
                               onOpen: () => _open(item),
                               onExport: () => _export(item),
                               onDelete: () => _removeItem(item),
@@ -838,10 +887,16 @@ class _HomeTabBar extends StatelessWidget {
     required this.onChanged,
   });
 
+  /// 选项卡自身的左右留白（也属于点击热区）。
+  ///
+  /// 外层标题行会把左右 padding 各自减去这个值，这样热区变大了、文字起点
+  /// 却仍与列表内容对齐；下面的列表与其标题也能保持同一条竖线。
+  static const double paddingX = 10;
+
   /// 当前选中的选项卡（0 = 播放列表，1 = 任务列表）。
   final int current;
 
-  /// 播放列表视频数（>0 时在标签上显示角标）。
+  /// 播放列表视频数（>0 时在标签旁显示数量）。
   final int playlistCount;
 
   final ValueChanged<int> onChanged;
@@ -852,9 +907,12 @@ class _HomeTabBar extends StatelessWidget {
 
     // AI 字幕总开关关闭：不显示选项卡，退化成原来的标题
     if (!aiSubtitleEnabled.value) {
-      return const Text(
-        '播放列表',
-        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+      return const Padding(
+        padding: EdgeInsets.fromLTRB(paddingX, 12, paddingX, 11),
+        child: Text(
+          '播放列表',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+        ),
       );
     }
 
@@ -865,20 +923,19 @@ class _HomeTabBar extends StatelessWidget {
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            _chip(
-              context,
+            _tab(
               scheme: scheme,
               label: '播放列表',
-              badge: playlistCount > 0 ? '$playlistCount' : null,
+              count: playlistCount,
               selected: current == 0,
               onTap: () => onChanged(0),
             ),
-            const SizedBox(width: 8),
-            _chip(
-              context,
+            // 间距很小，两个热区几乎连在一起，不会出现"点了空白没反应"
+            const SizedBox(width: 4),
+            _tab(
               scheme: scheme,
               label: '任务列表',
-              // 不显示数量角标：同一时刻最多只有一个识别任务（0 或 1），
+              // 不显示数量：同一时刻最多只有一个识别任务（0 或 1），
               // 用旋转的小圈表示"正在识别"就够了。
               showSpinner: running > 0,
               selected: current == 1,
@@ -890,72 +947,77 @@ class _HomeTabBar extends StatelessWidget {
     );
   }
 
-  Widget _chip(
-    BuildContext context, {
+  /// 单个选项卡：沿用原来「播放列表」标题那套大字样式，
+  /// 只用颜色深浅 + 字重区分选中态。
+  ///
+  /// 两点刻意设计：
+  /// 1. 点击热区比文字大一圈（上方 12、下方到下划线，左右各 [paddingX]），
+  ///    而不是只有那几个字能点；
+  /// 2. 选中态的下划线**贴在标题行底边**，外层正好有一条分割线，
+  ///    于是它看起来就是"这个选项卡连着下面这块列表"。
+  Widget _tab({
     required ColorScheme scheme,
     required String label,
     required bool selected,
     required VoidCallback onTap,
-    String? badge,
+    int count = 0,
     bool showSpinner = false,
   }) {
     return InkWell(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(18),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        decoration: BoxDecoration(
-          color: selected
-              ? scheme.primary.withValues(alpha: .16)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: selected
-                ? scheme.primary.withValues(alpha: .45)
-                : scheme.outlineVariant.withValues(alpha: .4),
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (showSpinner) ...[
-              SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: scheme.primary,
-                ),
-              ),
-              const SizedBox(width: 6),
-            ],
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 13.5,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                color: selected ? scheme.primary : scheme.onSurfaceVariant,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(paddingX, 12, paddingX, 0),
+        // 下划线用 Container 的底边框：宽度随文字收缩，正好等于标签宽度。
+        // 未选中时用透明边线占位，切换时文字不会上下跳动。
+        child: Container(
+          padding: const EdgeInsets.only(bottom: 8),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                color: selected ? scheme.primary : Colors.transparent,
+                width: 3,
               ),
             ),
-            if (badge != null) ...[
-              const SizedBox(width: 6),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                decoration: BoxDecoration(
-                  color: scheme.primary.withValues(alpha: .18),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  badge,
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (showSpinner) ...[
+                SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
                     color: scheme.primary,
                   ),
                 ),
+                const SizedBox(width: 7),
+              ],
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
+                  color: selected
+                      ? scheme.onSurface
+                      : scheme.onSurfaceVariant.withValues(alpha: .68),
+                ),
               ),
+              if (count > 0) ...[
+                const SizedBox(width: 5),
+                Text(
+                  '$count',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.onSurfaceVariant.withValues(
+                      alpha: selected ? .7 : .5,
+                    ),
+                  ),
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
@@ -1173,17 +1235,28 @@ class _SectionHeading extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        Text(
-          title,
-          style: Theme.of(context).textTheme.titleLarge
-              ?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.4),
+        // 标题与右侧计数都用弹性布局：Spacer 只能吸收多余空间，
+        // 窗口挤到不够宽时救不了溢出，这里让文字各自压缩/省略。
+        Flexible(
+          child: Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.titleLarge
+                ?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.4),
+          ),
         ),
-        const Spacer(),
+        const SizedBox(width: 12),
         if (trailing != null)
-          Text(
-            trailing!,
-            style: Theme.of(context).textTheme.labelLarge?.copyWith(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+          Expanded(
+            child: Text(
+              trailing!,
+              textAlign: TextAlign.end,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
       ],
@@ -1198,9 +1271,14 @@ class _VideoLibraryCard extends StatelessWidget {
     required this.onExport,
     required this.onDelete,
     required this.onLongPress,
+    this.resumeAt,
   });
 
   final _LibraryItem item;
+
+  /// 上次看到的播放位置；非空时卡片上显示"已看至 xx:xx"。
+  final Duration? resumeAt;
+
   final VoidCallback onOpen;
   final VoidCallback onExport;
   final VoidCallback onDelete;
@@ -1295,9 +1373,43 @@ class _VideoLibraryCard extends StatelessWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FileTypeBadge(
-                            isPflx: isPflx,
-                            encrypted: item.encrypted,
+                          // 标签行：加密锁 + 体积（+ PFLX 隐藏内容体积）+ 续播位置。
+                          // 不再标"普通视频/PFLX 双视频"：缩略图样式本身就能区分。
+                          // 用 Wrap 而不是 Row：窄窗口下多出来的标签会自动换行，不会溢出。
+                          Wrap(
+                            spacing: 10,
+                            runSpacing: 5,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              // 加密的 PFLX 只挂一把锁就够了（PFLX 格式里
+                              // kFlagEncrypted 是预留标志位，目前不会为 true，
+                              // 将来真用上加密时这里自动生效）
+                              if (item.encrypted)
+                                const _CardMetaChip(
+                                  icon: Icons.lock_outline_rounded,
+                                  emphasis: true,
+                                  tooltip: '已加密',
+                                ),
+                              _CardMetaChip(
+                                icon: Icons.data_usage_outlined,
+                                label: _formatBytes(item.fileBytes),
+                              ),
+                              if (isPflx)
+                                _CardMetaChip(
+                                  icon: Icons.visibility_off_outlined,
+                                  label: _formatBytes(item.hiddenBytes),
+                                  emphasis: true,
+                                ),
+                              // 只显示图标 + 时间：主题色 + 播放图标足以说明这是
+                              // "上次看到的位置"，旁边就是体积，不会看混。
+                              if (resumeAt != null)
+                                _CardMetaChip(
+                                  icon: Icons.play_circle_outline_rounded,
+                                  label: _formatResumeAt(resumeAt!),
+                                  emphasis: true,
+                                  tooltip: '上次看到 ${_formatResumeAt(resumeAt!)}',
+                                ),
+                            ],
                           ),
                           const SizedBox(height: 6),
                           Text(
@@ -1313,44 +1425,6 @@ class _VideoLibraryCard extends StatelessWidget {
                         ],
                       ),
                     ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Icon(
-                      Icons.data_usage_outlined,
-                      size: 15,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      _formatBytes(item.fileBytes),
-                      style: Theme.of(context).textTheme.bodySmall
-                          ?.copyWith(color: scheme.onSurfaceVariant),
-                    ),
-                    if (isPflx) ...[
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        child: Text(
-                          '·',
-                          style: TextStyle(color: scheme.outline),
-                        ),
-                      ),
-                      Icon(
-                        Icons.visibility_off_outlined,
-                        size: 15,
-                        color: scheme.primary,
-                      ),
-                      const SizedBox(width: 5),
-                      Text(
-                        '隐藏内容 ${_formatBytes(item.hiddenBytes)}',
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: scheme.primary,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
                   ],
                 ),
                 if (isPflx) ...[
@@ -1494,32 +1568,50 @@ class _VideoThumbnailBadge extends StatelessWidget {
   }
 }
 
-class _FileTypeBadge extends StatelessWidget {
-  const _FileTypeBadge({required this.isPflx, required this.encrypted});
+/// 卡片标签行里的小图标 + 文字（体积、续播位置这类）。
+class _CardMetaChip extends StatelessWidget {
+  const _CardMetaChip({
+    required this.icon,
+    this.label,
+    this.emphasis = false,
+    this.tooltip,
+  });
 
-  final bool isPflx;
-  final bool encrypted;
+  final IconData icon;
+
+  /// 文字；为 null 时只显示图标（用于"已加密"的锁这类纯标记）。
+  final String? label;
+
+  /// 是否用主题色强调：续播位置、PFLX 隐藏内容体积用强调色，
+  /// 普通文件体积用次要文字色，一眼能分出主次。
+  final bool emphasis;
+
+  /// 悬停说明（可选）。续播标签只显示"▶ 12:34"，靠它补一句完整含义；
+  /// 移动端没有悬停，不会打扰。
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final color = isPflx ? scheme.primary : scheme.onSurfaceVariant;
-    final label = isPflx ? (encrypted ? 'PFLX · 已加密' : 'PFLX 双视频') : '普通视频';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: .12),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: color,
-          fontSize: 11,
-          fontWeight: FontWeight.w800,
-        ),
-      ),
+    final color = emphasis ? scheme.primary : scheme.onSurfaceVariant;
+    final chip = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 14, color: color),
+        if (label != null) ...[
+          const SizedBox(width: 4),
+          Text(
+            label!,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: color,
+              fontWeight: emphasis ? FontWeight.w600 : null,
+            ),
+          ),
+        ],
+      ],
     );
+    if (tooltip == null) return chip;
+    return Tooltip(message: tooltip!, child: chip);
   }
 }
 
@@ -1698,6 +1790,21 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
   }
 }
 
+/// 把续播位置格式化成 `12:34` / `1:23:45`。
+///
+/// 与播放页时间轴的写法保持一致（player_page.dart 里的 `_formatDuration`），
+/// 这样卡片上的"已看至"和播放器里的时间读起来是一回事。
+String _formatResumeAt(Duration position) {
+  final hours = position.inHours;
+  final minutes = position.inMinutes.remainder(60);
+  final seconds = position.inSeconds.remainder(60);
+  if (hours > 0) {
+    return '$hours:${minutes.toString().padLeft(2, '0')}'
+        ':${seconds.toString().padLeft(2, '0')}';
+  }
+  return '${position.inMinutes}:${seconds.toString().padLeft(2, '0')}';
+}
+
 String _formatBytes(int bytes) {
   if (bytes <= 0) return '未知大小';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -1735,7 +1842,11 @@ abstract final class _StoragePermissionHelper {
 }
 
 abstract final class _LibraryStorage {
-  static const _key = 'savedLibraryPaths';
+  /// 播放列表在 `library.json` 里的键。
+  ///
+  /// 用 [PlaybackProgressStore] 里的同一常量：播放进度也写在同一个文件里，
+  /// 并且要靠这份列表判断"视频在不在播放列表"，两处必须一致。
+  static const _key = PlaybackProgressStore.libraryPathsKey;
 
   static Future<List<_LibraryItem>> load() async {
     try {

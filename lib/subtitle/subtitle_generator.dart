@@ -436,10 +436,17 @@ class SubtitleGenerator {
   /// 批量设置字幕条目（从缓存恢复或从后台任务同步）。
   ///
   /// [videoPath] 用于记录这批字幕属于哪个视频，供面板/叠加层判断归属。
-  void setEntries(List<SubtitleEntry> list, {String? videoPath}) {
+  /// [markCompleted] 为 true 时把状态一并置为"识别完成"：从本地缓存恢复的
+  /// 字幕在控制面板里应显示成已完成（否则面板停在"就绪"、预览区也展不开），
+  /// 而这批字幕并不需要真的再跑一次识别。
+  void setEntries(
+    List<SubtitleEntry> list, {String? videoPath, bool markCompleted = false}) {
     _entries.clear();
     _entries.addAll(list);
     _entriesVideoPath = videoPath;
+    if (markCompleted && list.isNotEmpty) {
+      _state = AsrState.completed;
+    }
   }
 
   /// 根据当前播放位置获取应显示的字幕。

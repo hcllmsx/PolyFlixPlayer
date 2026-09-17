@@ -500,16 +500,20 @@ class AiTaskManager extends ChangeNotifier {
   }
 
   /// 获取指定视频已缓存过字幕的模型列表（支持跨目录检测已存在缓存）。
+  ///
+  /// 遍历**完整**模型清单（tiny ~ large-v3 等 40 多个型号），而不是写死
+  /// tiny/base/small：用大模型识别过的缓存同样要能查出来，否则"重开视频自动
+  /// 恢复上次的 AI 字幕"会漏掉这些缓存，用户还得手动去面板里翻。
   Future<List<String>> getCachedModelIds(String videoPath) async {
     final dir = NativeFileHelper.desktopSubtitleCacheDir();
     if (!dir.existsSync()) return const [];
 
     final fingerprint = _getVideoFingerprint(videoPath);
     final cached = <String>[];
-    for (final mid in ['tiny', 'base', 'small']) {
-      final f = _findCacheFile(videoPath, mid, fingerprint, dir.path);
+    for (final info in availableModels) {
+      final f = _findCacheFile(videoPath, info.id, fingerprint, dir.path);
       if (f != null && f.existsSync()) {
-        cached.add(mid);
+        cached.add(info.id);
       }
     }
     return cached;
