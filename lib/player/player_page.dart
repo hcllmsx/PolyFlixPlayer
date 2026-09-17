@@ -23,6 +23,7 @@ import '../pflx/pflx.dart';
 import '../pflx/pflx_stream_server.dart';
 import '../settings/app_settings.dart';
 import '../subtitle/ai_subtitle_sheet.dart';
+import '../subtitle/ai_task_manager.dart';
 import '../subtitle/subtitle_generator.dart';
 import '../subtitle/subtitle_overlay.dart';
 import '../utils/platform_utils.dart';
@@ -873,6 +874,20 @@ class _PlayerPageState extends State<PlayerPage> {
           const Center(
             child: CircularProgressIndicator(color: Colors.white),
           ),
+        // 本视频正在识别时的常驻提示（右上角）：切走再回来依然在，
+        // 不像 OSD 那样一闪即逝。点一下直接打开 AI 面板。
+        //
+        // 有瞬时 OSD 时先让位——两者同在右上角会叠字；OSD 只显示 1.6 秒，
+        // 消失后这里会自动重新出现。
+        if (_aiSubtitleRunning && _osdText == null)
+          Positioned(
+            top: 72,
+            right: 16,
+            child: _PlayerTaskBadge(
+              videoKey: _streamServer?.url ?? _sourcePath,
+              onTap: _showAiSubtitleSheet,
+            ),
+          ),
         if (_osdText != null) _PlayerOsd(text: _osdText!),
       ],
     );
@@ -1252,6 +1267,21 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 打开 AI 语音识别字幕设置与控制面板。
   Future<void> _showAiSubtitleSheet() async {
     setState(() => _controlsVisible = true);
+
+    // 全局同一时刻只跑一个识别任务：别的视频正在识别时，本视频的面板打开也没用
+    // （点开始会被拒），所以直接挡一层蒙版说明原因，避免用户在里面白折腾。
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    final busy = AiTaskManager.instance.activeTasks
+        .where((t) => t.videoPath != activeKey)
+        .toList();
+    if (busy.isNotEmpty) {
+      final cancelled = await _showOtherVideoBusyDialog(busy.first);
+      if (!mounted) return;
+      // 用户选择取消那个任务：回到正常流程，直接打开本视频的面板
+      if (cancelled) await _showAiSubtitleSheet();
+      return;
+    }
+
     await AiSubtitleSheet.show(
       context: context,
       videoPath: _streamServer?.url ?? _sourcePath,
@@ -1264,6 +1294,52 @@ class _PlayerPageState extends State<PlayerPage> {
         _player.seek(position);
       },
     );
+  }
+
+  /// 其他视频正在识别时的提示。返回 true 表示用户选择"取消那个任务"。
+  Future<bool> _showOtherVideoBusyDialog(AiTask other) async {
+    final percent =
+        other.percent > 0 ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%' : null;
+    final result = await showDialog<bool>(
+      context: context,
+      // 半透明蒙版：明确表示"这个面板现在打不开"，而不是让用户以为按钮坏了
+      barrierColor: Colors.black.withValues(alpha: .62),
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF202027),
+        icon: const Icon(Icons.hourglass_top_rounded, size: 34),
+        title: const Text('正在识别其他视频', style: TextStyle(fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '「${other.videoTitle}」的字幕识别还没结束'
+              '${percent != null ? '（$percent）' : ''}。',
+              style: const TextStyle(fontSize: 13, height: 1.5),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              '同一时间只能识别一个视频：等它完成，或先取消那个任务，再来识别本视频。',
+              style: TextStyle(fontSize: 12.5, height: 1.6, color: Colors.white60),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('知道了'),
+          ),
+          FilledButton(
+            onPressed: () {
+              AiTaskManager.instance.cancelTask(other.videoPath);
+              Navigator.of(ctx).pop(true);
+            },
+            child: const Text('取消那个任务'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
   }
 }
 
@@ -1918,4 +1994,88 @@ String _formatDuration(Duration duration) {
     return '$hours:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
   }
   return '${duration.inMinutes}:${seconds.toString().padLeft(2, '0')}';
+}
+
+/// 播放页右上角的"本视频正在识别"常驻提示。
+///
+/// 之前只有一条 1.6 秒的 OSD 瞬时提示，切到别的视频再回来就看不到了。
+/// 这里改成常驻浮标：只要**本视频**的任务还在跑就一直显示进度与已耗时，
+/// 每秒刷新一次；点一下直接打开 AI 面板。别的视频的任务不会显示在这里。
+class _PlayerTaskBadge extends StatefulWidget {
+  const _PlayerTaskBadge({required this.videoKey, required this.onTap});
+
+  /// 当前播放视频的标识（流地址或本地路径），用于匹配属于本视频的任务。
+  final String videoKey;
+
+  final Future<void> Function() onTap;
+
+  @override
+  State<_PlayerTaskBadge> createState() => _PlayerTaskBadgeState();
+}
+
+class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    // 每秒刷新，让"已耗时"走动；任务结束后这个组件会自动消失
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final task = AiTaskManager.instance.getTask(widget.videoKey);
+    if (task == null || !task.isRunning) return const SizedBox.shrink();
+
+    final scheme = Theme.of(context).colorScheme;
+    final percentText =
+        task.percent > 0 ? ' ${(task.percent * 100).toStringAsFixed(0)}%' : '';
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: () => widget.onTap(),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: .62),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: scheme.primary.withValues(alpha: .55)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: scheme.primary,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'AI 识别中$percentText · 已用 ${AiTask.formatDuration(task.elapsed)}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

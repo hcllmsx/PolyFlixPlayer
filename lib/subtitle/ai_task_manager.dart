@@ -3,6 +3,7 @@
 /// 负责跨页面协调后台转录任务、追踪切片进度、持久化字幕缓存，并向首页与播放页广播状态变更。
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -21,7 +22,8 @@ class AiTask extends ChangeNotifier {
     required this.videoTitle,
     required this.modelId,
     required this.language,
-  }) : startTime = DateTime.now();
+    DateTime? startTime,
+  }) : startTime = startTime ?? DateTime.now();
 
   final String id;
   final String videoPath;
@@ -61,6 +63,48 @@ class AiTask extends ChangeNotifier {
     return modelId.toUpperCase();
   }
 
+  /// 是否正在识别（提取音频或推理中）。
+  ///
+  /// [isInterrupted] 的任务虽然保存时是 processing，但续跑不可能，所以不算运行中。
+  bool get isRunning =>
+      !_isCancelled &&
+      !_interrupted &&
+      (_state == AsrState.preparing || _state == AsrState.processing);
+
+  /// 是否已经结束（完成 / 失败 / 取消 / 中断）。
+  bool get isFinished => !isRunning;
+
+  /// 是否是被应用退出打断的任务（从磁盘恢复历史记录时判定）。
+  bool _interrupted = false;
+  bool get isInterrupted => _interrupted;
+
+  /// 已生成字幕条数。
+  ///
+  /// 历史记录不把字幕本体写进 JSON（体积太大，字幕在缓存文件里），
+  /// 只保留条数，所以这里的取值要兼容"有实体条目"和"只有条数"两种情况。
+  int _entryCount = 0;
+  int get entryCount => _entries.isNotEmpty ? _entries.length : _entryCount;
+
+  /// 结束时间（完成 / 失败 / 取消时写入）。
+  DateTime? _endTime;
+  DateTime? get endTime => _endTime;
+
+  /// 本条任务已耗时：进行中按"现在"算，结束后固定为总耗时。
+  Duration get elapsed => (_endTime ?? DateTime.now()).difference(startTime);
+
+  /// 把时长格式化成 `12 秒` / `3 分 05 秒` / `1 时 02 分`。
+  static String formatDuration(Duration d) {
+    final seconds = d.inSeconds;
+    if (seconds < 60) {
+      return '$seconds 秒';
+    }
+    final minutes = seconds ~/ 60;
+    if (minutes < 60) {
+      return '$minutes 分 ${(seconds % 60).toString().padLeft(2, '0')} 秒';
+    }
+    return '${minutes ~/ 60} 时 ${(minutes % 60).toString().padLeft(2, '0')} 分';
+  }
+
   void updateState(
     AsrState state, {
     Duration? totalDuration,
@@ -75,6 +119,10 @@ class AiTask extends ChangeNotifier {
     if (percent != null) _percent = percent.clamp(0.0, 1.0);
     if (message != null) _statusMessage = message;
     if (errorMessage != null) _errorMessage = errorMessage;
+    // 进入终态就固定结束时间，之后 elapsed 不再增长
+    if (state == AsrState.completed || state == AsrState.error) {
+      _endTime ??= DateTime.now();
+    }
     notifyListeners();
   }
 
@@ -88,7 +136,76 @@ class AiTask extends ChangeNotifier {
     _isCancelled = true;
     _state = AsrState.idle;
     _statusMessage = '已取消';
+    _endTime ??= DateTime.now();
     notifyListeners();
+  }
+
+  /// 序列化。字幕本体不入库（在缓存文件里），只记条数。
+  ///
+  /// [lastSeen] 仅在任务仍在运行时写入：应用被强杀时它代表"最后一次已知存活时间"，
+  /// 恢复历史记录时用它可以算出一个合理的耗时，而不是把离线时长也算进去。
+  Map<String, dynamic> toJson({DateTime? lastSeen}) => {
+    'id': id,
+    'videoPath': videoPath,
+    'videoTitle': videoTitle,
+    'modelId': modelId,
+    'language': language,
+    'startTime': startTime.toIso8601String(),
+    'endTime': _endTime?.toIso8601String(),
+    'lastSeen': lastSeen?.toIso8601String(),
+    'state': _state.name,
+    'statusMessage': _statusMessage,
+    'errorMessage': _errorMessage,
+    'entryCount': entryCount,
+    'percent': _percent,
+    'cancelled': _isCancelled,
+  };
+
+  /// 从持久化数据恢复一条历史记录。数据损坏时返回 null（跳过这一条）。
+  static AiTask? fromJson(Map<String, dynamic> json) {
+    try {
+      final task = AiTask(
+        id: json['id'] as String,
+        videoPath: json['videoPath'] as String,
+        videoTitle: (json['videoTitle'] as String?) ?? '',
+        modelId: (json['modelId'] as String?) ?? '',
+        language: (json['language'] as String?) ?? 'auto',
+        startTime:
+            DateTime.tryParse((json['startTime'] as String?) ?? '') ??
+            DateTime.now(),
+      );
+
+      task._entryCount = (json['entryCount'] as num?)?.toInt() ?? 0;
+      task._percent = ((json['percent'] as num?)?.toDouble() ?? 0).clamp(
+        0.0,
+        1.0,
+      );
+      task._statusMessage = json['statusMessage'] as String?;
+      task._errorMessage = json['errorMessage'] as String?;
+      task._isCancelled = (json['cancelled'] as bool?) ?? false;
+      final stateName = json['state'] as String?;
+      task._state = AsrState.values.firstWhere(
+        (s) => s.name == stateName,
+        orElse: () => AsrState.idle,
+      );
+
+      final endTime = DateTime.tryParse((json['endTime'] as String?) ?? '');
+      final lastSeen = DateTime.tryParse((json['lastSeen'] as String?) ?? '');
+      task._endTime = endTime ?? lastSeen;
+
+      // 保存时还在跑的：应用已经退出，不可能续跑，标记为"已中断"
+      if (!task._isCancelled &&
+          (task._state == AsrState.preparing ||
+              task._state == AsrState.processing)) {
+        task._interrupted = true;
+        task._state = AsrState.idle;
+        task._statusMessage = '已中断（应用退出时任务未完成，可重新识别）';
+        task._endTime = lastSeen ?? task.startTime;
+      }
+      return task;
+    } catch (_) {
+      return null;
+    }
   }
 }
 
@@ -97,35 +214,118 @@ class AiTaskManager extends ChangeNotifier {
   AiTaskManager._();
   static final AiTaskManager instance = AiTaskManager._();
 
-  final Map<String, AiTask> _tasks = {};
+  /// 全部任务记录（含已完成的），不自动清理，由用户手动删除。
+  ///
+  /// 用列表而不是 Map：同一个视频重新识别会产生新任务，旧记录要保留下来
+  /// 供用户在「任务列表」里回看，所以不能按视频路径覆盖。
+  final List<AiTask> _tasks = [];
+
+  /// 最多保留多少条历史记录（超出后丢弃最旧的）。
+  static const int _maxRecords = 60;
+
+  Timer? _saveTimer;
+
+  /// 任务记录的落盘文件：`%LOCALAPPDATA%\PolyFlixPlayer\ai_tasks.json`。
+  ///
+  /// 放在应用数据目录（不是 %TEMP% 缓存目录），"清理应用缓存"不会误删记录。
+  File _storageFile() {
+    final dir = NativeFileHelper.desktopDataDir();
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return File('${dir.path}${Platform.pathSeparator}ai_tasks.json');
+  }
+
+  /// 变更后合并写盘：3 秒内多次改动只写一次。
+  ///
+  /// 识别过程中进度回调很密集，逐次写 JSON 会白白磨损磁盘。另外对仍在运行的
+  /// 任务会写入 lastSeen，应用被强杀时靠它推算出合理的耗时（不会把离线时间算进去）。
+  void _scheduleSave() {
+    _saveTimer?.cancel();
+    _saveTimer = Timer(const Duration(seconds: 3), _save);
+  }
+
+  Future<void> _save() async {
+    try {
+      final from = _tasks.length > _maxRecords
+          ? _tasks.length - _maxRecords
+          : 0;
+      final now = DateTime.now();
+      final list = _tasks
+          .sublist(from)
+          .map((t) => t.toJson(lastSeen: t.isRunning ? now : null))
+          .toList();
+      await _storageFile().writeAsString(jsonEncode(list));
+    } catch (_) {
+      // 落盘失败不影响本次使用
+    }
+  }
+
+  /// 从磁盘恢复历史记录，应用启动时调用一次。
+  Future<void> loadPersisted() async {
+    try {
+      final file = _storageFile();
+      if (!file.existsSync()) return;
+      final raw = await file.readAsString();
+      final list = jsonDecode(raw) as List<dynamic>;
+      final loaded = <AiTask>[];
+      for (final item in list) {
+        if (item is Map<String, dynamic>) {
+          final task = AiTask.fromJson(item);
+          if (task != null) loaded.add(task);
+        }
+      }
+      if (loaded.isEmpty) return;
+      _tasks
+        ..clear()
+        ..addAll(loaded);
+      // 用 super 直接通知：载入本身不需要再安排一次写盘
+      super.notifyListeners();
+    } catch (_) {
+      // 文件损坏时等同于没有历史记录，不影响启动
+    }
+  }
+
+  @override
+  void notifyListeners() {
+    // 任何变更都安排一次合并写盘，保证异常退出也能留下记录
+    _scheduleSave();
+    super.notifyListeners();
+  }
+
+  /// 所有任务，正在跑的排在最前，其余按开始时间倒序。
+  List<AiTask> get allTasks {
+    final list = [..._tasks];
+    list.sort((a, b) {
+      if (a.isRunning != b.isRunning) return a.isRunning ? -1 : 1;
+      return b.startTime.compareTo(a.startTime);
+    });
+    return list;
+  }
 
   /// 所有当前活动中（正在提取或正在识别）的任务。
-  List<AiTask> get activeTasks => _tasks.values
-      .where((t) =>
-          !t.isCancelled &&
-          (t.state == AsrState.preparing || t.state == AsrState.processing))
-      .toList();
+  List<AiTask> get activeTasks => _tasks.where((t) => t.isRunning).toList();
 
   /// 是否有处于后台运行中的任务。
   bool get hasActiveTasks => activeTasks.isNotEmpty;
 
-  /// 获取指定视频的任务（如果存在）。
-  AiTask? getTask(String videoPath) => _tasks[videoPath];
+  /// 获取指定视频最近一次的任务（如果存在）。
+  AiTask? getTask(String videoPath) {
+    for (final task in _tasks.reversed) {
+      if (task.videoPath == videoPath) return task;
+    }
+    return null;
+  }
 
   /// 启动某视频的语音识别任务。
+  ///
+  /// 同一视频已有任务在跑时直接复用，不会重复开任务。
   Future<AiTask> startTask({
     required String videoPath,
     required String videoTitle,
     required String modelId,
     String language = 'auto',
   }) async {
-    final existing = _tasks[videoPath];
-    if (existing != null &&
-        !existing.isCancelled &&
-        (existing.state == AsrState.preparing ||
-            existing.state == AsrState.processing)) {
-      return existing;
-    }
+    final existing = getTask(videoPath);
+    if (existing != null && existing.isRunning) return existing;
 
     final task = AiTask(
       id: '${DateTime.now().millisecondsSinceEpoch}_${_tasks.length}',
@@ -135,7 +335,7 @@ class AiTaskManager extends ChangeNotifier {
       language: language,
     );
 
-    _tasks[videoPath] = task;
+    _tasks.add(task);
     notifyListeners();
 
     // 触发执行
@@ -145,12 +345,31 @@ class AiTaskManager extends ChangeNotifier {
 
   /// 取消指定视频的任务。
   void cancelTask(String videoPath) {
-    final task = _tasks[videoPath];
+    final task = getTask(videoPath);
     if (task != null) {
       task.cancel();
       SubtitleGenerator.instance.cancel();
       notifyListeners();
     }
+  }
+
+  /// 删除一条任务记录。
+  ///
+  /// 正在运行的任务不允许直接删除（会留下跑着的后台任务），返回 false；
+  /// 需要先取消，再删除。
+  bool removeTask(String taskId) {
+    final index = _tasks.indexWhere((t) => t.id == taskId);
+    if (index < 0) return false;
+    if (_tasks[index].isRunning) return false;
+    _tasks.removeAt(index);
+    notifyListeners();
+    return true;
+  }
+
+  /// 清空所有已结束的任务记录。
+  void clearFinishedTasks() {
+    _tasks.removeWhere((t) => t.isFinished);
+    notifyListeners();
   }
 
   /// 后台驱动切片识别流水线。
@@ -186,7 +405,11 @@ class AiTaskManager extends ChangeNotifier {
           message: '识别完成 (共 ${task.entries.length} 条字幕)',
         );
         // 保存字幕缓存（按模型区分，仅写高效 JSON 缓存，不自动生成冗余 srt）
-        await saveCachedSubtitles(task.videoPath, task.entries, modelId: task.modelId);
+        await saveCachedSubtitles(
+          task.videoPath,
+          task.entries,
+          modelId: task.modelId,
+        );
       }
     } catch (e) {
       task.updateState(
@@ -224,7 +447,10 @@ class AiTaskManager extends ChangeNotifier {
           final bytes = raf.readSync(readLen);
           raf.closeSync();
           final lenBytes = utf8.encode('$length:');
-          return md5.convert([...lenBytes, ...bytes]).toString().substring(0, 8);
+          return md5
+              .convert([...lenBytes, ...bytes])
+              .toString()
+              .substring(0, 8);
         }
       }
     } catch (_) {}
@@ -243,7 +469,9 @@ class AiTaskManager extends ChangeNotifier {
     final mId = modelId.toLowerCase();
 
     // 1. 首选：同名 + 同模型 + 同指纹
-    final direct = File('$dirPath${Platform.pathSeparator}${cleanName}_${mId}_$fingerprint.json');
+    final direct = File(
+      '$dirPath${Platform.pathSeparator}${cleanName}_${mId}_$fingerprint.json',
+    );
     if (direct.existsSync()) return direct;
 
     // 2. 跨目录/改名匹配：扫描缓存目录下所有具有相同特征指纹的文件 (*_${mId}_${fingerprint}.json)
@@ -259,8 +487,13 @@ class AiTaskManager extends ChangeNotifier {
     } catch (_) {}
 
     // 3. 兼容检查上个版本基于路径前6位短哈希命名的文件
-    final pathHash6 = md5.convert(utf8.encode(videoPath)).toString().substring(0, 6);
-    final legacyShort = File('$dirPath${Platform.pathSeparator}${cleanName}_${mId}_$pathHash6.json');
+    final pathHash6 = md5
+        .convert(utf8.encode(videoPath))
+        .toString()
+        .substring(0, 6);
+    final legacyShort = File(
+      '$dirPath${Platform.pathSeparator}${cleanName}_${mId}_$pathHash6.json',
+    );
     if (legacyShort.existsSync()) return legacyShort;
 
     return null;
@@ -299,7 +532,12 @@ class AiTaskManager extends ChangeNotifier {
 
       // 1. 若指定了模型，严格精准加载（支持跨路径/同视频自动复用，不回退其他模型）
       if (modelId != null && modelId.isNotEmpty) {
-        final targetFile = _findCacheFile(videoPath, modelId, fingerprint, dir.path);
+        final targetFile = _findCacheFile(
+          videoPath,
+          modelId,
+          fingerprint,
+          dir.path,
+        );
         if (targetFile != null && await targetFile.exists()) {
           return await _readJsonEntries(targetFile);
         }
@@ -315,8 +553,13 @@ class AiTaskManager extends ChangeNotifier {
       }
 
       // 3. 向前兼容旧版的纯路径哈希命名：sub_${hash16}.json
-      final oldHash = md5.convert(utf8.encode(videoPath)).toString().substring(0, 16);
-      final oldFile = File('${dir.path}${Platform.pathSeparator}sub_$oldHash.json');
+      final oldHash = md5
+          .convert(utf8.encode(videoPath))
+          .toString()
+          .substring(0, 16);
+      final oldFile = File(
+        '${dir.path}${Platform.pathSeparator}sub_$oldHash.json',
+      );
       if (await oldFile.exists()) {
         return await _readJsonEntries(oldFile);
       }
@@ -344,24 +587,36 @@ class AiTaskManager extends ChangeNotifier {
     try {
       final cleanName = _extractCleanBaseName(videoPath);
       final fingerprint = _getVideoFingerprint(videoPath);
-      final mId = (modelId != null && modelId.isNotEmpty) ? modelId.toLowerCase() : 'default';
+      final mId = (modelId != null && modelId.isNotEmpty)
+          ? modelId.toLowerCase()
+          : 'default';
       final dir = NativeFileHelper.desktopSubtitleCacheDir();
       if (!dir.existsSync()) dir.createSync(recursive: true);
 
-      final file = File('${dir.path}${Platform.pathSeparator}${cleanName}_${mId}_$fingerprint.json');
+      final file = File(
+        '${dir.path}${Platform.pathSeparator}${cleanName}_${mId}_$fingerprint.json',
+      );
       final jsonList = entries.map((e) => e.toJson()).toList();
       await file.writeAsString(jsonEncode(jsonList));
     } catch (_) {}
   }
 
   /// 删除指定视频在特定模型下的本地字幕缓存文件。
-  Future<bool> deleteCachedSubtitles(String videoPath, {required String modelId}) async {
+  Future<bool> deleteCachedSubtitles(
+    String videoPath, {
+    required String modelId,
+  }) async {
     try {
       final dir = NativeFileHelper.desktopSubtitleCacheDir();
       if (!dir.existsSync()) return false;
 
       final fingerprint = _getVideoFingerprint(videoPath);
-      final targetFile = _findCacheFile(videoPath, modelId, fingerprint, dir.path);
+      final targetFile = _findCacheFile(
+        videoPath,
+        modelId,
+        fingerprint,
+        dir.path,
+      );
       if (targetFile != null && await targetFile.exists()) {
         await targetFile.delete();
         return true;

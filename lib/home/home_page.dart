@@ -14,16 +14,40 @@ import 'package:window_manager/window_manager.dart';
 import '../main.dart';
 import '../pflx/pflx.dart';
 import '../player/player_page.dart';
+import '../settings/app_settings.dart';
 import '../settings/settings_page.dart';
 import '../settings/update_service.dart';
 import '../subtitle/ai_task_manager.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
+import 'ai_task_panel.dart';
 
 const Set<String> _kSupportedVideoExtensions = {
-  'mp4', 'mkv', 'mov', 'avi', 'flv', 'wmv', 'webm', 'ts', 'm4v',
-  '3gp', 'rmvb', 'f4v', 'mpg', 'mpeg', 'vob', 'ogv', 'm2ts', 'mts',
-  'divx', 'asf', 'rm', 'dat', 'h264', 'h265', 'hevc'
+  'mp4',
+  'mkv',
+  'mov',
+  'avi',
+  'flv',
+  'wmv',
+  'webm',
+  'ts',
+  'm4v',
+  '3gp',
+  'rmvb',
+  'f4v',
+  'mpg',
+  'mpeg',
+  'vob',
+  'ogv',
+  'm2ts',
+  'mts',
+  'divx',
+  'asf',
+  'rm',
+  'dat',
+  'h264',
+  'h265',
+  'hevc',
 };
 
 bool _isVideoPath(String path) {
@@ -54,6 +78,11 @@ class _HomePageState extends State<HomePage> {
   /// 宽屏双栏模式下，右侧面板是否展示内嵌设置页。
   bool _showSettingsInPanel = false;
 
+  /// 首页选项卡：0 = 播放列表，1 = 任务列表。
+  ///
+  /// 任务列表只在「设置 → 启用 AI 字幕功能」打开时出现。
+  int _homeTab = 0;
+
   @override
   void initState() {
     super.initState();
@@ -61,8 +90,23 @@ class _HomePageState extends State<HomePage> {
       MediaKit.ensureInitialized();
     } catch (_) {}
     _loadSavedLibrary();
+    // "任务列表"选项卡由 AI 字幕总开关控制，设置里改动后首页要立刻同步
+    aiSubtitleEnabled.addListener(_onAiSubtitleSettingChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) => _silentCheckUpdate());
   }
+
+  void _onAiSubtitleSettingChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
+    super.dispose();
+  }
+
+  /// 实际生效的选项卡：AI 字幕总开关关闭时强制回到播放列表。
+  int get _activeHomeTab => aiSubtitleEnabled.value ? _homeTab : 0;
 
   Future<void> _silentCheckUpdate() async {
     try {
@@ -74,10 +118,8 @@ class _HomePageState extends State<HomePage> {
         showDialog<void>(
           context: context,
           barrierDismissible: false,
-          builder: (_) => ForceUpdateDialog(
-            remoteVersion: remote,
-            currentVersion: current,
-          ),
+          builder: (_) =>
+              ForceUpdateDialog(remoteVersion: remote, currentVersion: current),
         );
       }
     } catch (_) {}
@@ -111,7 +153,8 @@ class _HomePageState extends State<HomePage> {
           continue;
         }
         final info = scan(file.path);
-        final isPflx = info != null &&
+        final isPflx =
+            info != null &&
             info['payload_offset'] + info['payload_len'] <= info['file_size'];
         selections.add(
           _LibraryItem(
@@ -174,7 +217,8 @@ class _HomePageState extends State<HomePage> {
   void _playPath(String path, String name) {
     if (!mounted) return;
     final info = scan(path);
-    final isPflx = info != null &&
+    final isPflx =
+        info != null &&
         info['payload_offset'] + info['payload_len'] <= info['file_size'];
     _open(
       _LibraryItem(
@@ -201,7 +245,7 @@ class _HomePageState extends State<HomePage> {
             ),
             title: const Text('开启存储管理权限'),
             content: const Text(
-              '导出隐藏视频到自定义文件夹需要“所有文件访问权限”，请在接下来的系统设置中允许本应用管理所有文件。',
+              '导出隐藏视频到自定义文件夹需要"所有文件访问权限"，请在接下来的系统设置中允许本应用管理所有文件。',
             ),
             actions: [
               TextButton(
@@ -230,9 +274,7 @@ class _HomePageState extends State<HomePage> {
     );
     if (confirmedName == null || !mounted) return;
 
-    final directory = await FilePicker.getDirectoryPath(
-      dialogTitle: '选择保存位置',
-    );
+    final directory = await FilePicker.getDirectoryPath(dialogTitle: '选择保存位置');
     if (directory == null || !mounted) return;
 
     final separator = Platform.pathSeparator;
@@ -364,13 +406,15 @@ class _HomePageState extends State<HomePage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
                 child: Text(
                   item.name,
                   // 文件名通常很长，这里完整展示，一行放不下就自动换行
-                  style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
+                  style: Theme.of(ctx).textTheme.titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w700),
                 ),
               ),
               const Divider(),
@@ -443,9 +487,7 @@ class _HomePageState extends State<HomePage> {
       },
     );
 
-    final scaffold = Scaffold(
-      body: _AmbientBackground(child: bodyContent),
-    );
+    final scaffold = Scaffold(body: _AmbientBackground(child: bodyContent));
 
     if (!isDesktopPlatform) return scaffold;
 
@@ -463,10 +505,7 @@ class _HomePageState extends State<HomePage> {
         if (paths.isNotEmpty) _openDroppedFile(paths.first);
       },
       child: Stack(
-        children: [
-          scaffold,
-          if (_dropActive) const _DropHintOverlay(),
-        ],
+        children: [scaffold, if (_dropActive) const _DropHintOverlay()],
       ),
     );
   }
@@ -483,54 +522,71 @@ class _HomePageState extends State<HomePage> {
               titleSpacing: 24,
               title: const _BrandLockup(compact: true),
               actions: [
-                _AiTaskIndicatorButton(onOpenVideo: _playPath),
                 const ThemeToggleButton(),
                 IconButton(
                   tooltip: '设置',
                   icon: const Icon(Icons.settings_outlined),
                   onPressed: () {
                     Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => const SettingsPage(),
-                      ),
+                      MaterialPageRoute(builder: (_) => const SettingsPage()),
                     );
                   },
                 ),
                 const SizedBox(width: 8),
               ],
             ),
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 120),
-              sliver: SliverList.list(
-                children: [
-                  if (_scanning) ...[
-                    const LinearProgressIndicator(),
-                    const SizedBox(height: 16),
-                  ],
-                  if (_items.isEmpty)
-                    _EmptyLibrary(onPickFiles: () => _pickFiles(autoOpen: true))
-                  else ...[
-                    _SectionHeading(
-                      title: '最近添加',
-                      trailing: '${_items.length} 个视频',
-                    ),
-                    const SizedBox(height: 12),
-                    ..._items.map(
-                      (item) => Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: _VideoLibraryCard(
-                          item: item,
-                          onOpen: () => _open(item),
-                          onExport: () => _export(item),
-                          onDelete: () => _removeItem(item),
-                          onLongPress: () => _showItemOptions(item),
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+                child: _HomeTabBar(
+                  current: _activeHomeTab,
+                  playlistCount: _items.length,
+                  onChanged: (value) => setState(() => _homeTab = value),
+                ),
               ),
             ),
+            if (_activeHomeTab == 1)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(0, 4, 0, 120),
+                  child: AiTaskPanel(onOpenVideo: _playPath, shrinkWrap: true),
+                ),
+              )
+            else
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 120),
+                sliver: SliverList.list(
+                  children: [
+                    if (_scanning) ...[
+                      const LinearProgressIndicator(),
+                      const SizedBox(height: 16),
+                    ],
+                    if (_items.isEmpty)
+                      _EmptyLibrary(
+                        onPickFiles: () => _pickFiles(autoOpen: true),
+                      )
+                    else ...[
+                      _SectionHeading(
+                        title: '最近添加',
+                        trailing: '${_items.length} 个视频',
+                      ),
+                      const SizedBox(height: 12),
+                      ..._items.map(
+                        (item) => Padding(
+                          padding: const EdgeInsets.only(bottom: 12),
+                          child: _VideoLibraryCard(
+                            item: item,
+                            onOpen: () => _open(item),
+                            onExport: () => _export(item),
+                            onDelete: () => _removeItem(item),
+                            onLongPress: () => _showItemOptions(item),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
           ],
         ),
         Positioned(
@@ -572,8 +628,6 @@ class _HomePageState extends State<HomePage> {
                   children: [
                     const _BrandLockup(compact: false),
                     const Spacer(),
-                    _AiTaskIndicatorButton(onOpenVideo: _playPath),
-                    const SizedBox(width: 8),
                     const ThemeToggleButton(),
                   ],
                 ),
@@ -583,9 +637,7 @@ class _HomePageState extends State<HomePage> {
                   padding: const EdgeInsets.fromLTRB(32, 10, 32, 24),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildWideHeroDropCard(context, scheme),
-                    ],
+                    children: [_buildWideHeroDropCard(context, scheme)],
                   ),
                 ),
               ),
@@ -610,7 +662,7 @@ class _HomePageState extends State<HomePage> {
                     embedded: true,
                     onClose: () => setState(() => _showSettingsInPanel = false),
                   )
-                : _buildWideRightPlaylist(context, scheme),
+                : _buildWideRightPanel(context, scheme),
           ),
         ),
       ],
@@ -677,12 +729,15 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// 右侧面板：播放列表 / 任务列表两个选项卡。
+  ///
+  /// AI 字幕总开关关闭时不显示任务选项卡，面板等同于原来的播放列表。
+  Widget _buildWideRightPanel(BuildContext context, ColorScheme scheme) {
+    final tab = _activeHomeTab;
 
-
-  Widget _buildWideRightPlaylist(BuildContext context, ColorScheme scheme) {
     return Column(
       children: [
-        // 顶部面板 Header
+        // 顶部面板 Header（标题位置换成选项卡）
         Container(
           padding: const EdgeInsets.fromLTRB(20, 16, 12, 12),
           decoration: BoxDecoration(
@@ -694,27 +749,13 @@ class _HomePageState extends State<HomePage> {
           ),
           child: Row(
             children: [
-              const Text(
-                '播放列表',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                  color: scheme.primary.withValues(alpha: .15),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  '${_items.length}',
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: scheme.primary,
-                  ),
+              Expanded(
+                child: _HomeTabBar(
+                  current: tab,
+                  playlistCount: _items.length,
+                  onChanged: (value) => setState(() => _homeTab = value),
                 ),
               ),
-              const Spacer(),
               IconButton(
                 icon: const Icon(Icons.add_rounded),
                 tooltip: '添加视频',
@@ -728,58 +769,195 @@ class _HomePageState extends State<HomePage> {
             ],
           ),
         ),
-        if (_scanning) const LinearProgressIndicator(),
-        // 列表区域
+        if (_scanning && tab == 0) const LinearProgressIndicator(),
         Expanded(
-          child: _items.isEmpty
-              ? Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.movie_filter_outlined,
-                          size: 48,
-                          color: scheme.onSurfaceVariant.withValues(alpha: .5),
-                        ),
-                        const SizedBox(height: 12),
-                        Text(
-                          '播放列表暂无内容',
-                          style: TextStyle(
-                            color: scheme.onSurfaceVariant,
-                            fontSize: 14,
+          child: tab == 1
+              ? AiTaskPanel(onOpenVideo: _playPath)
+              : (_items.isEmpty
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.movie_filter_outlined,
+                                size: 48,
+                                color: scheme.onSurfaceVariant.withValues(
+                                  alpha: .5,
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                '播放列表暂无内容',
+                                style: TextStyle(
+                                  color: scheme.onSurfaceVariant,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              OutlinedButton.icon(
+                                onPressed: () => _pickFiles(),
+                                icon: const Icon(Icons.add_rounded, size: 18),
+                                label: const Text('添加视频'),
+                              ),
+                            ],
                           ),
                         ),
-                        const SizedBox(height: 16),
-                        OutlinedButton.icon(
-                          onPressed: () => _pickFiles(),
-                          icon: const Icon(Icons.add_rounded, size: 18),
-                          label: const Text('添加视频'),
-                        ),
-                      ],
-                    ),
-                  ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-                  itemCount: _items.length,
-                  itemBuilder: (context, index) {
-                    final item = _items[index];
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _VideoLibraryCard(
-                        item: item,
-                        onOpen: () => _open(item),
-                        onExport: () => _export(item),
-                        onDelete: () => _removeItem(item),
-                        onLongPress: () => _showItemOptions(item),
-                      ),
-                    );
-                  },
-                ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                        itemCount: _items.length,
+                        itemBuilder: (context, index) {
+                          final item = _items[index];
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 10),
+                            child: _VideoLibraryCard(
+                              item: item,
+                              onOpen: () => _open(item),
+                              onExport: () => _export(item),
+                              onDelete: () => _removeItem(item),
+                              onLongPress: () => _showItemOptions(item),
+                            ),
+                          );
+                        },
+                      )),
         ),
       ],
+    );
+  }
+}
+
+/// 首页选项卡：播放列表 / 任务列表。
+///
+/// 任务数的角标自己监听 [AiTaskManager]，不必让整个首页跟着任务进度重建。
+class _HomeTabBar extends StatelessWidget {
+  const _HomeTabBar({
+    required this.current,
+    required this.playlistCount,
+    required this.onChanged,
+  });
+
+  /// 当前选中的选项卡（0 = 播放列表，1 = 任务列表）。
+  final int current;
+
+  /// 播放列表视频数（>0 时在标签上显示角标）。
+  final int playlistCount;
+
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+
+    // AI 字幕总开关关闭：不显示选项卡，退化成原来的标题
+    if (!aiSubtitleEnabled.value) {
+      return const Text(
+        '播放列表',
+        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+      );
+    }
+
+    return ListenableBuilder(
+      listenable: AiTaskManager.instance,
+      builder: (context, _) {
+        final running = AiTaskManager.instance.activeTasks.length;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _chip(
+              context,
+              scheme: scheme,
+              label: '播放列表',
+              badge: playlistCount > 0 ? '$playlistCount' : null,
+              selected: current == 0,
+              onTap: () => onChanged(0),
+            ),
+            const SizedBox(width: 8),
+            _chip(
+              context,
+              scheme: scheme,
+              label: '任务列表',
+              // 不显示数量角标：同一时刻最多只有一个识别任务（0 或 1），
+              // 用旋转的小圈表示"正在识别"就够了。
+              showSpinner: running > 0,
+              selected: current == 1,
+              onTap: () => onChanged(1),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _chip(
+    BuildContext context, {
+    required ColorScheme scheme,
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+    String? badge,
+    bool showSpinner = false,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(18),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: selected
+              ? scheme.primary.withValues(alpha: .16)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: selected
+                ? scheme.primary.withValues(alpha: .45)
+                : scheme.outlineVariant.withValues(alpha: .4),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (showSpinner) ...[
+              SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: scheme.primary,
+                ),
+              ),
+              const SizedBox(width: 6),
+            ],
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 13.5,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: selected ? scheme.primary : scheme.onSurfaceVariant,
+              ),
+            ),
+            if (badge != null) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                decoration: BoxDecoration(
+                  color: scheme.primary.withValues(alpha: .18),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  badge,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.primary,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }
@@ -867,8 +1045,9 @@ class _AmbientBackground extends StatelessWidget {
           top: -130,
           right: -100,
           child: _GlowOrb(
-            color: (isDark ? const Color(0xFF5148A4) : PolyFlixColors.softViolet)
-                .withValues(alpha: isDark ? .25 : .7),
+            color:
+                (isDark ? const Color(0xFF5148A4) : PolyFlixColors.softViolet)
+                    .withValues(alpha: isDark ? .25 : .7),
             size: 280,
           ),
         ),
@@ -968,9 +1147,8 @@ class _EmptyLibrary extends StatelessWidget {
             Text(
               '一个特殊的万能视频播放器',
               textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
+              style: Theme.of(context).textTheme.titleLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 24),
             FilledButton.icon(
@@ -997,18 +1175,16 @@ class _SectionHeading extends StatelessWidget {
       children: [
         Text(
           title,
-          style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                fontWeight: FontWeight.w700,
-                letterSpacing: -0.4,
-              ),
+          style: Theme.of(context).textTheme.titleLarge
+              ?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.4),
         ),
         const Spacer(),
         if (trailing != null)
           Text(
             trailing!,
             style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
       ],
     );
@@ -1067,10 +1243,7 @@ class _VideoLibraryCard extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Icon(
-            Icons.file_download_outlined,
-            color: scheme.onPrimaryContainer,
-          ),
+          Icon(Icons.file_download_outlined, color: scheme.onPrimaryContainer),
           const SizedBox(width: 8),
           Text(
             '导出隐藏视频',
@@ -1122,13 +1295,17 @@ class _VideoLibraryCard extends StatelessWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _FileTypeBadge(isPflx: isPflx, encrypted: item.encrypted),
+                          _FileTypeBadge(
+                            isPflx: isPflx,
+                            encrypted: item.encrypted,
+                          ),
                           const SizedBox(height: 6),
                           Text(
                             item.name,
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            style: Theme.of(context).textTheme.titleMedium
+                                ?.copyWith(
                                   fontWeight: FontWeight.w700,
                                   height: 1.2,
                                 ),
@@ -1149,14 +1326,16 @@ class _VideoLibraryCard extends StatelessWidget {
                     const SizedBox(width: 5),
                     Text(
                       _formatBytes(item.fileBytes),
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: scheme.onSurfaceVariant,
-                          ),
+                      style: Theme.of(context).textTheme.bodySmall
+                          ?.copyWith(color: scheme.onSurfaceVariant),
                     ),
                     if (isPflx) ...[
                       Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 8),
-                        child: Text('·', style: TextStyle(color: scheme.outline)),
+                        child: Text(
+                          '·',
+                          style: TextStyle(color: scheme.outline),
+                        ),
                       ),
                       Icon(
                         Icons.visibility_off_outlined,
@@ -1167,9 +1346,9 @@ class _VideoLibraryCard extends StatelessWidget {
                       Text(
                         '隐藏内容 ${_formatBytes(item.hiddenBytes)}',
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: scheme.primary,
-                              fontWeight: FontWeight.w600,
-                            ),
+                          color: scheme.primary,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ],
                   ],
@@ -1178,14 +1357,21 @@ class _VideoLibraryCard extends StatelessWidget {
                   const SizedBox(height: 12),
                   Container(
                     width: double.infinity,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
                     decoration: BoxDecoration(
                       color: scheme.primaryContainer.withValues(alpha: .35),
                       borderRadius: BorderRadius.circular(10),
                     ),
                     child: Row(
                       children: [
-                        Icon(Icons.auto_awesome_rounded, size: 15, color: scheme.primary),
+                        Icon(
+                          Icons.auto_awesome_rounded,
+                          size: 15,
+                          color: scheme.primary,
+                        ),
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
@@ -1194,7 +1380,8 @@ class _VideoLibraryCard extends StatelessWidget {
                                 : item.hiddenName!,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
                                   fontWeight: FontWeight.w600,
                                   color: scheme.onSurface,
                                 ),
@@ -1286,7 +1473,9 @@ class _VideoThumbnailBadge extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
               decoration: BoxDecoration(
-                color: (isDark ? Colors.black : Colors.white).withValues(alpha: .75),
+                color: (isDark ? Colors.black : Colors.white).withValues(
+                  alpha: .75,
+                ),
                 borderRadius: BorderRadius.circular(4),
               ),
               child: Text(
@@ -1315,9 +1504,7 @@ class _FileTypeBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final color = isPflx ? scheme.primary : scheme.onSurfaceVariant;
-    final label = isPflx
-        ? (encrypted ? 'PFLX · 已加密' : 'PFLX 双视频')
-        : '普通视频';
+    final label = isPflx ? (encrypted ? 'PFLX · 已加密' : 'PFLX 双视频') : '普通视频';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
@@ -1326,7 +1513,11 @@ class _FileTypeBadge extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w800),
+        style: TextStyle(
+          color: color,
+          fontSize: 11,
+          fontWeight: FontWeight.w800,
+        ),
       ),
     );
   }
@@ -1384,10 +1575,7 @@ class _ExportNameDialogState extends State<_ExportNameDialog> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return AlertDialog(
-      icon: Icon(
-        Icons.file_download_outlined,
-        color: scheme.primary,
-      ),
+      icon: Icon(Icons.file_download_outlined, color: scheme.primary),
       title: const Text('导出隐藏视频'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
@@ -1416,10 +1604,7 @@ class _ExportNameDialogState extends State<_ExportNameDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('取消'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('选择位置'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('选择位置')),
       ],
     );
   }
@@ -1458,18 +1643,16 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
     setState(() => _status = '正在导出并校验文件…');
 
     try {
-      extractPayload(
-        widget.sourcePath,
-        widget.outputPath,
-        widget.info,
-        (done, total) {
-          if (!mounted) return;
-          setState(() {
-            _progress = total == 0 ? 0 : done / total;
-            _status = '已处理 ${_formatBytes(done)} / ${_formatBytes(total)}';
-          });
-        },
-      );
+      extractPayload(widget.sourcePath, widget.outputPath, widget.info, (
+        done,
+        total,
+      ) {
+        if (!mounted) return;
+        setState(() {
+          _progress = total == 0 ? 0 : done / total;
+          _status = '已处理 ${_formatBytes(done)} / ${_formatBytes(total)}';
+        });
+      });
       if (mounted) widget.onComplete(const _ExportResult.success());
     } catch (error) {
       if (mounted) widget.onComplete(_ExportResult.failure(error.toString()));
@@ -1479,8 +1662,10 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      icon: Icon(Icons.file_download_outlined,
-          color: Theme.of(context).colorScheme.primary),
+      icon: Icon(
+        Icons.file_download_outlined,
+        color: Theme.of(context).colorScheme.primary,
+      ),
       title: const Text('正在导出隐藏视频'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
@@ -1495,17 +1680,17 @@ class _ExportProgressDialogState extends State<_ExportProgressDialog> {
             child: Text(
               '${(_progress * 100).toStringAsFixed(0)}%',
               style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
           const SizedBox(height: 8),
           Text(
             '请保持应用开启，导出完成后会自动进行完整性校验。',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  height: 1.4,
-                ),
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              height: 1.4,
+            ),
           ),
         ],
       ),
@@ -1527,7 +1712,9 @@ String _formatBytes(int bytes) {
 }
 
 abstract final class _StoragePermissionHelper {
-  static const _channel = MethodChannel('com.polyflix.player/storage_permission');
+  static const _channel = MethodChannel(
+    'com.polyflix.player/storage_permission',
+  );
 
   static Future<bool> hasPermission() async {
     if (!Platform.isAndroid) return true;
@@ -1558,7 +1745,8 @@ abstract final class _LibraryStorage {
       for (final path in paths) {
         if (!File(path).existsSync()) continue;
         final info = scan(path);
-        final isPflx = info != null &&
+        final isPflx =
+            info != null &&
             info['payload_offset'] + info['payload_len'] <= info['file_size'];
         list.add(
           _LibraryItem(
@@ -1585,10 +1773,7 @@ abstract final class _LibraryStorage {
 }
 
 class _UndoCountdownButton extends StatefulWidget {
-  const _UndoCountdownButton({
-    required this.duration,
-    required this.onPressed,
-  });
+  const _UndoCountdownButton({required this.duration, required this.onPressed});
 
   final Duration duration;
   final VoidCallback onPressed;
@@ -1604,10 +1789,8 @@ class _UndoCountdownButtonState extends State<_UndoCountdownButton>
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: widget.duration,
-    )..forward();
+    _controller = AnimationController(vsync: this, duration: widget.duration)
+      ..forward();
   }
 
   @override
@@ -1674,211 +1857,3 @@ class _UndoCountdownButtonState extends State<_UndoCountdownButton>
     );
   }
 }
-
-class _AiTaskIndicatorButton extends StatelessWidget {
-  const _AiTaskIndicatorButton({required this.onOpenVideo});
-
-  final void Function(String path, String name) onOpenVideo;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: AiTaskManager.instance,
-      builder: (context, _) {
-        final activeTasks = AiTaskManager.instance.activeTasks;
-        if (activeTasks.isEmpty) return const SizedBox.shrink();
-
-        final count = activeTasks.length;
-        final theme = Theme.of(context);
-        final scheme = theme.colorScheme;
-
-        return Tooltip(
-          message: '后台正在进行 $count 个语音识别任务 (点击查看)',
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(20),
-              onTap: () => _showAiTasksDialog(context, onOpenVideo),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                decoration: BoxDecoration(
-                  color: scheme.primaryContainer.withValues(alpha: 0.8),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: scheme.primary.withValues(alpha: 0.3),
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: scheme.primary,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      'AI 识别中 ($count)',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: scheme.onPrimaryContainer,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  static void _showAiTasksDialog(
-    BuildContext context,
-    void Function(String path, String name) onOpenVideo,
-  ) {
-    showDialog<void>(
-      context: context,
-      builder: (dialogCtx) {
-        return AlertDialog(
-          title: Row(
-            children: [
-              Icon(
-                Icons.auto_awesome_rounded,
-                color: Theme.of(dialogCtx).colorScheme.primary,
-                size: 22,
-              ),
-              const SizedBox(width: 8),
-              const Text('AI 语音识别任务中心', style: TextStyle(fontSize: 17)),
-            ],
-          ),
-          content: SizedBox(
-            width: 480,
-            child: ListenableBuilder(
-              listenable: AiTaskManager.instance,
-              builder: (context, _) {
-                final tasks = AiTaskManager.instance.activeTasks;
-                if (tasks.isEmpty) {
-                  return const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 24),
-                    child: Center(
-                      child: Text(
-                        '当前没有正在处理的 AI 任务',
-                        style: TextStyle(color: Colors.white54),
-                      ),
-                    ),
-                  );
-                }
-
-                return ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: tasks.length,
-                  separatorBuilder: (context, index) => const Divider(height: 16),
-                  itemBuilder: (context, index) {
-                    final task = tasks[index];
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                task.videoTitle,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 14,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 6,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.15),
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                task.modelDisplayName,
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Theme.of(context).colorScheme.primary,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: LinearProgressIndicator(
-                            value: task.percent > 0 ? task.percent : null,
-                            minHeight: 6,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                task.statusMessage ?? '正在处理中…',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            ),
-                            TextButton.icon(
-                              style: TextButton.styleFrom(
-                                visualDensity: VisualDensity.compact,
-                                foregroundColor: Theme.of(context).colorScheme.error,
-                              ),
-                              icon: const Icon(Icons.cancel_outlined, size: 16),
-                              label: const Text('取消'),
-                              onPressed: () => task.cancel(),
-                            ),
-                            const SizedBox(width: 4),
-                            FilledButton.tonalIcon(
-                              style: FilledButton.styleFrom(
-                                visualDensity: VisualDensity.compact,
-                              ),
-                              icon: const Icon(Icons.play_arrow_rounded, size: 16),
-                              label: const Text('播放'),
-                              onPressed: () {
-                                Navigator.of(dialogCtx).pop();
-                                onOpenVideo(task.videoPath, task.videoTitle);
-                              },
-                            ),
-                          ],
-                        ),
-                      ],
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogCtx).pop(),
-              child: const Text('关闭'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-

@@ -6,6 +6,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'home/home_page.dart';
 import 'settings/app_settings.dart';
+import 'subtitle/ai_task_manager.dart';
 import 'subtitle/whisper_server.dart';
 import 'utils/platform_utils.dart';
 
@@ -24,6 +25,8 @@ Future<void> main() async {
   }
   // 设置在首帧之前读上来，否则界面会先按默认值渲染再跳变。
   await loadAppSettings();
+  // 恢复持久化的 AI 识别任务记录（历史记录 + 上次异常退出时的中断标记）
+  await AiTaskManager.instance.loadPersisted();
   runApp(const PolyFlixApp());
 }
 

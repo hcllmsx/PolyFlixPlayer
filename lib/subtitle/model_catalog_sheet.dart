@@ -1,8 +1,10 @@
-/// 全部语音模型对照表（介绍表格 + 已导入状态 + 选用/删除）。
+/// 语音模型面板，两种形态共用一套数据：
 ///
-/// 应用**不内置任何下载链接**，所以这张表承担"说明书"的角色：
-/// 用户按表格选好模型 → 去网盘下载同名文件 → 用设置页的「导入模型」导入。
-/// 表格左侧按官方原始文件名（如 `ggml-small-q5_1.bin`）展示，方便用户去网盘对照查找。
+/// - [ModelSheetMode.catalog]（设置页「浏览全部模型」）：完整**对照表** —— 33 个型号
+///   按官方原始文件名（如 `ggml-small-q5_1.bin`）列出，带档位、体积、说明、耗时参考、
+///   网盘入口与已导入状态，承担"说明书 + 管理面板"的角色；
+/// - [ModelSheetMode.picker]（AI 字幕面板的「选择模型」）：极简**选择器** —— 只列
+///   已导入的模型，让用户快速切换，不再重复显示对照表内容。
 library;
 
 import 'package:flutter/material.dart';
@@ -13,6 +15,15 @@ import '../utils/platform_utils.dart';
 import 'download_links.dart';
 import 'model_manager.dart';
 
+/// 面板形态。
+enum ModelSheetMode {
+  /// 完整对照表（设置页）。
+  catalog,
+
+  /// 只列已导入模型的选择器（AI 字幕面板）。
+  picker,
+}
+
 /// 模型面板的返回结果。
 class ModelPickerResult {
   const ModelPickerResult({required this.modelId});
@@ -21,21 +32,29 @@ class ModelPickerResult {
 }
 
 class ModelCatalogSheet extends StatefulWidget {
-  const ModelCatalogSheet({super.key, this.selectedId});
+  const ModelCatalogSheet({
+    super.key,
+    this.selectedId,
+    this.mode = ModelSheetMode.catalog,
+  });
 
   /// 当前选中的模型 ID。
   final String? selectedId;
 
-  /// 弹出面板；返回用户在表格里选用的模型（取消时返回 null）。
+  /// 面板形态，见 [ModelSheetMode]。
+  final ModelSheetMode mode;
+
+  /// 弹出面板；返回用户选用的模型（取消时返回 null）。
   static Future<ModelPickerResult?> show(
     BuildContext context, {
     String? selectedId,
+    ModelSheetMode mode = ModelSheetMode.catalog,
   }) {
     return showModalBottomSheet<ModelPickerResult>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
-      builder: (_) => ModelCatalogSheet(selectedId: selectedId),
+      builder: (_) => ModelCatalogSheet(selectedId: selectedId, mode: mode),
     );
   }
 
@@ -96,6 +115,14 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
 
   @override
   Widget build(BuildContext context) {
+    return widget.mode == ModelSheetMode.picker
+        ? _buildPicker(context)
+        : _buildCatalog(context);
+  }
+
+  // ------------------------------------------------ 对照表（设置页「浏览全部模型」）
+
+  Widget _buildCatalog(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
     return ConstrainedBox(
@@ -492,6 +519,161 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  // ------------------------------------------------ 选择器（AI 字幕面板「选择模型」）
+
+  /// 只列已导入的模型：播放中想换个模型时用，不需要看整张对照表。
+  Widget _buildPicker(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final imported = availableModels
+        .where((m) => _imported.contains(m.id))
+        .toList();
+
+    return ConstrainedBox(
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.of(context).size.height * 0.88,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 12, 8),
+            child: Row(
+              children: [
+                Icon(Icons.memory_rounded, color: scheme.primary),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '选择语音识别模型',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        _loading
+                            ? '正在检查已导入的模型…'
+                            : '只列出已导入的模型（共 ${imported.length} 个），点击即可切换使用',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                          height: 1.4,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close_rounded),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Flexible(
+            child: _loading
+                ? const Padding(
+                    padding: EdgeInsets.all(32),
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                : (imported.isEmpty
+                      ? _pickerEmpty(scheme)
+                      : ListView(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          shrinkWrap: true,
+                          children: [
+                            for (final m in imported) _pickerRow(scheme, m),
+                          ],
+                        )),
+          ),
+          _pickerFooter(scheme),
+        ],
+      ),
+    );
+  }
+
+  Widget _pickerRow(ColorScheme scheme, WhisperModelInfo model) {
+    final selected = widget.selectedId == model.id;
+    return ListTile(
+      dense: true,
+      onTap: () =>
+          Navigator.of(context).pop(ModelPickerResult(modelId: model.id)),
+      leading: Icon(
+        selected
+            ? Icons.radio_button_checked_rounded
+            : Icons.radio_button_unchecked_rounded,
+        color: selected ? scheme.primary : scheme.onSurfaceVariant,
+      ),
+      title: Text(
+        model.fileName,
+        style: TextStyle(
+          fontSize: 13,
+          fontFamily: 'Consolas',
+          fontFamilyFallback: const ['Menlo', 'monospace'],
+          fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+          color: selected ? scheme.primary : scheme.onSurface,
+        ),
+      ),
+      subtitle: Text(
+        '${model.displayName} · ${model.sizeLabel}',
+        style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+      ),
+      trailing: selected
+          ? Text('使用中', style: TextStyle(fontSize: 12, color: scheme.primary))
+          : null,
+    );
+  }
+
+  /// 一个模型都没导入时的引导（指向设置页的对照表与导入按钮）。
+  Widget _pickerEmpty(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 24, 20, 28),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '还没有导入任何模型',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurface,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '请到「设置 → AI 语音字幕 → 浏览全部模型」查看型号对照表，'
+            '按文件名去网盘下载后用同页的「导入模型」导入。',
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.6,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _pickerFooter(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+      child: Text(
+        '需要查看全部 ${availableModels.length} 个型号的说明，或想换用别的模型？'
+        '请到「设置 → AI 语音字幕 → 浏览全部模型」。',
+        style: TextStyle(
+          fontSize: 11.5,
+          height: 1.5,
+          color: scheme.onSurfaceVariant.withValues(alpha: .75),
+        ),
       ),
     );
   }

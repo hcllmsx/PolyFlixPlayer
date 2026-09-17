@@ -130,15 +130,17 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _statusMessage = runningTask.statusMessage;
     } else if (_generator.entries.isEmpty) {
       // 尝试自动读取当前视频的本地字幕缓存（按模型精准匹配）
-      AiTaskManager.instance.loadCachedSubtitles(widget.videoPath, modelId: _selectedModel).then((cached) {
-        if (mounted && cached != null && cached.isNotEmpty) {
-          _generator.setEntries(cached, videoPath: widget.videoPath);
-          setState(() {
-            _currentState = AsrState.completed;
-            _statusMessage = '已载入历史字幕缓存 (共 ${cached.length} 条)';
+      AiTaskManager.instance
+          .loadCachedSubtitles(widget.videoPath, modelId: _selectedModel)
+          .then((cached) {
+            if (mounted && cached != null && cached.isNotEmpty) {
+              _generator.setEntries(cached, videoPath: widget.videoPath);
+              setState(() {
+                _currentState = AsrState.completed;
+                _statusMessage = '已载入历史字幕缓存 (共 ${cached.length} 条)';
+              });
+            }
           });
-        }
-      });
     }
 
     AiTaskManager.instance.addListener(_onTaskManagerChanged);
@@ -161,11 +163,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     EnginePackManager.instance
         .resolvePreferred(allowGpu: !aiAsrForceCpu.value)
         .then((pack) {
-      if (!mounted) return;
-      setState(() {
-        _engineLabel = pack == null ? '内置 CPU 引擎' : pack.displayName;
-      });
-    });
+          if (!mounted) return;
+          setState(() {
+            _engineLabel = pack == null ? '内置 CPU 引擎' : pack.displayName;
+          });
+        });
   }
 
   void _onTaskManagerChanged() {
@@ -175,7 +177,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       setState(() {
         _currentState = task.state;
         _statusMessage = task.statusMessage;
-        if (task.state == AsrState.preparing || task.state == AsrState.processing) {
+        if (task.state == AsrState.preparing ||
+            task.state == AsrState.processing) {
           _selectedModel = task.modelId;
         }
       });
@@ -193,31 +196,39 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Future<void> _checkModels() async {
-    // 只探测"当前选中的模型"是否已导入（模型有四十多个，不逐个扫描）
+    // 扫一遍模型目录，记下"哪些模型已导入"。
+    //
+    // 注意：这里必须记录**全部**模型的可用性，不能只记当前选中的那一个 ——
+    // 之前只写 `{当前选中: 是否可用}`，一旦 _selectedModel 与这次探测结果不同步
+    // （例如打开面板时刚好有别的识别任务在跑、导致下面的 `_selectedModel = activeId`
+    // 被跳过），卡片查表就会查到空值，误报"尚未导入模型"。
+    final imported = (await ModelManager.instance.getDownloadedModels())
+        .toSet();
+
+    // 选中的模型没导入时，回落到第一个已导入的模型；一个都没导入则保持原选择，
+    // 由界面提示去设置页导入。
     var activeId = _selectedModel;
-    var activeReady = await ModelManager.instance.isModelDownloaded(activeId);
-    if (!activeReady) {
-      // 选中的模型没导入：回落到任一个已导入的模型；
-      // 一个都没导入就保持原选择，由界面提示去导入。
-      for (final m in availableModels) {
-        if (await ModelManager.instance.isModelDownloaded(m.id)) {
-          activeId = m.id;
-          activeReady = true;
-          break;
-        }
-      }
+    if (!imported.contains(activeId)) {
+      final fallback = availableModels
+          .where((m) => imported.contains(m.id))
+          .toList();
+      if (fallback.isNotEmpty) activeId = fallback.first.id;
     }
+
     // 顺便确认当前视频有哪些模型留下了字幕缓存（界面标记用）
-    final cachedList =
-        await AiTaskManager.instance.getCachedModelIds(widget.videoPath);
+    final cachedList = await AiTaskManager.instance.getCachedModelIds(
+      widget.videoPath,
+    );
     if (!mounted) return;
 
     setState(() {
       _cachedModels = cachedList.toSet();
-      _modelAvailability = {activeId: activeReady};
-      final isRunning = _currentState == AsrState.preparing ||
-          _currentState == AsrState.processing;
-      if (!isRunning && activeReady) _selectedModel = activeId;
+      _modelAvailability = {
+        for (final m in availableModels) m.id: imported.contains(m.id),
+      };
+      // 选中的模型确实已导入时才落位。正在识别时 _selectedModel 已经是任务用的
+      // 那个模型（同样已导入），所以这里无条件同步是安全的，也不会打断识别。
+      if (imported.contains(activeId)) _selectedModel = activeId;
       _checkingModels = false;
     });
     _syncEnglishOnlyLanguage();
@@ -232,7 +243,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Future<void> _onSelectModel(String id) async {
-    final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
+    final isRunning =
+        _currentState == AsrState.preparing ||
+        _currentState == AsrState.processing;
     if (isRunning) return;
 
     setState(() => _selectedModel = id);
@@ -250,7 +263,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _generator.setEntries(cached, videoPath: widget.videoPath);
       setState(() {
         _currentState = AsrState.completed;
-        _statusMessage = '已切换并载入 ${id.toUpperCase()} 模型历史缓存 (共 ${cached.length} 条)';
+        _statusMessage =
+            '已切换并载入 ${id.toUpperCase()} 模型历史缓存 (共 ${cached.length} 条)';
       });
     } else {
       _generator.clear();
@@ -263,7 +277,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   void _startTranscribing() {
-    final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
+    final isRunning =
+        _currentState == AsrState.preparing ||
+        _currentState == AsrState.processing;
     if (isRunning) return;
 
     // 低端/老旧设备不做兼容降级，直接明确拒绝
@@ -281,7 +297,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       AppToast.show(
         context,
         '所选模型 $_selectedModel 尚未导入：请在设置页「浏览全部模型」里按文件名对照，'
-            '从网盘下载后用「导入模型」导入',
+        '从网盘下载后用「导入模型」导入',
         isError: true,
       );
       return;
@@ -293,7 +309,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       widget.onToggleSubtitleActive(true);
     }
 
-    final title = widget.videoTitle ??
+    final title =
+        widget.videoTitle ??
         (widget.videoPath.contains(Platform.pathSeparator)
             ? widget.videoPath.split(Platform.pathSeparator).last
             : widget.videoPath);
@@ -326,7 +343,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         ),
         content: Text(
           '确定要删除当前 $modelName 模型的字幕缓存吗？\n删除后可重新识别原音频。',
-          style: const TextStyle(fontSize: 13, color: Colors.white70, height: 1.5),
+          style: const TextStyle(
+            fontSize: 13,
+            color: Colors.white70,
+            height: 1.5,
+          ),
         ),
         actions: [
           TextButton(
@@ -379,10 +400,14 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       // 提取建议的导出文件名
       String defaultName = 'subtitle.srt';
       if (widget.videoTitle != null && widget.videoTitle!.trim().isNotEmpty) {
-        final sanitized = widget.videoTitle!.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+        final sanitized = widget.videoTitle!
+            .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+            .trim();
         defaultName = '$sanitized.srt';
       } else {
-        final base = widget.videoPath.split(Platform.isWindows ? r'\' : '/').last;
+        final base = widget.videoPath
+            .split(Platform.isWindows ? r'\' : '/')
+            .last;
         final dotIdx = base.lastIndexOf('.');
         if (dotIdx > 0) {
           defaultName = '${base.substring(0, dotIdx)}.srt';
@@ -496,7 +521,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                     ),
                   ),
                   IconButton(
-                    icon: const Icon(Icons.close_rounded, color: Colors.white70),
+                    icon: const Icon(
+                      Icons.close_rounded,
+                      color: Colors.white70,
+                    ),
                     onPressed: () => Navigator.of(context).pop(),
                   ),
                 ],
@@ -691,7 +719,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     }
 
     final isRunning =
-        _currentState == AsrState.preparing || _currentState == AsrState.processing;
+        _currentState == AsrState.preparing ||
+        _currentState == AsrState.processing;
     final info = ModelManager.instance.infoOf(_selectedModel);
     final isAvailable = _modelAvailability[_selectedModel] ?? false;
     final hasCache = _cachedModels.contains(_selectedModel);
@@ -705,13 +734,17 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
           color: const Color(0xFF262630),
           borderRadius: BorderRadius.circular(10),
           border: Border.all(
-            color: isAvailable ? Colors.white12 : Colors.redAccent.withValues(alpha: .5),
+            color: isAvailable
+                ? Colors.white12
+                : Colors.redAccent.withValues(alpha: .5),
           ),
         ),
         child: Row(
           children: [
             Icon(
-              isAvailable ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded,
+              isAvailable
+                  ? Icons.check_circle_outline_rounded
+                  : Icons.error_outline_rounded,
               size: 20,
               color: isAvailable ? Colors.green : Colors.redAccent,
             ),
@@ -752,7 +785,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                     ),
                     style: TextStyle(
                       fontSize: 11,
-                      color: isAvailable ? Colors.white54 : Colors.redAccent.withValues(alpha: .8),
+                      color: isAvailable
+                          ? Colors.white54
+                          : Colors.redAccent.withValues(alpha: .8),
                     ),
                   ),
                 ],
@@ -761,10 +796,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             const SizedBox(width: 8),
             Text(
               '更换',
-              style: TextStyle(
-                fontSize: 12,
-                color: theme.colorScheme.primary,
-              ),
+              style: TextStyle(fontSize: 12, color: theme.colorScheme.primary),
             ),
             Icon(
               Icons.chevron_right_rounded,
@@ -785,7 +817,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     required bool hasCache,
   }) {
     if (isRunning) return '识别进行中，暂不能切换模型';
-    if (!isAvailable) return '模型文件未导入，点击右侧查看对照表并导入';
+    if (!isAvailable) return '尚未导入模型，点击右侧选择（需先在设置页导入）';
 
     final buffer = StringBuffer(info?.sizeLabel ?? '');
     if (hasCache) buffer.write(' · 已生成该模型字幕缓存');
@@ -812,9 +844,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   /// 打开模型选择面板；选中的模型会立即生效（有缓存则载入该模型缓存）。
   Future<void> _openModelPicker() async {
+    // AI 面板里只要"已导入模型的选择器"，完整对照表留给设置页
     final result = await ModelCatalogSheet.show(
       context,
       selectedId: _selectedModel,
+      mode: ModelSheetMode.picker,
     );
     if (result == null || !mounted) return;
 
@@ -897,7 +931,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       ),
       child: Row(
         children: [
-          const Icon(Icons.closed_caption_rounded, color: Colors.white70, size: 20),
+          const Icon(
+            Icons.closed_caption_rounded,
+            color: Colors.white70,
+            size: 20,
+          ),
           const SizedBox(width: 10),
           const Expanded(
             child: Text(
@@ -917,14 +955,22 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             const SizedBox(width: 4),
             IconButton(
               tooltip: '导出为 SRT 字幕文件',
-              icon: const Icon(Icons.file_download_outlined, color: Colors.white70, size: 20),
+              icon: const Icon(
+                Icons.file_download_outlined,
+                color: Colors.white70,
+                size: 20,
+              ),
               onPressed: _exportSrtFile,
             ),
           ],
           const SizedBox(width: 4),
           IconButton(
             tooltip: '删除字幕缓存',
-            icon: const Icon(Icons.delete_outline_rounded, color: Colors.white60, size: 20),
+            icon: const Icon(
+              Icons.delete_outline_rounded,
+              color: Colors.white60,
+              size: 20,
+            ),
             onPressed: (hasEntries || _cachedModels.contains(_selectedModel))
                 ? _deleteSubtitlesWithConfirm
                 : null,
@@ -955,10 +1001,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             const Spacer(),
             Text(
               _previewExpanded ? '收起' : '展开查看',
-              style: TextStyle(
-                fontSize: 12,
-                color: theme.colorScheme.primary,
-              ),
+              style: TextStyle(fontSize: 12, color: theme.colorScheme.primary),
             ),
             const SizedBox(width: 4),
             Icon(
@@ -985,12 +1028,15 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       child: ListView.separated(
         padding: const EdgeInsets.all(8),
         itemCount: entries.length,
-        separatorBuilder: (_, _) => const Divider(color: Colors.white10, height: 1),
+        separatorBuilder: (_, _) =>
+            const Divider(color: Colors.white10, height: 1),
         itemBuilder: (context, idx) {
           final e = entries[idx];
           final startStr = _formatDuration(e.start);
           return InkWell(
-            onTap: widget.onSeekTo != null ? () => widget.onSeekTo!(e.start) : null,
+            onTap: widget.onSeekTo != null
+                ? () => widget.onSeekTo!(e.start)
+                : null,
             borderRadius: BorderRadius.circular(6),
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 6),
@@ -1009,7 +1055,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                   Expanded(
                     child: Text(
                       e.text,
-                      style: const TextStyle(fontSize: 12, color: Colors.white70),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white70,
+                      ),
                     ),
                   ),
                 ],
@@ -1028,10 +1077,15 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
           backgroundColor: Colors.redAccent.shade700,
           foregroundColor: Colors.white,
           padding: const EdgeInsets.symmetric(vertical: 14),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
         ),
         icon: const Icon(Icons.stop_circle_rounded, size: 20),
-        label: const Text('停止识别', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+        label: const Text(
+          '停止识别',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+        ),
         onPressed: _stopTranscribing,
       );
     }
@@ -1046,19 +1100,23 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         Expanded(
           child: FilledButton.icon(
             style: FilledButton.styleFrom(
-              backgroundColor: hasCache ? Colors.white12 : theme.colorScheme.primary,
+              backgroundColor: hasCache
+                  ? Colors.white12
+                  : theme.colorScheme.primary,
               foregroundColor: hasCache ? Colors.white38 : Colors.white,
               disabledBackgroundColor: Colors.white10,
               disabledForegroundColor: Colors.white30,
               padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
             icon: Icon(
               unsupported
                   ? Icons.block_rounded
                   : (hasCache
-                      ? Icons.check_circle_outline_rounded
-                      : Icons.mic_none_rounded),
+                        ? Icons.check_circle_outline_rounded
+                        : Icons.mic_none_rounded),
               size: 20,
               color: hasCache ? Colors.white38 : Colors.white,
             ),
@@ -1066,8 +1124,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               unsupported
                   ? '当前设备不支持此功能'
                   : (hasModel
-                      ? (hasCache ? '已有字幕缓存' : '开始识别原音频')
-                      : '未就绪 (缺少模型)'),
+                        ? (hasCache ? '已有字幕缓存' : '开始识别原音频')
+                        : '未就绪 (缺少模型)'),
               style: TextStyle(
                 fontSize: 15,
                 fontWeight: FontWeight.w600,

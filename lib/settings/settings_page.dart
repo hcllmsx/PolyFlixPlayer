@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../subtitle/ai_task_manager.dart';
 import '../subtitle/device_capability.dart';
 import '../subtitle/engine_catalog_sheet.dart';
 import '../subtitle/engine_pack.dart';
@@ -19,11 +20,7 @@ import 'app_settings.dart';
 import 'update_service.dart';
 
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({
-    super.key,
-    this.embedded = false,
-    this.onClose,
-  });
+  const SettingsPage({super.key, this.embedded = false, this.onClose});
 
   /// 是否作为右侧面板内嵌展示。
   final bool embedded;
@@ -69,8 +66,9 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _refreshEnginePacks() async {
     final packs = await EnginePackManager.instance.resolveAll();
-    final preferred = await EnginePackManager.instance
-        .resolvePreferred(allowGpu: !aiAsrForceCpu.value);
+    final preferred = await EnginePackManager.instance.resolvePreferred(
+      allowGpu: !aiAsrForceCpu.value,
+    );
     if (!mounted) return;
     setState(() {
       _enginePacks = packs;
@@ -111,9 +109,9 @@ class _SettingsPageState extends State<SettingsPage> {
       await ModelManager.instance.deleteModel(model.id);
       await _refreshModels();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已删除模型 ${model.displayName}')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('已删除模型 ${model.displayName}')));
       }
     }
   }
@@ -173,15 +171,13 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
       if (!ok && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('无法打开链接: $url')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('无法打开链接: $url')));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('打开链接失败: $e')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('打开链接失败: $e')));
       }
     }
   }
@@ -200,274 +196,274 @@ class _SettingsPageState extends State<SettingsPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                  const Text(
-                    '应用外观',
-                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                const Text(
+                  '应用外观',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '选择你偏好的界面色彩模式。',
+                  style: TextStyle(
+                    color: scheme.onSurfaceVariant,
+                    fontSize: 13,
                   ),
-                  const SizedBox(height: 6),
-                  Text(
-                    '选择你偏好的界面色彩模式。',
-                    style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
-                  ),
-                  const SizedBox(height: 14),
-                  ListenableBuilder(
-                    listenable: themeNotifier,
-                    builder: (context, _) {
-                      return SizedBox(
-                        width: double.infinity,
-                        child: SegmentedButton<AppThemeMode>(
-                          segments: const [
-                            ButtonSegment(
-                              value: AppThemeMode.system,
-                              label: Text('自动'),
-                              icon: Icon(Icons.brightness_auto_rounded),
-                            ),
-                            ButtonSegment(
-                              value: AppThemeMode.light,
-                              label: Text('浅色'),
-                              icon: Icon(Icons.light_mode_rounded),
-                            ),
-                            ButtonSegment(
-                              value: AppThemeMode.dark,
-                              label: Text('深色'),
-                              icon: Icon(Icons.dark_mode_rounded),
-                            ),
-                          ],
-                          selected: {themeNotifier.mode},
-                          onSelectionChanged: (selected) {
-                            themeNotifier.setMode(selected.first);
-                          },
-                        ),
-                      );
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (isDesktopPlatform) ...[
-            const SizedBox(height: 18),
-            const _SectionTitle(title: '播放'),
-            Card(
-              clipBehavior: Clip.antiAlias,
-              child: ListenableBuilder(
-                listenable: fitWindowToVideo,
-                builder: (context, _) {
-                  return SwitchListTile(
-                    secondary: Icon(
-                      Icons.aspect_ratio_rounded,
-                      color: scheme.primary,
-                    ),
-                    title: const Text('窗口适应视频比例'),
-                    subtitle: const Text(
-                      '打开视频后把播放窗口调整成该视频的画面比例，尽量减少黑边。',
-                    ),
-                    value: fitWindowToVideo.value,
-                    onChanged: (value) => setFitWindowToVideo(value),
-                  );
-                },
-              ),
-            ),
-          ],
-          const SizedBox(height: 18),
-          const _SectionTitle(title: 'AI 语音字幕 (实验性)'),
-          Card(
-            clipBehavior: Clip.antiAlias,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+                ),
+                const SizedBox(height: 14),
                 ListenableBuilder(
-                  listenable: aiSubtitleEnabled,
+                  listenable: themeNotifier,
                   builder: (context, _) {
-                    return SwitchListTile(
-                      secondary: Icon(
-                        Icons.auto_awesome_rounded,
-                        color: scheme.primary,
-                      ),
-                      title: const Text('启用 AI 字幕功能'),
-                      subtitle: const Text('自动识别音频并生成字幕。'),
-                      value: aiSubtitleEnabled.value,
-                      onChanged: (value) => setAiSubtitleEnabled(value),
-                    );
-                  },
-                ),
-                const Divider(height: 1),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                  child: Row(
-                    children: [
-                      _cardSectionTitle('离线语音模型管理'),
-                      const Spacer(),
-                      Text(
-                        '已检测到 ${_downloadedModels.length}/${availableModels.length} 个模型就绪',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 4),
-                // 只列出已导入的模型：模型清单有四十多个，全列出来长得没法看，
-                // 对照表 / 选用 / 删除统一走「浏览全部模型」面板。
-                if (_downloadedModels.isEmpty)
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                    child: Text(
-                      '尚未导入任何模型。点「浏览全部模型」看对照表 → 按文件名去网盘下载 → '
-                      '回到这里点「导入模型」。只需导入你要用的那一个。',
-                      style: TextStyle(
-                        fontSize: 12,
-                        height: 1.5,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                    ),
-                  )
-                else
-                  for (final model in availableModels)
-                    if (_downloadedModels.contains(model.id))
-                      _buildModelItem(model, scheme),
-                _sectionActionRow([
-                  _SectionAction(
-                    label: '浏览全部模型',
-                    onPressed: _browseModels,
-                  ),
-                  _SectionAction(
-                    label: '导入模型',
-                    onPressed: _importModel,
-                  ),
-                  _SectionAction(
-                    label: '模型目录',
-                    onPressed: _openModelDirectory,
-                  ),
-                ]),
-                const Divider(height: 1),
-                _buildAsrPerformanceRow(scheme),
-                const SizedBox(height: 8),
-              ],
-            ),
-          ),
-          const SizedBox(height: 18),
-          const _SectionTitle(title: '存储与空间'),
-          Card(
-            clipBehavior: Clip.antiAlias,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        Icons.cleaning_services_rounded,
-                        color: scheme.primary,
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text('清理应用缓存'),
-                            const SizedBox(height: 4),
-                            Text(
-                              _loadingCache
-                                  ? '正在计算缓存大小…'
-                                  : '当前临时缓存占用: ${_formatBytes(_cacheBytes)}',
-                              style: TextStyle(
-                                fontSize: 13,
-                                color: scheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      if (isDesktopPlatform) ...[
-                        OutlinedButton.icon(
-                          icon: const Icon(Icons.folder_open_rounded, size: 16),
-                          label: const Text('打开目录'),
-                          style: OutlinedButton.styleFrom(
-                            visualDensity: VisualDensity.compact,
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                    return SizedBox(
+                      width: double.infinity,
+                      child: SegmentedButton<AppThemeMode>(
+                        segments: const [
+                          ButtonSegment(
+                            value: AppThemeMode.system,
+                            label: Text('自动'),
+                            icon: Icon(Icons.brightness_auto_rounded),
                           ),
-                          onPressed: () => NativeFileHelper.openDirectory(
-                            NativeFileHelper.desktopCacheDir(),
+                          ButtonSegment(
+                            value: AppThemeMode.light,
+                            label: Text('浅色'),
+                            icon: Icon(Icons.light_mode_rounded),
                           ),
-                        ),
-                        const SizedBox(width: 8),
-                      ],
-                      _clearingCache
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2.2),
-                            )
-                          : FilledButton.tonal(
-                              onPressed: _cacheBytes > 0 ? _clearCache : null,
-                              child: const Text('清理'),
-                            ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 18),
-          const _SectionTitle(title: '关于'),
-          Card(
-            clipBehavior: Clip.antiAlias,
-            child: Column(
-              children: [
-                ListTile(
-                  leading: Icon(
-                    Icons.info_outline_rounded,
-                    color: scheme.primary,
-                  ),
-                  title: const Text('关于影现播放器'),
-                  subtitle: Text('v$_currentVersion'),
-                  trailing: const Icon(Icons.chevron_right_rounded),
-                  onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => const AboutPage(),
+                          ButtonSegment(
+                            value: AppThemeMode.dark,
+                            label: Text('深色'),
+                            icon: Icon(Icons.dark_mode_rounded),
+                          ),
+                        ],
+                        selected: {themeNotifier.mode},
+                        onSelectionChanged: (selected) {
+                          themeNotifier.setMode(selected.first);
+                        },
                       ),
                     );
                   },
                 ),
-                const Divider(height: 1, indent: 56),
-                ListTile(
-                  leading: Icon(
-                    Icons.feedback_outlined,
-                    color: scheme.primary,
-                  ),
-                  title: const Text('建议反馈'),
-                  subtitle: const Text('通过问卷告诉我们你的想法'),
-                  trailing: const Icon(Icons.open_in_new_rounded, size: 18),
-                  onTap: _openFeedback,
-                ),
               ],
             ),
           ),
-          const SizedBox(height: 24),
-          Center(
-            child: Text(
-              'PolyFlixPlayer · by hcllmsx\n一个"会识别自己人"的万能视频播放器',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: scheme.onSurfaceVariant.withValues(alpha: .7),
-                fontSize: 12,
-                height: 1.5,
-              ),
+        ),
+        if (isDesktopPlatform) ...[
+          const SizedBox(height: 18),
+          const _SectionTitle(title: '播放'),
+          Card(
+            clipBehavior: Clip.antiAlias,
+            child: ListenableBuilder(
+              listenable: fitWindowToVideo,
+              builder: (context, _) {
+                return SwitchListTile(
+                  secondary: Icon(
+                    Icons.aspect_ratio_rounded,
+                    color: scheme.primary,
+                  ),
+                  title: const Text('窗口适应视频比例'),
+                  subtitle: const Text('打开视频后把播放窗口调整成该视频的画面比例，尽量减少黑边。'),
+                  value: fitWindowToVideo.value,
+                  onChanged: (value) => setFitWindowToVideo(value),
+                );
+              },
             ),
           ),
         ],
-      );
+        const SizedBox(height: 18),
+        const _SectionTitle(title: 'AI 语音字幕 (实验性)'),
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ListenableBuilder(
+                // 同时监听任务管理器：有任务在跑时要临时禁用总开关
+                listenable: Listenable.merge([
+                  aiSubtitleEnabled,
+                  AiTaskManager.instance,
+                ]),
+                builder: (context, _) {
+                  final hasActiveTask = AiTaskManager.instance.hasActiveTasks;
+                  return SwitchListTile(
+                    secondary: Icon(
+                      Icons.auto_awesome_rounded,
+                      color: scheme.primary,
+                    ),
+                    title: const Text('启用 AI 字幕功能'),
+                    subtitle: Text(
+                      hasActiveTask
+                          // 识别中途关掉总开关会让任务处于"完成了但功能已关"的
+                          // 半截状态，所以任务结束前不允许关闭。
+                          ? '有识别任务正在进行，任务结束前无法关闭。'
+                          : '自动识别音频并生成字幕。',
+                    ),
+                    value: aiSubtitleEnabled.value,
+                    onChanged: hasActiveTask
+                        ? null
+                        : (value) => setAiSubtitleEnabled(value),
+                  );
+                },
+              ),
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: Row(
+                  children: [
+                    _cardSectionTitle('离线语音模型管理'),
+                    const Spacer(),
+                    Text(
+                      '已检测到 ${_downloadedModels.length} 个模型就绪',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 4),
+              // 只列出已导入的模型：模型清单有四十多个，全列出来长得没法看，
+              // 对照表 / 选用 / 删除统一走「浏览全部模型」面板。
+              if (_downloadedModels.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                  child: Text(
+                    '尚未导入任何模型。点「浏览全部模型」看对照表 → 按文件名去网盘下载 → '
+                    '回到这里点「导入模型」。只需导入你要用的那一个。',
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.5,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else
+                for (final model in availableModels)
+                  if (_downloadedModels.contains(model.id))
+                    _buildModelItem(model, scheme),
+              _sectionActionRow([
+                _SectionAction(label: '浏览全部模型', onPressed: _browseModels),
+                _SectionAction(label: '导入模型', onPressed: _importModel),
+                _SectionAction(label: '模型目录', onPressed: _openModelDirectory),
+              ]),
+              const Divider(height: 1),
+              _buildAsrPerformanceRow(scheme),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        const _SectionTitle(title: '存储与空间'),
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.cleaning_services_rounded,
+                      color: scheme.primary,
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('清理应用缓存'),
+                          const SizedBox(height: 4),
+                          Text(
+                            _loadingCache
+                                ? '正在计算缓存大小…'
+                                : '当前临时缓存占用: ${_formatBytes(_cacheBytes)}',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    if (isDesktopPlatform) ...[
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.folder_open_rounded, size: 16),
+                        label: const Text('打开目录'),
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                        ),
+                        onPressed: () => NativeFileHelper.openDirectory(
+                          NativeFileHelper.desktopCacheDir(),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    _clearingCache
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2.2),
+                          )
+                        : FilledButton.tonal(
+                            onPressed: _cacheBytes > 0 ? _clearCache : null,
+                            child: const Text('清理'),
+                          ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 18),
+        const _SectionTitle(title: '关于'),
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              ListTile(
+                leading: Icon(
+                  Icons.info_outline_rounded,
+                  color: scheme.primary,
+                ),
+                title: const Text('关于影现播放器'),
+                subtitle: Text('v$_currentVersion'),
+                trailing: const Icon(Icons.chevron_right_rounded),
+                onTap: () {
+                  Navigator.of(
+                    context,
+                  ).push(MaterialPageRoute(builder: (_) => const AboutPage()));
+                },
+              ),
+              const Divider(height: 1, indent: 56),
+              ListTile(
+                leading: Icon(Icons.feedback_outlined, color: scheme.primary),
+                title: const Text('建议反馈'),
+                subtitle: const Text('通过问卷告诉我们你的想法'),
+                trailing: const Icon(Icons.open_in_new_rounded, size: 18),
+                onTap: _openFeedback,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 24),
+        Center(
+          child: Text(
+            'PolyFlixPlayer · by hcllmsx\n一个"会识别自己人"的万能视频播放器',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: scheme.onSurfaceVariant.withValues(alpha: .7),
+              fontSize: 12,
+              height: 1.5,
+            ),
+          ),
+        ),
+      ],
+    );
 
     if (widget.embedded) {
       return Column(
@@ -509,9 +505,7 @@ class _SettingsPageState extends State<SettingsPage> {
     }
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('设置'),
-      ),
+      appBar: AppBar(title: const Text('设置')),
       body: body,
     );
   }
@@ -522,7 +516,13 @@ class _SettingsPageState extends State<SettingsPage> {
   /// GPU 加速（CUDA/Vulkan）；没放引擎包则自动回落到内置的纯 CPU 插件。
   Widget _buildAsrPerformanceRow(ColorScheme scheme) {
     final cores = Platform.numberOfProcessors;
-    final options = <int>[0, 4, 8, 12, 16].where((v) => v == 0 || v < cores).toList();
+    final options = <int>[
+      0,
+      4,
+      8,
+      12,
+      16,
+    ].where((v) => v == 0 || v < cores).toList();
     final hasGpuPack = _enginePacks.any((p) => p.supportsGpu);
 
     return ListenableBuilder(
@@ -605,10 +605,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 },
               ),
               if (isDesktopPlatform)
-                _SectionAction(
-                  label: '导入引擎',
-                  onPressed: _importEngine,
-                ),
+                _SectionAction(label: '导入引擎', onPressed: _importEngine),
               _SectionAction(
                 label: '引擎目录',
                 onPressed: () async {
@@ -652,7 +649,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         gpuActive
                             ? '当前使用 GPU 引擎包加速，线程数不生效。'
                             : '仅 CPU 识别时生效：本机 $cores 逻辑核心，'
-                                '「自动」取核心数一半并限制在 4~12。',
+                                  '「自动」取核心数一半并限制在 4~12。',
                         style: TextStyle(
                           fontSize: 12,
                           height: 1.45,
@@ -684,8 +681,9 @@ class _SettingsPageState extends State<SettingsPage> {
                                     style: TextStyle(
                                       fontSize: 13,
                                       color: gpuActive
-                                          ? scheme.onSurface
-                                              .withValues(alpha: .38)
+                                          ? scheme.onSurface.withValues(
+                                              alpha: .38,
+                                            )
                                           : null,
                                     ),
                                   ),
@@ -744,10 +742,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
                 onPressed: action.onPressed,
-                child: Text(
-                  action.label,
-                  style: const TextStyle(fontSize: 14),
-                ),
+                child: Text(action.label, style: const TextStyle(fontSize: 14)),
               ),
           ],
         ),
@@ -764,7 +759,8 @@ class _SettingsPageState extends State<SettingsPage> {
     await setAiAsrModelId(result.modelId);
     if (!mounted) return;
     final label =
-        ModelManager.instance.infoOf(result.modelId)?.displayName ?? result.modelId;
+        ModelManager.instance.infoOf(result.modelId)?.displayName ??
+        result.modelId;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text('已选用：$label')));
@@ -885,28 +881,30 @@ class _SettingsPageState extends State<SettingsPage> {
     final detail = ValueNotifier<String>('准备中…');
     final navigator = Navigator.of(context, rootNavigator: true);
 
-    unawaited(showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => PopScope(
-        canPop: false,
-        child: AlertDialog(
-          title: Text(title),
-          content: ValueListenableBuilder<String>(
-            valueListenable: detail,
-            builder: (_, text, _) => Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const LinearProgressIndicator(),
-                const SizedBox(height: 14),
-                Text(text, style: const TextStyle(fontSize: 13, height: 1.5)),
-              ],
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => PopScope(
+          canPop: false,
+          child: AlertDialog(
+            title: Text(title),
+            content: ValueListenableBuilder<String>(
+              valueListenable: detail,
+              builder: (_, text, _) => Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const LinearProgressIndicator(),
+                  const SizedBox(height: 14),
+                  Text(text, style: const TextStyle(fontSize: 13, height: 1.5)),
+                ],
+              ),
             ),
           ),
         ),
       ),
-    ));
+    );
 
     try {
       return await task((value) => detail.value = value);
@@ -984,10 +982,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
 /// 卡片内小节操作按钮的描述。
 class _SectionAction {
-  const _SectionAction({
-    required this.label,
-    required this.onPressed,
-  });
+  const _SectionAction({required this.label, required this.onPressed});
 
   final String label;
   final Future<void> Function() onPressed;
