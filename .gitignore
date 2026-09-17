@@ -1,7 +1,7 @@
 # 本地构建脚本（仅在本机使用，不纳入版本管理）
 1-run_menu.bat
 build_menu.ps1
-flutter-apk.lnk
+*.lnk
 
 # Miscellaneous
 *.class

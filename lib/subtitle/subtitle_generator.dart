@@ -21,8 +21,11 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:ffi/ffi.dart';
 
+import '../settings/app_settings.dart';
 import '../utils/native_file_helper.dart';
+import 'engine_pack.dart';
 import 'model_manager.dart';
+import 'whisper_server.dart';
 
 /// 单条字幕。
 class SubtitleEntry {
@@ -154,9 +157,19 @@ class SubtitleGenerator {
 
       if (_cancelled) return [];
 
-      // 2. 提取音频为 WAV 文件
+      // 2. 提取音频为 WAV 文件（上报进度，避免长时间黑盒等待）
       _updateState(AsrState.preparing, message: '正在提取音频…');
-      final wavPath = await _extractAudioToWav(videoPath);
+      final wavPath = await _extractAudioToWav(
+        videoPath,
+        onProgress: (fraction, _, _) {
+          final overall = fraction * _kExtractProgressShare;
+          _updateState(
+            AsrState.preparing,
+            percent: (overall * 100).toInt(),
+            message: '正在提取音频… ${(fraction * 100).toStringAsFixed(0)}%',
+          );
+        },
+      );
       if (wavPath == null) {
         _updateState(AsrState.error, message: '音频提取失败');
         return [];
@@ -167,60 +180,26 @@ class SubtitleGenerator {
         return [];
       }
 
-      // 3. 执行 ASR 识别（在后台 Isolate 中进行安全 FFI 调用，不阻塞 UI 且彻底防止堆崩溃）
+      // 3. 执行 ASR 识别（引擎包优先，回落到内置 FFI 插件）
       _updateState(AsrState.processing, message: '正在分析语音并生成字幕…');
       _isModelInUse = true;
 
-      final dllName = Platform.isWindows ? 'whisper_ggml.dll' : 'libwhisper_ggml.so';
       final langCode = language.trim().isEmpty ? 'auto' : language;
+      // 本次识别统一用同一个线程数，避免识别途中改设置造成前后不一致
+      final asrThreads = resolveAsrThreads();
 
-      final rawJson = await Isolate.run(() => _safeNativeTranscribe(
-            dllName: dllName,
-            modelPath: modelPath,
-            wavPath: wavPath,
-            language: langCode,
-          ));
+      final recognized = await _recognizeWavFile(
+        wavPath: wavPath,
+        modelPath: modelPath,
+        language: langCode,
+        threads: asrThreads,
+      );
+      _entries.addAll(recognized);
 
       // 4. 清理临时 WAV 文件
       _cleanupTempFile(wavPath);
 
       if (_cancelled) return [];
-
-      // 5. 转换结果
-      final resMap = jsonDecode(rawJson) as Map<String, dynamic>;
-      if (resMap['@type'] == 'error') {
-        final errMsg = resMap['message'] as String? ?? '未知错误';
-        throw Exception(errMsg);
-      }
-
-      final segments = resMap['segments'] as List<dynamic>?;
-
-      if (segments != null && segments.isNotEmpty) {
-        for (final item in segments) {
-          final seg = item as Map<String, dynamic>;
-          // whisper.cpp 的时间戳单位是 10ms (厘秒/centiseconds)，必须乘以 10 转换为毫秒
-          final fromMs = ((seg['from_ts'] as num?)?.toInt() ?? 0) * 10;
-          final toMs = ((seg['to_ts'] as num?)?.toInt() ?? 0) * 10;
-          final segText = (seg['text'] as String?)?.trim() ?? '';
-          if (segText.isNotEmpty) {
-            _entries.add(SubtitleEntry(
-              start: Duration(milliseconds: fromMs),
-              end: Duration(milliseconds: toMs),
-              text: segText,
-            ));
-          }
-        }
-      } else {
-        // 没有分段时间戳时，如果有全文，整体作为一条字幕
-        final text = (resMap['text'] as String?)?.trim() ?? '';
-        if (text.isNotEmpty) {
-          _entries.add(SubtitleEntry(
-            start: Duration.zero,
-            end: const Duration(hours: 99),
-            text: text,
-          ));
-        }
-      }
 
       if (_entries.isNotEmpty) {
         _updateState(AsrState.completed, message: '识别完成 (共 ${_entries.length} 条原语言字幕)');
@@ -234,6 +213,129 @@ class SubtitleGenerator {
     }
   }
 
+  /// 上一次识别实际使用的引擎描述（供界面展示，如 "CUDA 引擎包 · RTX 4080"）。
+  static String? lastEngineLabel;
+
+  /// 音频提取阶段在整体进度里占的比例，剩下 92% 留给识别。
+  ///
+  /// 提取（1 小时 2160p 影片通常 20~60 秒）本身也会占掉可观时间，
+  /// 所以给它一段独立进度，让用户看到"确实在动"，而不是长时间黑盒等待。
+  static const double _kExtractProgressShare = 0.08;
+
+  /// 把"识别阶段"的 0~1 进度映射到整体进度的后 92%。
+  static double _remapRecognitionPercent(double p) =>
+      _kExtractProgressShare + (1 - _kExtractProgressShare) * p.clamp(0.0, 1.0);
+
+  /// 解析本次识别使用的 CPU 线程数。
+  ///
+  /// 当前上游插件（whisper_ggml 2.6.0）是纯 CPU 构建，线程数是唯一有效的
+  /// 速度杠杆：设置里为 0 时走自动策略 —— 取逻辑核心数的一半并夹在 [4, 12]。
+  /// 实测（310 秒音频 / small 模型）：4 线程 38.8s → 8 线程 23.4s → 12 线程
+  /// 22.3s，再往上基本没收益（tiny 模型 16 线程反而变慢）。
+  static int resolveAsrThreads() {
+    final configured = aiAsrThreadCount.value;
+    if (configured > 0) return configured;
+    return (Platform.numberOfProcessors ~/ 2).clamp(4, 12);
+  }
+
+  /// 识别一个 WAV 文件，返回原始分段（时间轴按 [offsetMs] 平移）。
+  ///
+  /// 两条路径：
+  ///  1. **引擎包**（用户把 whisper.cpp 官方预编译包放进引擎目录）：
+  ///     走 `whisper-server.exe`，模型常驻内存，CUDA/Vulkan 包可自动用上 GPU；
+  ///  2. **内置插件**（whisper_ggml，纯 CPU FFI）：引擎包缺失或启动失败时兜底，
+  ///     保证没装引擎包的用户也能正常识别。
+  Future<List<SubtitleEntry>> _recognizeWavFile({
+    required String wavPath,
+    required String modelPath,
+    required String language,
+    required int threads,
+    int offsetMs = 0,
+  }) async {
+    // ---- 路径 1：引擎包（可 GPU 加速） ----
+    try {
+      final pack = await EnginePackManager.instance.resolvePreferred(
+        allowGpu: !aiAsrForceCpu.value,
+      );
+      if (pack != null) {
+        final session = await WhisperServerSession.acquire(
+          pack: pack,
+          modelPath: modelPath,
+          threads: threads,
+          forceCpu: aiAsrForceCpu.value,
+        );
+        if (session != null) {
+          lastEngineLabel = '${pack.displayName} · ${session.resolvedDeviceName}';
+          final segments = await session.transcribeWavFile(wavPath, language: language);
+          return [
+            for (final s in segments)
+              SubtitleEntry(
+                start: Duration(milliseconds: offsetMs + s.startMs),
+                end: Duration(milliseconds: offsetMs + s.endMs),
+                text: s.text,
+              ),
+          ];
+        }
+      }
+    } catch (_) {
+      // 引擎包异常（进程崩溃、端口占用、DLL 缺失等）不致命，继续回落内置插件
+    }
+
+    // ---- 路径 2：内置插件（FFI / 纯 CPU） ----
+    lastEngineLabel = '内置 CPU 引擎';
+    final dllName = Platform.isWindows ? 'whisper_ggml.dll' : 'libwhisper_ggml.so';
+    final rawJson = await Isolate.run(() => _safeNativeTranscribe(
+          dllName: dllName,
+          modelPath: modelPath,
+          wavPath: wavPath,
+          language: language,
+          threads: threads,
+        ));
+
+    final resMap = jsonDecode(rawJson) as Map<String, dynamic>;
+    if (resMap['@type'] == 'error') {
+      throw Exception(resMap['message'] as String? ?? '未知错误');
+    }
+    return _parsePluginSegments(resMap, offsetMs);
+  }
+
+  /// 解析内置插件返回的 JSON 分段。
+  ///
+  /// 注意：whisper.cpp 的时间戳单位是 10ms（厘秒），必须乘以 10 才是毫秒。
+  static List<SubtitleEntry> _parsePluginSegments(
+    Map<String, dynamic> resMap,
+    int offsetMs,
+  ) {
+    final result = <SubtitleEntry>[];
+    final segments = resMap['segments'] as List<dynamic>?;
+
+    if (segments != null && segments.isNotEmpty) {
+      for (final item in segments) {
+        final seg = item as Map<String, dynamic>;
+        final fromMs = ((seg['from_ts'] as num?)?.toInt() ?? 0) * 10;
+        final toMs = ((seg['to_ts'] as num?)?.toInt() ?? 0) * 10;
+        final text = (seg['text'] as String?)?.trim() ?? '';
+        if (text.isEmpty) continue;
+        result.add(SubtitleEntry(
+          start: Duration(milliseconds: offsetMs + fromMs),
+          end: Duration(milliseconds: offsetMs + toMs),
+          text: text,
+        ));
+      }
+    } else {
+      // 没有分段时间戳时，如果有全文，整体作为一条字幕
+      final text = (resMap['text'] as String?)?.trim() ?? '';
+      if (text.isNotEmpty) {
+        result.add(SubtitleEntry(
+          start: Duration(milliseconds: offsetMs),
+          end: const Duration(hours: 99),
+          text: text,
+        ));
+      }
+    }
+    return result;
+  }
+
   /// 在单独 Isolate 中执行的纯原生 FFI 转录。
   ///
   /// 绝对不要在 Windows 上对 C++ 返回的指针调用 malloc.free()，
@@ -243,6 +345,7 @@ class SubtitleGenerator {
     required String modelPath,
     required String wavPath,
     required String language,
+    required int threads,
   }) {
     DynamicLibrary lib;
     try {
@@ -260,7 +363,7 @@ class SubtitleGenerator {
       'model': modelPath,
       'audio': wavPath,
       'is_translate': false,
-      'threads': 4,
+      'threads': threads,
       'is_verbose': false,
       'language': language,
       'is_special_tokens': false,
@@ -347,8 +450,21 @@ class SubtitleGenerator {
     if (isCancelled?.call() == true || _cancelled) return [];
 
     _updateState(AsrState.preparing, message: '正在提取音频…');
-    onProgress?.call(AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在提取音频…');
-    final wavPath = await _extractAudioToWav(videoPath);
+    onProgress?.call(
+        AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在提取音频…');
+    final wavPath = await _extractAudioToWav(
+      videoPath,
+      onProgress: (fraction, processed, total) {
+        final overall = fraction * _kExtractProgressShare;
+        final msg = '正在提取音频… ${(fraction * 100).toStringAsFixed(0)}%';
+        _updateState(
+          AsrState.preparing,
+          percent: (overall * 100).toInt(),
+          message: msg,
+        );
+        onProgress?.call(AsrState.preparing, processed, total, overall, msg);
+      },
+    );
     if (wavPath == null) {
       _updateState(AsrState.error, message: '音频提取失败');
       onProgress?.call(AsrState.error, Duration.zero, Duration.zero, 0.0, '音频提取失败');
@@ -375,47 +491,33 @@ class SubtitleGenerator {
     // 分析音频能量（静音区间与人声发音点），用于消除前导静音漂移和长句按停顿智能拆分
     final energyProfile = await AudioEnergyProfile.fromWavFile(wavPath);
 
-    final dllName = Platform.isWindows ? 'whisper_ggml.dll' : 'libwhisper_ggml.so';
     final langCode = language.trim().isEmpty ? 'auto' : language;
+    // 本次识别统一用同一个线程数，避免识别途中改设置造成前后不一致
+    final asrThreads = resolveAsrThreads();
 
     // 如果音频较短（<= 120 秒），无需切片，直接整体转录！
     // 这样短视频保留全局上下文与最准确的时间戳，不受切片边界干扰。
     if (totalSeconds <= 120) {
-      _updateState(AsrState.processing, percent: 30, message: '正在分析完整音频…');
-      onProgress?.call(AsrState.processing, Duration.zero, totalDuration, 0.3, '正在分析完整音频…');
+      final processingBase = _kExtractProgressShare;
+      _updateState(
+        AsrState.processing,
+        percent: (processingBase * 100).toInt(),
+        message: '正在分析完整音频…',
+      );
+      onProgress?.call(AsrState.processing, Duration.zero, totalDuration,
+          processingBase, '正在分析完整音频…');
 
-      final rawJson = await Isolate.run(() => _safeNativeTranscribe(
-            dllName: dllName,
-            modelPath: modelPath,
-            wavPath: wavPath,
-            language: langCode,
-          ));
+      final rawEntries = await _recognizeWavFile(
+        wavPath: wavPath,
+        modelPath: modelPath,
+        language: langCode,
+        threads: asrThreads,
+      );
 
       if (isCancelled?.call() == true || _cancelled) {
         _updateState(AsrState.idle, message: '已取消');
         onProgress?.call(AsrState.idle, Duration.zero, totalDuration, 0.0, '已取消');
         return [];
-      }
-
-      final resMap = jsonDecode(rawJson) as Map<String, dynamic>;
-      final rawEntries = <SubtitleEntry>[];
-      if (resMap['@type'] != 'error') {
-        final segments = resMap['segments'] as List<dynamic>?;
-        if (segments != null && segments.isNotEmpty) {
-          for (final item in segments) {
-            final seg = item as Map<String, dynamic>;
-            final fromMs = ((seg['from_ts'] as num?)?.toInt() ?? 0) * 10;
-            final toMs = ((seg['to_ts'] as num?)?.toInt() ?? 0) * 10;
-            final segText = (seg['text'] as String?)?.trim() ?? '';
-            if (segText.isNotEmpty) {
-              rawEntries.add(SubtitleEntry(
-                start: Duration(milliseconds: fromMs),
-                end: Duration(milliseconds: toMs),
-                text: segText,
-              ));
-            }
-          }
-        }
       }
 
       final normalized = normalizeEntries(rawEntries, energyProfile: energyProfile);
@@ -456,7 +558,10 @@ class SubtitleGenerator {
         if (currentChunkBytes <= 0) break;
 
         final currentProcessedSec = i * chunkSeconds;
-        final percent = (currentProcessedSec / totalSeconds).clamp(0.0, 0.99);
+        // 识别阶段占整体的后 92%，前面留给音频提取
+        final percent = _remapRecognitionPercent(
+          (currentProcessedSec / totalSeconds).clamp(0.0, 0.99),
+        );
         final progressMsg = '已识别 ${_formatDuration(Duration(seconds: currentProcessedSec))} / ${_formatDuration(totalDuration)} (${(percent * 100).toStringAsFixed(1)}%) · 片段 ${i + 1}/$chunkCount';
 
         _updateState(AsrState.processing, percent: (percent * 100).toInt(), message: progressMsg);
@@ -474,44 +579,29 @@ class SubtitleGenerator {
         await sink.flush();
         await sink.close();
 
-        // 原生调用转录该分片
-        final rawJson = await Isolate.run(() => _safeNativeTranscribe(
-              dllName: dllName,
-              modelPath: modelPath,
-              wavPath: tempChunkPath,
-              language: langCode,
-            ));
+        // 识别该分片（引擎包优先，回落内置插件），时间轴按分片偏移平移。
+        // 单个分片失败（显存不足、进程被杀等）不应中断整段识别，跳过继续。
+        List<SubtitleEntry> chunkEntries;
+        try {
+          chunkEntries = await _recognizeWavFile(
+            wavPath: tempChunkPath,
+            modelPath: modelPath,
+            language: langCode,
+            threads: asrThreads,
+            offsetMs: i * chunkSeconds * 1000,
+          );
+        } catch (_) {
+          _cleanupTempFile(tempChunkPath);
+          continue;
+        }
 
         _cleanupTempFile(tempChunkPath);
 
-        // 解析并追加
-        final resMap = jsonDecode(rawJson) as Map<String, dynamic>;
-        if (resMap['@type'] != 'error') {
-          final segments = resMap['segments'] as List<dynamic>?;
-          final chunkEntries = <SubtitleEntry>[];
-          final offsetMs = i * chunkSeconds * 1000;
-
-          if (segments != null && segments.isNotEmpty) {
-            for (final item in segments) {
-              final seg = item as Map<String, dynamic>;
-              final fromMs = ((seg['from_ts'] as num?)?.toInt() ?? 0) * 10;
-              final toMs = ((seg['to_ts'] as num?)?.toInt() ?? 0) * 10;
-              final segText = (seg['text'] as String?)?.trim() ?? '';
-              if (segText.isNotEmpty) {
-                chunkEntries.add(SubtitleEntry(
-                  start: Duration(milliseconds: offsetMs + fromMs),
-                  end: Duration(milliseconds: offsetMs + toMs),
-                  text: segText,
-                ));
-              }
-            }
-          }
-          if (chunkEntries.isNotEmpty) {
-            final normalizedChunk = normalizeEntries(chunkEntries);
-            rawAccumulated.addAll(chunkEntries);
-            _entries.addAll(normalizedChunk);
-            onNewEntries?.call(normalizedChunk);
-          }
+        if (chunkEntries.isNotEmpty) {
+          final normalizedChunk = normalizeEntries(chunkEntries);
+          rawAccumulated.addAll(chunkEntries);
+          _entries.addAll(normalizedChunk);
+          onNewEntries?.call(normalizedChunk);
         }
       }
     } finally {
@@ -551,11 +641,14 @@ class SubtitleGenerator {
   }) {
     if (rawList.isEmpty) return [];
 
+    // 第零步：先把被引擎在句中截断的相邻原始分段合并回一句
+    final sourceList = _mergeRawContinuations(rawList);
+
     // 第一步：基于真实音频能量校准发音起点，并将长复合句智能拆分为多短语
     final preprocessed = <SubtitleEntry>[];
 
-    for (int i = 0; i < rawList.length; i++) {
-      final cur = rawList[i];
+    for (int i = 0; i < sourceList.length; i++) {
+      final cur = sourceList[i];
       final text = cur.text.trim();
       if (text.isEmpty) continue;
 
@@ -587,8 +680,8 @@ class SubtitleGenerator {
         // whisper 的 to_ts 会一直延伸到下一句的起点，导致搜索窗口里混进下一句起音的残块。
         // 因此把窗口右边界收敛到"下一句真实发音点"之前，保证只统计本句自己的语音块。
         int searchEndMs = eMs;
-        if (i + 1 < rawList.length) {
-          final next = rawList[i + 1];
+        if (i + 1 < sourceList.length) {
+          final next = sourceList[i + 1];
           final nextSpeech = energyProfile.findFirstSpeech(
             next.start.inMilliseconds,
             next.end.inMilliseconds,
@@ -663,31 +756,48 @@ class SubtitleGenerator {
 
       // 忽略纯音乐与背景音占位符
       final lower = text.toLowerCase();
-      if (lower == '[music]' ||
-          lower == '(music)' ||
-          lower == '♪' ||
-          lower == '♫' ||
-          lower == '[applause]' ||
-          lower == '[laughter]') {
-        continue;
-      }
+      const placeholders = {
+        'music', '[music]', '(music)', '♪', '♫', '♪♪', '♫♫',
+        '[applause]', 'applause', '[laughter]', 'laughter',
+        '[silence]', 'silence', '[blank_audio]',
+      };
+      if (placeholders.contains(lower)) continue;
+      // 纯括号标注（如 "(laughs)"、"[SIGHS]"）也属于非字幕内容
+      if (RegExp(r'^[\[(][^\])]*[\])]$').hasMatch(text)) continue;
 
       final cjkCount = RegExp(r'[\u4e00-\u9fa5]').allMatches(text).length;
       final wordCount =
           text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
 
       final baseEstimateMs = (cjkCount * 240 + wordCount * 320 + 600);
-      final idealMaxDurationMs = baseEstimateMs.clamp(1500, 5500);
+      // 估算值只作为"没有能量信息时"的兜底；上限放宽到 9 秒，
+      // 因为字幕多停留一会儿的代价，远小于说话中突然留白。
+      final idealMaxDurationMs = baseEstimateMs.clamp(1500, 9000);
 
+      // 最后一条没有下一条可比，就用它自己的原始结束时间作为边界；
+      // 这里如果沿用"朗读时长估算"，会把按真实发声算出来的结束时间又压回去。
       final nextStartMs = (i + 1 < preprocessed.length)
           ? preprocessed[i + 1].start.inMilliseconds
-          : (cur.start.inMilliseconds + idealMaxDurationMs);
+          : cur.end.inMilliseconds;
 
-      int actualEndMs = cur.end.inMilliseconds;
-      final rawDurationMs = actualEndMs - cur.start.inMilliseconds;
+      // 结束时间优先以"真实发声结束"为准（能量剖面），这样长句不会因为
+      // 词数估算偏短而在还在说话时就消失；拿不到能量信息时才退回估算。
+      final speechEndMs = energyProfile?.findLastSpeechEnd(
+            cur.start.inMilliseconds,
+            cur.end.inMilliseconds,
+          ) ??
+          -1;
 
-      if (rawDurationMs > idealMaxDurationMs) {
-        actualEndMs = cur.start.inMilliseconds + idealMaxDurationMs;
+      int actualEndMs;
+      if (speechEndMs > 0) {
+        actualEndMs = max(speechEndMs + 400, cur.start.inMilliseconds + 1200);
+        // 不能超出原始分段结束（那之后通常已是下一句的地盘）
+        actualEndMs = min(actualEndMs, cur.end.inMilliseconds);
+      } else {
+        actualEndMs = min(
+          cur.end.inMilliseconds,
+          cur.start.inMilliseconds + idealMaxDurationMs,
+        );
       }
 
       if (actualEndMs > nextStartMs) {
@@ -710,6 +820,77 @@ class SubtitleGenerator {
       ));
     }
     return result;
+  }
+
+  /// 合并被引擎在句中截断的相邻原始分段。
+  ///
+  /// whisper 在 30 秒窗口边界处会把一句话切成两段，例如：
+  ///   `[14.8 -> 38.9] "Listen to music, send a message, turn on the lights, turn"`
+  ///   `[38.9 -> 39.2] "off the lights."`
+  /// 前一段没有句末标点、两段时间上首尾相接（间隙约 0ms）。这种必须合并，
+  /// 否则会被后面的停顿拆分逻辑当成两个独立短语，后半截还会因为时间戳错位
+  /// 而显示在错误的时刻。
+  ///
+  /// 但**必须防止滚雪球**：电影里的歌词、嘈杂对白常常整段没有标点，
+  /// 若只按"无标点 + 紧邻"合并，会把几十个分段粘成一条几百词的字幕，
+  /// 随后又被显示时长上限一刀切，导致"还在说话字幕就消失了"。
+  /// 因此判据收紧为：
+  ///   1. 间隙 ≤ 300ms（真正的句子之间一般会有更长的停顿）；
+  ///   2. 前段没有句末标点；
+  ///   3. 当前段看起来是"续接的残句"（以小写/短片段收尾），而不是一个完整新句；
+  ///   4. 合并后总词数与总跨度都有硬上限（兜底保险）。
+  static List<SubtitleEntry> _mergeRawContinuations(List<SubtitleEntry> raw) {
+    if (raw.length < 2) return raw;
+
+    const int maxMergeGapMs = 300;
+    const int maxMergedWords = 30;
+    final sentenceEnd = RegExp(r'[.!?。！？…]$');
+    final startsNewSentence = RegExp(r'^["“(\[]?[A-Z\u4e00-\u9fa5]');
+
+    int wordCount(String text) =>
+        text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+
+    final merged = <SubtitleEntry>[];
+    var mergedWords = 0;
+
+    for (final cur in raw) {
+      if (merged.isNotEmpty) {
+        final prev = merged.last;
+        final prevText = prev.text.trim();
+        final curText = cur.text.trim();
+        final gapMs = cur.start.inMilliseconds - prev.end.inMilliseconds;
+        final curWords = wordCount(curText);
+        final totalWords = mergedWords + curWords;
+
+        // 当前段是否只是上一句的尾巴：不以大写/汉字开头，或本身很短
+        final looksLikeTail =
+            !startsNewSentence.hasMatch(curText) || curWords <= 3;
+
+        // 注意：这里**不能**再用"合并后总跨度"做限制。
+        // whisper 的段末会延伸到下一个起点（含大段静音），跨度常常虚高，
+        // 用它做判据会把合法的"句尾被截断"场景也一并否掉。词数上限已足够防滚雪球。
+        final canMerge = prevText.isNotEmpty &&
+            curText.isNotEmpty &&
+            !sentenceEnd.hasMatch(prevText) &&
+            gapMs <= maxMergeGapMs &&
+            looksLikeTail &&
+            totalWords <= maxMergedWords;
+
+        if (canMerge) {
+          merged[merged.length - 1] = SubtitleEntry(
+            start: prev.start,
+            end: cur.end,
+            text: '$prevText $curText',
+            translatedText: prev.translatedText,
+          );
+          mergedWords = totalWords;
+          continue;
+        }
+      }
+      merged.add(cur);
+      mergedWords = wordCount(cur.text.trim());
+    }
+    return merged;
   }
 
   /// 将字幕条目列表转换为标准的 SRT 格式文本。
@@ -792,7 +973,11 @@ class SubtitleGenerator {
   ///
   /// 使用系统 FFmpeg（Windows PATH 上需有 ffmpeg.exe）。
   /// 返回临时 WAV 文件路径，调用方负责清理。
-  Future<String?> _extractAudioToWav(String videoPath) async {
+  Future<String?> _extractAudioToWav(
+    String videoPath, {
+    void Function(double fraction, Duration processed, Duration total)?
+        onProgress,
+  }) async {
     try {
       final audioDir = NativeFileHelper.desktopCacheAudioDir();
       if (!audioDir.existsSync()) audioDir.createSync(recursive: true);
@@ -805,26 +990,68 @@ class SubtitleGenerator {
       // 如果临时文件已存在且大小合理，直接复用
       final existing = File(wavPath);
       if (await existing.exists() && await existing.length() > 1024) {
+        onProgress?.call(1.0, Duration.zero, Duration.zero);
         return wavPath;
       }
 
-      // FFmpeg 提取音频：16kHz、单声道、16-bit PCM WAV
+      // 先问出视频时长，用来把 ffmpeg 的进度换算成百分比
+      final totalSeconds = await _probeDurationSeconds(videoPath);
+      final totalDuration =
+          totalSeconds > 0 ? Duration(seconds: totalSeconds.round()) : Duration.zero;
+
       final ffmpegCmd = Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg';
-      final result = await Process.run(
+      final process = await Process.start(
         ffmpegCmd,
         [
           '-y',
+          // 只取音频、丢掉字幕与数据流；-map 0:a:0 只挑第一条音轨，少做无用解码
           '-i', videoPath,
-          '-vn',
+          '-map', '0:a:0?',
+          '-vn', '-sn', '-dn',
           '-acodec', 'pcm_s16le',
           '-ar', '16000',
           '-ac', '1',
+          // 结构化进度输出到 stdout，便于解析
+          '-progress', 'pipe:1',
+          '-nostats',
+          '-loglevel', 'error',
           wavPath,
         ],
-        runInShell: true,
+        runInShell: false,
       );
 
-      if (result.exitCode != 0) {
+      // 解析进度：out_time_us=<微秒>。
+      // 注意 stdout / stderr 都是单订阅流，只能 listen 一次，也不能再 drain，
+      // 否则会抛 StateError 被外层 catch 吞掉（表现成"音频提取失败"）。
+      var lastReportedPercent = -1;
+      final progressSub = process.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(
+        (line) {
+          if (totalSeconds <= 0) return;
+          final match = RegExp(r'^out_time_us=(\d+)').firstMatch(line.trim());
+          if (match == null) return;
+          final micros = int.tryParse(match.group(1)!) ?? 0;
+          if (micros <= 0) return;
+          final processed = Duration(microseconds: micros);
+          final fraction = (processed.inMicroseconds / (totalSeconds * 1000000))
+              .clamp(0.0, 1.0);
+          final percent = (fraction * 100).round();
+          if (percent == lastReportedPercent) return;
+          lastReportedPercent = percent;
+          onProgress?.call(fraction, processed, totalDuration);
+        },
+        onError: (_) {},
+      );
+      // stderr 也必须消费，否则管道写满会卡住子进程
+      final stderrSub = process.stderr.listen((_) {}, onError: (_) {});
+
+      final exitCode = await process.exitCode;
+      await progressSub.cancel();
+      await stderrSub.cancel();
+
+      if (exitCode != 0) {
         // FFmpeg 不可用或视频没有音轨
         return null;
       }
@@ -834,9 +1061,33 @@ class SubtitleGenerator {
         return null;
       }
 
+      onProgress?.call(1.0, totalDuration, totalDuration);
       return wavPath;
     } catch (_) {
       return null;
+    }
+  }
+
+  /// 用 ffprobe 读取媒体总时长（秒）；失败返回 0。
+  ///
+  /// ffprobe 只读头部信息，毫秒级完成，不会像"猜一个进度"那样让进度条骗人。
+  Future<double> _probeDurationSeconds(String videoPath) async {
+    final ffprobeCmd = Platform.isWindows ? 'ffprobe.exe' : 'ffprobe';
+    try {
+      final result = await Process.run(
+        ffprobeCmd,
+        [
+          '-v', 'error',
+          '-show_entries', 'format=duration',
+          '-of', 'default=noprint_wrappers=1:nokey=1',
+          videoPath,
+        ],
+        runInShell: false,
+      );
+      if (result.exitCode != 0) return 0;
+      return double.tryParse(result.stdout.toString().trim()) ?? 0;
+    } catch (_) {
+      return 0;
     }
   }
 
@@ -864,6 +1115,24 @@ class AudioEnergyProfile {
   final List<(int, double)> timeline;
   final double noiseFloor;
   final double speechThreshold;
+
+  /// 返回 [fromMs, toMs] 内最后一次真实发声的结束时刻（毫秒）。
+  ///
+  /// 用于确定字幕应该停留到什么时候：以"最后一次发声 + 少量余量"为准，
+  /// 而不是用词数估算的朗读时长——估算偏短会让字幕在还在说话时就消失，
+  /// 表现为角色继续说了好几句、画面却空着。
+  /// 区间内没有检测到发声时返回 -1。
+  int findLastSpeechEnd(int fromMs, int toMs) {
+    var last = -1;
+    for (final entry in timeline) {
+      final t = entry.$1;
+      final r = entry.$2;
+      if (t < fromMs) continue;
+      if (t > toMs) break;
+      if (r >= speechThreshold) last = t + 100; // 采样窗口长 100ms
+    }
+    return last;
+  }
 
   /// 在 [fromMs, toMs] 范围内寻找首次出现真实人声发音的毫秒点
   int findFirstSpeech(int fromMs, int toMs) {

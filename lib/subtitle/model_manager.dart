@@ -65,6 +65,21 @@ const List<WhisperModelInfo> availableModels = [
 /// [received] 已下载字节数，[total] 总字节数（-1 表示未知）。
 typedef ModelDownloadProgress = void Function(int received, int total);
 
+/// 本地导入模型的结果。
+class ModelImportResult {
+  const ModelImportResult({
+    required this.success,
+    required this.message,
+    this.modelId,
+  });
+
+  final bool success;
+  final String message;
+
+  /// 成功时写入的模型 ID（tiny / base / small）。
+  final String? modelId;
+}
+
 /// 模型管理器。
 class ModelManager {
   ModelManager._();
@@ -193,6 +208,115 @@ class ModelManager {
         if (await tmpFile.exists()) await tmpFile.delete();
       } catch (_) {}
       rethrow;
+    }
+  }
+
+  /// 从本地文件导入一个已下载好的 ggml 模型。
+  ///
+  /// 用于"网络不好，自己离线下载模型再导入"的场景：校验文件确实是 ggml
+  /// 模型（magic 头 4 字节为 `ggml`），再按文件名或体积判断属于哪个模型，
+  /// 最后流式复制到模型目录，复制过程通过 [onProgress] 回报字节数。
+  Future<ModelImportResult> importModelFile(
+    String sourcePath, {
+    void Function(int copied, int total)? onProgress,
+  }) async {
+    try {
+      final source = File(sourcePath);
+      if (!await source.exists()) {
+        return const ModelImportResult(success: false, message: '文件不存在或无法读取');
+      }
+
+      // 1) 校验文件头 magic。
+      //    whisper.cpp 的 ggml 模型把 magic 0x67676d6c 按小端写入，
+      //    因此文件前 4 字节是 "lmgg"；同时兼容大端写法与新版 GGUF 格式。
+      final raf = await source.open();
+      final header = await raf.read(4);
+      await raf.close();
+      final isGgmlLittleEndian =
+          header.length == 4 && header[0] == 0x6c && header[1] == 0x6d &&
+              header[2] == 0x67 && header[3] == 0x67;
+      final isGgmlBigEndian =
+          header.length == 4 && header[0] == 0x67 && header[1] == 0x67 &&
+              header[2] == 0x6d && header[3] == 0x6c;
+      final isGguf =
+          header.length == 4 && header[0] == 0x47 && header[1] == 0x47 &&
+              header[2] == 0x55 && header[3] == 0x46;
+      if (!isGgmlLittleEndian && !isGgmlBigEndian && !isGguf) {
+        return const ModelImportResult(
+          success: false,
+          message: '这不是 Whisper 的 ggml 模型文件（文件头校验失败）',
+        );
+      }
+
+      // 2) 判断属于哪个模型：先看文件名，再看体积
+      final fileName = sourcePath.split(Platform.pathSeparator).last;
+      final lowerName = fileName.toLowerCase();
+      final size = await source.length();
+
+      WhisperModelInfo? target;
+      for (final model in availableModels) {
+        if (lowerName.contains(model.id)) {
+          target = model;
+          break;
+        }
+      }
+      if (target == null) {
+        var bestDelta = double.infinity;
+        for (final model in availableModels) {
+          final delta =
+              (size - model.sizeBytes).abs() / model.sizeBytes;
+          if (delta < 0.15 && delta < bestDelta) {
+            bestDelta = delta;
+            target = model;
+          }
+        }
+      }
+      if (target == null) {
+        final expected = availableModels
+            .map((m) => '${m.id} 约 ${(m.sizeBytes ~/ (1024 * 1024))}MB')
+            .join('、');
+        return ModelImportResult(
+          success: false,
+          message: '无法识别模型类型（文件体积 ${(size / (1024 * 1024)).toStringAsFixed(0)}MB）。'
+              '请使用官方 ggml-*.bin 文件，或将文件名带上模型名。预期：$expected',
+        );
+      }
+
+      // 3) 流式复制到模型目录
+      final dirPath = await NativeFileHelper.getWhisperModelDirPath();
+      final dir = Directory(dirPath);
+      if (!await dir.exists()) await dir.create(recursive: true);
+      final destPath = '$dirPath${Platform.pathSeparator}${target.fileName}';
+      final dest = File(destPath);
+
+      // 用户直接选中模型目录里已有的那个文件时，绝不能"先删后复制"——会把源文件删掉
+      if (await dest.exists() &&
+          dest.absolute.path.toLowerCase() == source.absolute.path.toLowerCase()) {
+        return ModelImportResult(
+          success: true,
+          message: '${target.displayName} 已在模型目录中，无需重复导入',
+          modelId: target.id,
+        );
+      }
+      if (await dest.exists()) await dest.delete();
+
+      final sink = dest.openWrite();
+      var copied = 0;
+      await for (final chunk in source.openRead()) {
+        sink.add(chunk);
+        copied += chunk.length;
+        onProgress?.call(copied, size);
+      }
+      await sink.flush();
+      await sink.close();
+
+      return ModelImportResult(
+        success: true,
+        message: '已导入 ${target.displayName} 模型',
+        modelId: target.id,
+      );
+    } catch (e) {
+      return ModelImportResult(success: false, message: '导入失败：$e');
     }
   }
 

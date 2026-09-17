@@ -50,31 +50,54 @@ abstract final class NativeFileHelper {
   }
 
   // ─────────────────────────────────────────────────
-  // 目录结构：
-  //   PolyFlixPlayer/
-  //   ├── cache/         ← 普通缓存（可安全清理）
-  //   │   └── subtitles/ ← 已生成的字幕缓存
-  //   └── models/        ← 模型目录（清理缓存时跳过）
-  //       └── whisper/   ← Whisper ASR 模型
+  // 目录结构（Windows）：
   //
-  // 清理缓存只动 cache/，不碰 models/。
+  //   %LOCALAPPDATA%\PolyFlixPlayer\   ← 持久数据，不受临时目录清理影响
+  //   ├── models\whisper\              ← Whisper ASR 模型
+  //   └── engine\                      ← 识别引擎包（CUDA / Vulkan，见 EnginePackManager）
+  //
+  //   %TEMP%\PolyFlixPlayer\           ← 可随时清理的临时缓存（清理缓存会整个删掉）
+  //   ├── subtitles\                   ← 已生成的字幕缓存
+  //   └── audio\                       ← 提取出的临时音频
+  //
+  // 模型与引擎放 LOCALAPPDATA：动辄数百 MB ~ 1GB，被系统清理工具删掉后重下代价太高；
+  // 缓存放 TEMP：随时可以丢，清理后重算即可，所以直接以 PolyFlixPlayer 目录为缓存根，
+  // 不必再多套一层 cache\。
   // ─────────────────────────────────────────────────
 
-  /// 桌面端缓存目录：%TEMP%\PolyFlixPlayer\cache\
+  /// 桌面端缓存目录：%TEMP%\PolyFlixPlayer\
+  ///
+  /// 该目录下只有可再生的缓存（字幕缓存、临时音频），"清理应用缓存"会整个删除。
   static Directory desktopCacheDir() {
     final base = Directory.systemTemp.path;
     final sep = Platform.pathSeparator;
-    return Directory('$base${sep}PolyFlixPlayer${sep}cache');
+    return Directory('$base${sep}PolyFlixPlayer');
   }
 
-  /// 桌面端模型目录：%TEMP%\PolyFlixPlayer\models\
-  static Directory _desktopModelsDir() {
+  /// 桌面端持久数据目录：%LOCALAPPDATA%\PolyFlixPlayer\
+  ///
+  /// 取不到 LOCALAPPDATA 时（非 Windows 或异常环境）退回 %TEMP%。
+  static Directory desktopDataDir() {
+    final localAppData = Platform.environment['LOCALAPPDATA'];
+    if (localAppData != null && localAppData.trim().isNotEmpty) {
+      return Directory(
+        '${localAppData.trim()}${Platform.pathSeparator}PolyFlixPlayer',
+      );
+    }
     final base = Directory.systemTemp.path;
     final sep = Platform.pathSeparator;
-    return Directory('$base${sep}PolyFlixPlayer${sep}models');
+    return Directory('$base${sep}PolyFlixPlayer');
   }
 
-  /// 桌面端音频提取缓存目录：%TEMP%\PolyFlixPlayer\cache\audio\
+  /// 桌面端模型目录：%LOCALAPPDATA%\PolyFlixPlayer\models\
+  static Directory _desktopModelsDir() {
+    return Directory(
+      '${desktopDataDir().path}${Platform.pathSeparator}models',
+    );
+  }
+
+  /// 桌面端音频提取缓存目录：%TEMP%\PolyFlixPlayer\audio\
+  /// （仅存放提取出的临时 WAV，识别完成即删）
   static Directory desktopCacheAudioDir() {
     final base = desktopCacheDir().path;
     final sep = Platform.pathSeparator;
@@ -148,7 +171,8 @@ abstract final class NativeFileHelper {
 
   /// 获取当前应用缓存总大小（字节）。
   ///
-  /// 只统计 cache/ 目录，不含模型文件。
+  /// 桌面端统计 %TEMP%\PolyFlixPlayer\ 整个目录；模型与引擎包在
+  /// %LOCALAPPDATA% 下，不计入、也不会被清理。
   static Future<int> getCacheSizeBytes() async {
     if (Platform.isAndroid) {
       try {
@@ -157,7 +181,7 @@ abstract final class NativeFileHelper {
       } catch (_) {}
       return 0;
     }
-    // 桌面端：统计 cache/ 目录
+    // 桌面端：统计缓存根目录
     try {
       return await _directorySize(desktopCacheDir());
     } catch (_) {}
@@ -181,7 +205,8 @@ abstract final class NativeFileHelper {
 
   /// 清理应用缓存，返回已释放的字节数。
   ///
-  /// **只清理 cache/ 目录，不动 models/ 目录。**
+  /// 清理的是 `%TEMP%\PolyFlixPlayer\`（字幕缓存 + 临时音频）；
+  /// 模型与引擎包位于 `%LOCALAPPDATA%\PolyFlixPlayer\`，不受影响。
   static Future<int> clearCache() async {
     int cleared = 0;
     if (Platform.isAndroid) {
@@ -189,7 +214,7 @@ abstract final class NativeFileHelper {
         cleared = (await _channel.invokeMethod<int>('clearCache')) ?? 0;
       } catch (_) {}
     } else {
-      // 桌面端：删除 cache/ 目录（连同内容），下次使用时按需重建
+      // 桌面端：整个缓存根目录连同内容删除，下次使用时按需重建
       try {
         final dir = desktopCacheDir();
         if (dir.existsSync()) {

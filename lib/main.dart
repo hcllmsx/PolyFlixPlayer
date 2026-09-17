@@ -1,9 +1,12 @@
+import 'dart:ui' show AppExitResponse;
+
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'home/home_page.dart';
 import 'settings/app_settings.dart';
+import 'subtitle/whisper_server.dart';
 import 'utils/platform_utils.dart';
 
 Future<void> main() async {
@@ -76,8 +79,35 @@ class ThemeNotifier extends ChangeNotifier {
 
 final themeNotifier = ThemeNotifier();
 
-class PolyFlixApp extends StatelessWidget {
+class PolyFlixApp extends StatefulWidget {
   const PolyFlixApp({super.key});
+
+  @override
+  State<PolyFlixApp> createState() => _PolyFlixAppState();
+}
+
+class _PolyFlixAppState extends State<PolyFlixApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// 退出应用前先关掉常驻的识别服务进程。
+  ///
+  /// whisper-server 是独立子进程，父进程退出它不会自动跟着退，
+  /// 不清理会一直占着显存（GPU 引擎包场景）直到重启电脑。
+  @override
+  Future<AppExitResponse> didRequestAppExit() async {
+    await WhisperServerSession.shutdownAny();
+    return AppExitResponse.exit;
+  }
 
   @override
   Widget build(BuildContext context) {

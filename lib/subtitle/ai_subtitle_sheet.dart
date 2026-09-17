@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 
 import 'ai_task_manager.dart';
 import '../settings/app_settings.dart';
+import 'device_capability.dart';
+import 'engine_pack.dart';
 import 'model_manager.dart';
 import 'subtitle_generator.dart';
 
@@ -84,6 +86,15 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   AsrState _currentState = AsrState.idle;
   Set<String> _cachedModels = {};
 
+  /// 设备能力检测结果；为 null 表示还在检测中。
+  ///
+  /// 明确不做降级兼容：不满足最低要求（内存 / 核数）的设备直接提示"不支持"，
+  /// 不为老旧低端设备投入适配成本。
+  DeviceCapabilities? _deviceCaps;
+
+  /// 预探测到的识别引擎名称（引擎包 / 内置 CPU）。
+  String? _engineLabel;
+
   final List<Map<String, String>> _languageOptions = const [
     {'code': 'auto', 'label': '自动侦测（原音频语言）'},
     {'code': 'zh', 'label': '中文 (Chinese)'},
@@ -131,6 +142,21 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       });
     });
     _checkModels();
+
+    // 设备能力检测：不满足最低要求时禁用识别入口并给出明确提示
+    detectDeviceCapabilities().then((caps) {
+      if (mounted) setState(() => _deviceCaps = caps);
+    });
+
+    // 预先探测将要使用的识别引擎（引擎包 / 内置 CPU 插件），供界面展示
+    EnginePackManager.instance
+        .resolvePreferred(allowGpu: !aiAsrForceCpu.value)
+        .then((pack) {
+      if (!mounted) return;
+      setState(() {
+        _engineLabel = pack == null ? '内置 CPU 引擎' : pack.displayName;
+      });
+    });
   }
 
   void _onTaskManagerChanged() {
@@ -216,6 +242,17 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   void _startTranscribing() {
     final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
     if (isRunning) return;
+
+    // 低端/老旧设备不做兼容降级，直接明确拒绝
+    final caps = _deviceCaps;
+    if (caps != null && !caps.meetsMinimumRequirements) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('当前设备不支持 AI 语音识别：${caps.unsupportedReason ?? '硬件不满足最低要求'}'),
+        ),
+      );
+      return;
+    }
 
     if (!(_modelAvailability[_selectedModel] ?? false)) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -466,6 +503,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                 children: [
                   // 1. 状态看板
                   _buildStatusCard(theme, isRunning, entries.length),
+                  const SizedBox(height: 6),
+                  _buildEngineCaption(),
 
                   const SizedBox(height: 16),
 
@@ -507,6 +546,24 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
           ],
         ),
       ),
+    );
+  }
+
+  /// 识别引擎说明行：让用户知道这次识别是走 GPU 引擎包还是内置 CPU。
+  Widget _buildEngineCaption() {
+    final label = SubtitleGenerator.lastEngineLabel ?? _engineLabel;
+    return Row(
+      children: [
+        const Icon(Icons.memory_rounded, size: 13, color: Colors.white38),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            label == null ? '识别引擎：正在检测…' : '识别引擎：$label',
+            style: const TextStyle(fontSize: 11.5, color: Colors.white38),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
     );
   }
 
@@ -725,6 +782,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         child: DropdownButton<String>(
           value: _selectedLanguage,
           isExpanded: true,
+          // M3 下聚焦时会用 focusColor 填出一块底色，这里关掉保持纯文字
+          focusColor: Colors.transparent,
           dropdownColor: const Color(0xFF262630),
           icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
           items: _languageOptions.map((opt) {
@@ -898,6 +957,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     final hasModel = _modelAvailability[_selectedModel] ?? false;
     final hasCache = _cachedModels.contains(_selectedModel);
+    final unsupported =
+        _deviceCaps != null && !_deviceCaps!.meetsMinimumRequirements;
 
     return Row(
       children: [
@@ -912,21 +973,29 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             ),
             icon: Icon(
-              hasCache ? Icons.check_circle_outline_rounded : Icons.mic_none_rounded,
+              unsupported
+                  ? Icons.block_rounded
+                  : (hasCache
+                      ? Icons.check_circle_outline_rounded
+                      : Icons.mic_none_rounded),
               size: 20,
               color: hasCache ? Colors.white38 : Colors.white,
             ),
             label: Text(
-              hasModel
-                  ? (hasCache ? '已有字幕缓存' : '开始识别原音频')
-                  : '未就绪 (缺少模型)',
+              unsupported
+                  ? '当前设备不支持此功能'
+                  : (hasModel
+                      ? (hasCache ? '已有字幕缓存' : '开始识别原音频')
+                      : '未就绪 (缺少模型)'),
               style: TextStyle(
                 fontSize: 15,
                 fontWeight: FontWeight.w600,
                 color: hasCache ? Colors.white38 : Colors.white,
               ),
             ),
-            onPressed: (hasModel && !hasCache) ? _startTranscribing : null,
+            onPressed: (!unsupported && hasModel && !hasCache)
+                ? _startTranscribing
+                : null,
           ),
         ),
       ],

@@ -10,6 +10,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 const String _kFitWindowToVideo = 'settings.fitWindowToVideo';
 const String _kAiSubtitleEnabled = 'settings.aiSubtitleEnabled';
 const String _kAiAsrModelId = 'settings.aiAsrModelId';
+const String _kAiAsrThreads = 'settings.aiAsrThreads';
+const String _kAiAsrForceCpu = 'settings.aiAsrForceCpu';
 
 /// 打开视频后是否让播放窗口自动适应视频画面比例（仅桌面端生效）。
 ///
@@ -27,6 +29,19 @@ final ValueNotifier<bool> aiSubtitleEnabled = ValueNotifier<bool>(true);
 /// 打开 AI 字幕面板时自动恢复为上次选用的模型，避免每次都回到 tiny。
 final ValueNotifier<String> aiAsrModelId = ValueNotifier<String>('tiny');
 
+/// AI 语音识别的 CPU 线程数；0 表示"自动"（按逻辑核心数推算）。
+///
+/// whisper.cpp 是纯 CPU 推理，线程数直接影响长视频的识别耗时：
+/// 线程太少慢得离谱，线程过多收益递减（小模型甚至会变慢），所以给用户一个
+/// 可调档位，默认交给自动策略。
+final ValueNotifier<int> aiAsrThreadCount = ValueNotifier<int>(0);
+
+/// 是否强制使用 CPU 做识别。
+///
+/// 用于"装了 GPU 引擎包但显卡驱动有问题"的场景：勾选后即使装了 CUDA/Vulkan
+/// 引擎包也会以 `-ng` 启动，退回 CPU 推理，不用删掉引擎包。
+final ValueNotifier<bool> aiAsrForceCpu = ValueNotifier<bool>(false);
+
 /// 从本地存储载入设置，应在 runApp 之前调用一次。
 Future<void> loadAppSettings() async {
   try {
@@ -37,6 +52,8 @@ Future<void> loadAppSettings() async {
     // 仅接受合法的模型 ID，防止脏数据导致面板找不到模型
     aiAsrModelId.value =
         const ['tiny', 'base', 'small'].contains(savedModel) ? savedModel : 'tiny';
+    aiAsrThreadCount.value = prefs.getInt(_kAiAsrThreads) ?? 0;
+    aiAsrForceCpu.value = prefs.getBool(_kAiAsrForceCpu) ?? false;
   } catch (_) {
     // 读取失败时保留默认值，不能因为设置读不出来就启动不了。
   }
@@ -70,6 +87,28 @@ Future<void> setAiAsrModelId(String value) async {
   try {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kAiAsrModelId, value);
+  } catch (_) {
+    // 持久化失败不影响本次生效。
+  }
+}
+
+/// 写入"AI 识别线程数"（0 = 自动）。
+Future<void> setAiAsrThreadCount(int value) async {
+  aiAsrThreadCount.value = value;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_kAiAsrThreads, value);
+  } catch (_) {
+    // 持久化失败不影响本次生效。
+  }
+}
+
+/// 写入"强制使用 CPU 识别"开关。
+Future<void> setAiAsrForceCpu(bool value) async {
+  aiAsrForceCpu.value = value;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kAiAsrForceCpu, value);
   } catch (_) {
     // 持久化失败不影响本次生效。
   }

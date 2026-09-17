@@ -1,8 +1,15 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
+import '../subtitle/device_capability.dart';
+import '../subtitle/engine_pack.dart';
 import '../subtitle/model_manager.dart';
+import '../subtitle/whisper_server.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'about_page.dart';
@@ -36,12 +43,39 @@ class _SettingsPageState extends State<SettingsPage> {
   Set<String> _downloadedModels = {};
   final Map<String, double> _downloadProgress = {};
 
+  /// 本机 GPU 能力。
+  GpuCapability? _gpu;
+
+  /// 已安装的识别引擎包（空表示只使用内置 CPU 插件）。
+  List<EnginePack> _enginePacks = const [];
+
+  /// 实际会被使用的引擎包（同类型多个时取最近导入的）。
+  EnginePack? _preferredEngine;
+
+  bool _checkingEngine = true;
+
   @override
   void initState() {
     super.initState();
     _refreshCacheSize();
     _loadLocalVersion();
     _refreshModels();
+    detectGpuCapability().then((cap) {
+      if (mounted) setState(() => _gpu = cap);
+    });
+    _refreshEnginePacks();
+  }
+
+  Future<void> _refreshEnginePacks() async {
+    final packs = await EnginePackManager.instance.resolveAll();
+    final preferred = await EnginePackManager.instance
+        .resolvePreferred(allowGpu: !aiAsrForceCpu.value);
+    if (!mounted) return;
+    setState(() {
+      _enginePacks = packs;
+      _preferredEngine = preferred;
+      _checkingEngine = false;
+    });
   }
 
   Future<void> _refreshModels() async {
@@ -295,14 +329,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
                   child: Row(
                     children: [
-                      Text(
-                        '离线语音模型管理',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: scheme.primary,
-                        ),
-                      ),
+                      _cardSectionTitle('离线语音模型管理'),
                       const Spacer(),
                       Text(
                         '已检测到 ${_downloadedModels.length}/${availableModels.length} 个模型就绪',
@@ -317,6 +344,20 @@ class _SettingsPageState extends State<SettingsPage> {
                 const SizedBox(height: 4),
                 for (final model in availableModels)
                   _buildModelItem(model, scheme),
+                _sectionActionRow([
+                  _SectionAction(
+                    icon: Icons.file_download_outlined,
+                    label: '导入模型',
+                    onPressed: _importModel,
+                  ),
+                  _SectionAction(
+                    icon: Icons.folder_open_rounded,
+                    label: '打开模型目录',
+                    onPressed: _openModelDirectory,
+                  ),
+                ]),
+                const Divider(height: 1),
+                _buildAsrPerformanceRow(scheme),
                 const SizedBox(height: 8),
               ],
             ),
@@ -350,14 +391,6 @@ class _SettingsPageState extends State<SettingsPage> {
                               style: TextStyle(
                                 fontSize: 13,
                                 color: scheme.onSurfaceVariant,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              '不包含离线语音模型',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: scheme.onSurfaceVariant.withValues(alpha: .7),
                               ),
                             ),
                           ],
@@ -497,6 +530,410 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
+  /// 识别引擎与性能设置。
+  ///
+  /// 引擎采用"引擎包"模式：把 whisper.cpp 官方预编译包放进引擎目录即可获得
+  /// GPU 加速（CUDA/Vulkan）；没放引擎包则自动回落到内置的纯 CPU 插件。
+  Widget _buildAsrPerformanceRow(ColorScheme scheme) {
+    final cores = Platform.numberOfProcessors;
+    final options = <int>[0, 4, 8, 12, 16].where((v) => v == 0 || v < cores).toList();
+    final hasGpuPack = _enginePacks.any((p) => p.supportsGpu);
+
+    return ListenableBuilder(
+      listenable: aiAsrForceCpu,
+      builder: (context, _) {
+        final gpuActive = hasGpuPack && !aiAsrForceCpu.value;
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // ---------- 识别引擎 ----------
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: _cardSectionTitle('识别引擎'),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _engineStatusText(),
+                    style: TextStyle(fontSize: 13, color: scheme.onSurface),
+                  ),
+                  // 本机显卡（已过滤虚拟显示适配器）：
+                  // 只有一张就直接跟在冒号后面，多张才用无序列表逐行展示
+                  if (_gpu?.hasAdapters == true) ...[
+                    const SizedBox(height: 6),
+                    if (_gpu!.adapters.length == 1)
+                      Text(
+                        '本机显卡：${_gpu!.adapters.first}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      )
+                    else ...[
+                      Text(
+                        '本机显卡：',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      for (final adapter in _gpu!.adapters)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 4, top: 2),
+                          child: Text(
+                            '· $adapter',
+                            style: TextStyle(
+                              fontSize: 12,
+                              height: 1.4,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ],
+                  if (_engineHintText() != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      _engineHintText()!,
+                      style: TextStyle(
+                        fontSize: 12,
+                        height: 1.5,
+                        color: scheme.onSurfaceVariant.withValues(alpha: .72),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            _sectionActionRow([
+              if (isDesktopPlatform)
+                _SectionAction(
+                  icon: Icons.unarchive_outlined,
+                  label: '导入引擎',
+                  onPressed: _importEngine,
+                ),
+              _SectionAction(
+                icon: Icons.folder_open_rounded,
+                label: '引擎目录',
+                onPressed: () async {
+                  await NativeFileHelper.openDirectory(
+                    EnginePackManager.instance.engineRootDir(),
+                  );
+                  await _refreshEnginePacks();
+                },
+              ),
+            ]),
+            if (hasGpuPack)
+              SwitchListTile(
+                value: aiAsrForceCpu.value,
+                onChanged: (v) => setAiAsrForceCpu(v),
+                secondary: Icon(
+                  Icons.developer_board_off_rounded,
+                  color: scheme.primary,
+                ),
+                title: const Text('强制使用 CPU 识别'),
+                subtitle: const Text('显卡驱动异常或识别报错时打开，无需删除引擎包。'),
+              ),
+            const Divider(height: 1, indent: 16, endIndent: 16),
+
+            // ---------- 识别线程数 ----------
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: _cardSectionTitle('识别线程数'),
+            ),
+            ListenableBuilder(
+              listenable: aiAsrThreadCount,
+              builder: (context, _) {
+                final current = options.contains(aiAsrThreadCount.value)
+                    ? aiAsrThreadCount.value
+                    : 0;
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        gpuActive
+                            ? '当前使用 GPU 引擎包加速，线程数不生效。'
+                            : '仅 CPU 识别时生效：本机 $cores 逻辑核心，'
+                                '「自动」取核心数一半并限制在 4~12。',
+                        style: TextStyle(
+                          fontSize: 12,
+                          height: 1.45,
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          DropdownButton<int>(
+                            value: current,
+                            underline: const SizedBox.shrink(),
+                            // Material 3 下 DropdownButton 聚焦时会用 focusColor 填充底色，
+                            // 选完一项后那块灰底会一直留着，这里显式关掉。
+                            focusColor: Colors.transparent,
+                            // GPU 加速时线程数不起作用，置灰不可选
+                            onChanged: gpuActive
+                                ? null
+                                : (v) {
+                                    if (v != null) setAiAsrThreadCount(v);
+                                  },
+                            items: [
+                              for (final v in options)
+                                DropdownMenuItem<int>(
+                                  value: v,
+                                  child: Text(
+                                    v == 0 ? '自动' : '$v 线程',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: gpuActive
+                                          ? scheme.onSurface
+                                              .withValues(alpha: .38)
+                                          : null,
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 14),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 卡片内小节标题：与「离线语音模型管理」保持同一套样式。
+  Widget _cardSectionTitle(String title) {
+    final scheme = Theme.of(context).colorScheme;
+    return Text(
+      title,
+      style: TextStyle(
+        fontSize: 13,
+        fontWeight: FontWeight.w600,
+        color: scheme.primary,
+      ),
+    );
+  }
+
+  /// 卡片内小节的操作按钮行：单独一行、右对齐。
+  Widget _sectionActionRow(List<_SectionAction> actions) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 12, 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          for (var i = 0; i < actions.length; i++) ...[
+            if (i > 0) const SizedBox(width: 4),
+            TextButton.icon(
+              style: TextButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+              ),
+              onPressed: actions[i].onPressed,
+              icon: Icon(actions[i].icon, size: 16),
+              label: Text(actions[i].label),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 导入本地已下载好的 ggml 模型文件。
+  Future<void> _importModel() async {
+    final picked = await FilePicker.pickFile(
+      dialogTitle: '选择要导入的模型文件（ggml-tiny / base / small.bin）',
+      type: FileType.custom,
+      allowedExtensions: ['bin'],
+    );
+    final path = picked?.path;
+    if (path == null || !mounted) return;
+
+    final result = await _runWithProgress<ModelImportResult>(
+      '导入模型',
+      (report) => ModelManager.instance.importModelFile(
+        path,
+        onProgress: (copied, total) => report(
+          total > 0
+              ? '正在写入模型目录… ${_formatBytes(copied)} / ${_formatBytes(total)}'
+              : '正在写入模型目录…',
+        ),
+      ),
+    );
+
+    if (!mounted) return;
+    await _refreshModels();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(result.message)));
+  }
+
+  /// 导入本地已下载好的引擎包 zip。
+  Future<void> _importEngine() async {
+    final picked = await FilePicker.pickFile(
+      dialogTitle: '选择引擎包（whisper.cpp 官方发布的 zip）',
+      type: FileType.custom,
+      allowedExtensions: ['zip'],
+    );
+    final path = picked?.path;
+    if (path == null || !mounted) return;
+
+    // 先停掉正在运行的识别服务：否则替换旧引擎包时文件被占用，删不掉
+    await WhisperServerSession.shutdownAny();
+
+    final result = await _runWithProgress<EngineImportResult>(
+      '导入引擎包',
+      (report) => EnginePackManager.instance.importFromZip(
+        path,
+        onProgress: (written) =>
+            report('正在解压… 已写入 ${_formatBytes(written)}\n（1GB 左右的包通常需要 1~2 分钟）'),
+        onDuplicateKind: _askDuplicateEngine,
+      ),
+    );
+
+    if (!mounted) return;
+    await _refreshEnginePacks();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(result.message)));
+  }
+
+  /// 同类型引擎包已存在时的询问：替换 / 保留两个 / 取消。
+  Future<EngineDuplicateAction> _askDuplicateEngine(
+    EngineKind kind,
+    EnginePack existing,
+  ) async {
+    final kindLabel = switch (kind) {
+      EngineKind.cuda => 'CUDA',
+      EngineKind.vulkan => 'Vulkan',
+      EngineKind.cpu => 'CPU',
+    };
+    final choice = await showDialog<EngineDuplicateAction>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('已存在同类型引擎包'),
+        content: Text(
+          '引擎目录中已经有 $kindLabel 引擎包（${existing.dirName}）。\n\n'
+          '· 替换：删除旧的，改用这次导入的包（推荐）\n'
+          '· 保留两个：新包放到 ${existing.dirName}-2，'
+          '会多占一份空间，识别时默认使用最近导入的那个',
+          style: const TextStyle(fontSize: 13, height: 1.6),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.of(ctx).pop(EngineDuplicateAction.cancel),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(ctx).pop(EngineDuplicateAction.keepBoth),
+            child: const Text('保留两个'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(ctx).pop(EngineDuplicateAction.replace),
+            child: const Text('替换'),
+          ),
+        ],
+      ),
+    );
+    return choice ?? EngineDuplicateAction.cancel;
+  }
+
+  /// 执行耗时任务并显示不可取消的进度弹窗。
+  ///
+  /// 不可取消是有意的：导入到一半中断会在模型/引擎目录里留下半截文件，
+  /// 反而更难处理。
+  Future<T> _runWithProgress<T>(
+    String title,
+    Future<T> Function(void Function(String detail) report) task,
+  ) async {
+    final detail = ValueNotifier<String>('准备中…');
+    final navigator = Navigator.of(context, rootNavigator: true);
+
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: Text(title),
+          content: ValueListenableBuilder<String>(
+            valueListenable: detail,
+            builder: (_, text, _) => Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const LinearProgressIndicator(),
+                const SizedBox(height: 14),
+                Text(text, style: const TextStyle(fontSize: 13, height: 1.5)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ));
+
+    try {
+      return await task((value) => detail.value = value);
+    } finally {
+      if (navigator.canPop()) navigator.pop();
+      // 弹窗关闭动画结束后再释放，避免正在监听它的组件访问已释放对象
+      Future.delayed(const Duration(milliseconds: 300), detail.dispose);
+    }
+  }
+
+  /// 引擎状态主文案：展示真正会被使用的那个包（含目录名，便于区分同类型多包）。
+  String _engineStatusText() {
+    if (_checkingEngine) return '正在检测…';
+
+    final preferred = _preferredEngine;
+    if (preferred == null) {
+      return _enginePacks.isEmpty
+          ? '未安装引擎包：使用内置 CPU 引擎'
+          : '已安装 ${_enginePacks.length} 个引擎包，但当前设置下不使用（见下方开关）';
+    }
+
+    final gpuActive = preferred.supportsGpu && !aiAsrForceCpu.value;
+    final extra = _enginePacks.length - 1;
+    final extraText = extra > 0 ? '，另有 $extra 个备用包' : '';
+    return '当前使用：${preferred.qualifiedName}'
+        '（${gpuActive ? 'GPU 加速' : 'CPU 识别'}）$extraText';
+  }
+
+  /// 引擎状态附加提示（没有则返回 null）。
+  String? _engineHintText() {
+    if (_checkingEngine) return null;
+    if (_enginePacks.isEmpty) {
+      return '把 whisper.cpp 官方预编译包解压到引擎目录即可启用 GPU 加速。';
+    }
+    if (_enginePacks.length > 1) {
+      return '同类型有多个引擎包时，默认使用最近导入的那个；不需要的包可直接在引擎目录里删除。';
+    }
+    return null;
+  }
+
+  Future<void> _openModelDirectory() async {
+    final path = await NativeFileHelper.getWhisperModelDirPath();
+    await NativeFileHelper.openDirectory(Directory(path));
+  }
+
   Widget _buildModelItem(WhisperModelInfo model, ColorScheme scheme) {
     final isDownloaded = _downloadedModels.contains(model.id);
     final progress = _downloadProgress[model.id];
@@ -551,6 +988,19 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
     );
   }
+}
+
+/// 卡片内小节操作按钮的描述。
+class _SectionAction {
+  const _SectionAction({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String label;
+  final Future<void> Function() onPressed;
 }
 
 class _SectionTitle extends StatelessWidget {
