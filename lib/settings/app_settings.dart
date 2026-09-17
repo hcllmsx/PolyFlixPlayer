@@ -2,18 +2,23 @@
 ///
 /// 用顶层 ValueNotifier 而不是引入状态管理库：设置项很少，设置页写、
 /// 播放页读，两边监听同一个值即可，改动面最小。
+///
+/// 持久化走 [AppStore]（`%LOCALAPPDATA%\PolyFlixPlayer\settings.json`），
+/// 不再使用 shared_preferences —— 后者的落盘路径由 exe 的公司名/产品名决定，
+/// 一旦改名用户设置就会丢。
 library;
 
 import 'package:flutter/foundation.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../subtitle/model_manager.dart';
+import 'app_store.dart';
 
-const String _kFitWindowToVideo = 'settings.fitWindowToVideo';
-const String _kAiSubtitleEnabled = 'settings.aiSubtitleEnabled';
-const String _kAiAsrModelId = 'settings.aiAsrModelId';
-const String _kAiAsrThreads = 'settings.aiAsrThreads';
-const String _kAiAsrForceCpu = 'settings.aiAsrForceCpu';
+// ------------------------------ 存储键（settings.json 里的字段名） ------------------------------
+const String _kFitWindowToVideo = 'fitWindowToVideo';
+const String _kAiSubtitleEnabled = 'aiSubtitleEnabled';
+const String _kAiAsrModelId = 'aiAsrModelId';
+const String _kAiAsrThreads = 'aiAsrThreads';
+const String _kAiAsrForceCpu = 'aiAsrForceCpu';
 
 /// 打开视频后是否让播放窗口自动适应视频画面比例（仅桌面端生效）。
 ///
@@ -46,74 +51,46 @@ final ValueNotifier<bool> aiAsrForceCpu = ValueNotifier<bool>(false);
 
 /// 从本地存储载入设置，应在 runApp 之前调用一次。
 Future<void> loadAppSettings() async {
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    fitWindowToVideo.value = prefs.getBool(_kFitWindowToVideo) ?? false;
-    aiSubtitleEnabled.value = prefs.getBool(_kAiSubtitleEnabled) ?? true;
-    final savedModel = prefs.getString(_kAiAsrModelId) ?? '';
-    // 只接受模型清单里真实存在的 ID：清单有 40 多个型号（tiny~large-v3 系列），
-    // 写死几个会让用户记住的大模型选择失效，脏数据才回退到 tiny。
-    aiAsrModelId.value = availableModels.any((m) => m.id == savedModel)
-        ? savedModel
-        : 'tiny';
-    aiAsrThreadCount.value = prefs.getInt(_kAiAsrThreads) ?? 0;
-    aiAsrForceCpu.value = prefs.getBool(_kAiAsrForceCpu) ?? false;
-  } catch (_) {
-    // 读取失败时保留默认值，不能因为设置读不出来就启动不了。
-  }
+  final store = AppStore.instance;
+  await store.load();
+  fitWindowToVideo.value = store.getBool(_kFitWindowToVideo, false);
+  aiSubtitleEnabled.value = store.getBool(_kAiSubtitleEnabled, true);
+  final savedModel = store.getString(_kAiAsrModelId) ?? '';
+  // 只接受模型清单里真实存在的 ID：清单有 40 多个型号（tiny~large-v3 系列），
+  // 写死几个会让用户记住的大模型选择失效，脏数据才回退到 tiny。
+  aiAsrModelId.value = availableModels.any((m) => m.id == savedModel)
+      ? savedModel
+      : 'tiny';
+  aiAsrThreadCount.value = store.getInt(_kAiAsrThreads, 0);
+  aiAsrForceCpu.value = store.getBool(_kAiAsrForceCpu, false);
 }
 
 /// 写入"窗口适应视频比例"开关。
 Future<void> setFitWindowToVideo(bool value) async {
   fitWindowToVideo.value = value;
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_kFitWindowToVideo, value);
-  } catch (_) {
-    // 持久化失败不影响本次生效。
-  }
+  await AppStore.instance.setBool(_kFitWindowToVideo, value);
 }
 
 /// 写入"AI 字幕"开关。
 Future<void> setAiSubtitleEnabled(bool value) async {
   aiSubtitleEnabled.value = value;
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_kAiSubtitleEnabled, value);
-  } catch (_) {
-    // 持久化失败不影响本次生效。
-  }
+  await AppStore.instance.setBool(_kAiSubtitleEnabled, value);
 }
 
 /// 写入"AI 语音识别模型"选择，下次打开面板时恢复。
 Future<void> setAiAsrModelId(String value) async {
   aiAsrModelId.value = value;
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kAiAsrModelId, value);
-  } catch (_) {
-    // 持久化失败不影响本次生效。
-  }
+  await AppStore.instance.setString(_kAiAsrModelId, value);
 }
 
 /// 写入"AI 识别线程数"（0 = 自动）。
 Future<void> setAiAsrThreadCount(int value) async {
   aiAsrThreadCount.value = value;
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_kAiAsrThreads, value);
-  } catch (_) {
-    // 持久化失败不影响本次生效。
-  }
+  await AppStore.instance.setInt(_kAiAsrThreads, value);
 }
 
 /// 写入"强制使用 CPU 识别"开关。
 Future<void> setAiAsrForceCpu(bool value) async {
   aiAsrForceCpu.value = value;
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_kAiAsrForceCpu, value);
-  } catch (_) {
-    // 持久化失败不影响本次生效。
-  }
+  await AppStore.instance.setBool(_kAiAsrForceCpu, value);
 }

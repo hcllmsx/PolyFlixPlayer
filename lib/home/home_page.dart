@@ -8,13 +8,13 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../main.dart';
 import '../pflx/pflx.dart';
 import '../player/player_page.dart';
 import '../settings/app_settings.dart';
+import '../settings/app_store.dart';
 import '../settings/settings_page.dart';
 import '../settings/update_service.dart';
 import '../subtitle/ai_task_manager.dart';
@@ -1735,12 +1735,13 @@ abstract final class _StoragePermissionHelper {
 }
 
 abstract final class _LibraryStorage {
-  static const _key = 'polyflix_saved_library_paths';
+  static const _key = 'savedLibraryPaths';
 
   static Future<List<_LibraryItem>> load() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final paths = prefs.getStringList(_key) ?? [];
+      final store = AppStore.library;
+      await store.load();
+      final paths = store.getStringList(_key) ?? const <String>[];
       final list = <_LibraryItem>[];
       for (final path in paths) {
         if (!File(path).existsSync()) continue;
@@ -1765,9 +1766,11 @@ abstract final class _LibraryStorage {
 
   static Future<void> save(List<_LibraryItem> items) async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final paths = items.map((e) => e.path).toList();
-      await prefs.setStringList(_key, paths);
+      // 只存路径：文件不存在时 load() 会自动跳过该条
+      await AppStore.library.setStringList(
+        _key,
+        items.map((e) => e.path).toList(),
+      );
     } catch (_) {}
   }
 }

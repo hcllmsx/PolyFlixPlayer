@@ -41,7 +41,6 @@ dependencies:
   media_kit_libs_android_video: ^1.1.8
   # 文件选择 / 路径访问（安卓 SAF & iOS 文档选择器）
   file_picker: ^12.0.0
-  shared_preferences: ^2.5.5
   url_launcher: ^6.3.1
   media_kit_libs_windows_video: ^1.0.11
   desktop_drop: ^0.8.4
