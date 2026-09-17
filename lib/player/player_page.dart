@@ -36,6 +36,16 @@ const double _kVolumeStep = 5;
 /// 桌面端键盘快进/快退的秒数（←/→），与界面按钮的 ±10s 保持一致。
 const int _kSeekStepSeconds = 10;
 
+/// 桌面端控制条隐藏后，鼠标需要移动这么多逻辑像素才会重新唤出。
+///
+/// 原先是任何 1 像素的 hover 就立刻弹出来 —— 手搭在鼠标上、桌面轻微震动都会
+/// 把控制条和光标"晃"出来，看片时很打断。改成以「隐藏那一刻的光标位置」为基准，
+/// 移动超过这个距离才算一次有意的动作（缓慢移动同样会累积距离）。
+///
+/// 取 100 而不是更小的值：点画面隐藏控制条时，手在点完之后往往还有一个自然的
+/// 收尾动作，光标会跟着挪一截，阈值太小就会出现"刚点了隐藏、立刻又弹回来"。
+const double _kPointerWakeDistance = 100;
+
 /// 字幕菜单里"关闭字幕"项的哨兵值（不会与真实轨道 id 冲突）。
 const String _kSubtitlesOff = '__off__';
 
@@ -114,7 +124,7 @@ class PlayerPage extends StatefulWidget {
   State<PlayerPage> createState() => _PlayerPageState();
 }
 
-class _PlayerPageState extends State<PlayerPage> {
+class _PlayerPageState extends State<PlayerPage> with WindowListener {
   late final Player _player;
   late final VideoController _controller;
   PflxStreamServer? _streamServer;
@@ -211,6 +221,22 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 会造成大量无谓重建，这里限制最短间隔。
   DateTime _lastPointerActivity = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// 最近一次鼠标位置（全局逻辑坐标），每次 hover 都更新。
+  Offset? _lastPointerPos;
+
+  /// 控制条隐藏那一刻的光标位置，作为"移动了多远"的判断基准。
+  Offset? _pointerAnchor;
+
+  /// 上一次点画面的时间与位置，用于识别双击（桌面端双击 = 全屏切换）。
+  ///
+  /// 自己判断而不是用 `GestureDetector.onDoubleTap`：那个会让单击回调先等
+  /// 300ms（等着看有没有第二击），"点一下画面藏控制条"会明显变迟钝。
+  DateTime? _lastSurfaceTapAt;
+  Offset? _lastSurfaceTapPos;
+
+  /// 是否处于全屏（仅桌面端，跟随窗口状态同步）。
+  bool _isFullScreen = false;
+
   /// 键盘事件接收节点。配合 ExcludeFocus 保证焦点不会跑到按钮上。
   final FocusNode _keyboardFocus = FocusNode(debugLabel: 'player');
 
@@ -231,6 +257,10 @@ class _PlayerPageState extends State<PlayerPage> {
           systemNavigationBarIconBrightness: Brightness.light,
         ),
       );
+    } else {
+      // 桌面端：跟踪窗口全屏状态（用户用系统方式切全屏时界面图标也要跟着变）
+      windowManager.addListener(this);
+      _syncFullScreenState();
     }
     _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
     _asrProgressSub = SubtitleGenerator.instance.progressStream.listen((p) {
@@ -271,6 +301,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   void dispose() {
+    if (isDesktopPlatform) windowManager.removeListener(this);
     aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
     _asrProgressSub?.cancel();
     _aiRestoreDebounce?.cancel();
@@ -455,7 +486,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_showRestartButton) return;
     _hideTimer = Timer(const Duration(seconds: 4), () {
       if (mounted && _playing && _controlsVisible && !_scrubbing) {
-        setState(() => _controlsVisible = false);
+        _hideControls();
       }
     });
   }
@@ -466,14 +497,12 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   void _toggleControls() {
-    setState(() {
-      _controlsVisible = !_controlsVisible;
-      if (_controlsVisible) {
-        _scheduleAutoHide();
-      } else {
-        _cancelAutoHide();
-      }
-    });
+    if (_controlsVisible) {
+      _hideControls();
+    } else {
+      setState(() => _controlsVisible = true);
+      _scheduleAutoHide();
+    }
   }
 
   Future<void> _togglePlayback() async {
@@ -808,17 +837,24 @@ class _PlayerPageState extends State<PlayerPage> {
     // 2. 落一次播放进度：下次打开这个视频从当前位置继续。
     //    放在 pause 之后 —— 位置已经稳定，记的就是用户实际看到的地方。
     await _recordProgressNow();
-    // 3. 提前停止流式服务（如有），减少 dispose 中的工作量。
+    // 3. 退出全屏再走：否则回到首页仍是全屏，而首页没有全屏入口，
+    //    用户会觉得"窗口卡在全屏了"。
+    if (isDesktopPlatform && _isFullScreen) {
+      try {
+        await windowManager.setFullScreen(false);
+      } catch (_) {}
+    }
+    // 4. 提前停止流式服务（如有），减少 dispose 中的工作量。
     try {
       _streamServer?.stop();
       _streamServer = null;
     } catch (_) {}
-    // 4. 等一帧，让 Flutter 渲染管线完成当前帧的合成，
+    // 5. 等一帧，让 Flutter 渲染管线完成当前帧的合成，
     //    之后的帧就不会再引用播放器纹理了。
     if (!mounted) return;
     await Future.delayed(const Duration(milliseconds: 100));
     if (!mounted) return;
-    // 5. 现在安全 pop。
+    // 6. 现在安全 pop。
     Navigator.of(context).pop();
   }
 
@@ -835,6 +871,8 @@ class _PlayerPageState extends State<PlayerPage> {
     if (!mounted) return;
     if (!fitWindowToVideo.value) return;
     if (_windowFitApplied) return;
+    // 全屏时改窗口尺寸会跟全屏状态打架（还可能把全屏顶掉）
+    if (_isFullScreen) return;
 
     final videoWidth = _player.state.width;
     final videoHeight = _player.state.height;
@@ -887,11 +925,100 @@ class _PlayerPageState extends State<PlayerPage> {
 
   // ------------------------------------------------------------ 桌面端交互
 
+  /// 读取一次窗口的全屏状态，保证界面图标与真实状态一致。
+  Future<void> _syncFullScreenState() async {
+    try {
+      final value = await windowManager.isFullScreen();
+      if (!mounted || value == _isFullScreen) return;
+      setState(() => _isFullScreen = value);
+    } catch (_) {
+      // 取不到就按当前记录显示，不影响播放
+    }
+  }
+
+  @override
+  void onWindowEnterFullScreen() {
+    if (mounted) setState(() => _isFullScreen = true);
+  }
+
+  @override
+  void onWindowLeaveFullScreen() {
+    if (mounted) setState(() => _isFullScreen = false);
+  }
+
+  /// 切换全屏（仅桌面端；移动端本来就是沉浸式全屏，没有这个概念）。
+  ///
+  /// 全屏与双击画面、F11、控制条上的按钮三处入口共用，Esc 会优先退出全屏。
+  Future<void> _toggleFullScreen() async {
+    if (!isDesktopPlatform) return;
+    final next = !_isFullScreen;
+    try {
+      await windowManager.setFullScreen(next);
+    } catch (_) {
+      return; // 切换失败不影响播放
+    }
+    if (!mounted) return;
+    setState(() {
+      _isFullScreen = next;
+      // 全屏切换后保持控制条可见：用户多半接着还要操作
+      _controlsVisible = true;
+    });
+    _scheduleAutoHide();
+  }
+
+  /// 画面被点击（[position] 为全局坐标，用于识别双击）。
+  ///
+  /// 桌面端：单击 = 显隐控制条，双击 = 全屏切换。
+  /// 移动端：保持原来的单击显隐控制条。
+  void _handleSurfaceTap(Offset? position) {
+    if (!isDesktopPlatform) {
+      _toggleControls();
+      return;
+    }
+
+    final now = DateTime.now();
+    final lastAt = _lastSurfaceTapAt;
+    final lastPos = _lastSurfaceTapPos;
+    final isDoubleClick =
+        lastAt != null &&
+        now.difference(lastAt) < const Duration(milliseconds: 300) &&
+        (position == null ||
+            lastPos == null ||
+            (position - lastPos).distance < 32);
+
+    _lastSurfaceTapAt = isDoubleClick ? null : now;
+    _lastSurfaceTapPos = position;
+
+    if (isDoubleClick) {
+      _toggleFullScreen();
+      return;
+    }
+    _toggleControls();
+  }
+
   /// 鼠标在画面上活动：显示控件并重置自动隐藏计时。
   ///
   /// 带 250ms 节流——onHover 在鼠标移动时触发极其频繁，无节流会导致
   /// 移动鼠标时疯狂重建整棵组件树。
-  void _onPointerActivity() {
+  ///
+  /// 控制条处于隐藏状态时还有一道"移动距离"门槛（见 [_kPointerWakeDistance]）：
+  /// 以隐藏那一刻的光标位置为基准，移动不够远就不唤出，免得轻微抖动就弹出来。
+  void _onPointerActivity(PointerHoverEvent event) {
+    final pos = event.position;
+    // 每次都记：这样"隐藏瞬间的位置"始终是最新的
+    _lastPointerPos = pos;
+
+    if (!_controlsVisible) {
+      final anchor = _pointerAnchor;
+      if (anchor == null) {
+        // 还没有基准点（例如隐藏后第一次收到 hover）：先记下来，不唤出
+        _pointerAnchor = pos;
+        return;
+      }
+      if ((pos - anchor).distance < _kPointerWakeDistance) return;
+      _pointerAnchor = null;
+    }
+
     final now = DateTime.now();
     if (now.difference(_lastPointerActivity).inMilliseconds < 250) return;
     _lastPointerActivity = now;
@@ -899,6 +1026,14 @@ class _PlayerPageState extends State<PlayerPage> {
       setState(() => _controlsVisible = true);
     }
     _scheduleAutoHide();
+  }
+
+  /// 隐藏控制条（同时记下光标位置，作为"要移动多远才唤回"的基准）。
+  void _hideControls() {
+    _cancelAutoHide();
+    if (!_controlsVisible) return;
+    setState(() => _controlsVisible = false);
+    _pointerAnchor = _lastPointerPos;
   }
 
   /// 在画面右上角弹出一条瞬时提示（音量/静音/切轨反馈）。
@@ -1034,7 +1169,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 桌面端键盘快捷键（对齐桌面播放器通用习惯）。
   ///
-  /// 空格=播放/暂停，←/→=±10s，↑/↓=音量，M=静音，Esc=退出播放。
+  /// 空格=播放/暂停，←/→=±10s，↑/↓=音量，M=静音，F11=全屏，
+  /// Esc=退全屏（已全屏时）/ 退出播放。双击画面同样切换全屏。
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
     final isRepeat = event is KeyRepeatEvent;
     if (event is! KeyDownEvent && !isRepeat) {
@@ -1074,8 +1210,19 @@ class _PlayerPageState extends State<PlayerPage> {
       if (!isRepeat) _toggleMute();
       return KeyEventResult.handled;
     }
+    if (key == LogicalKeyboardKey.f11) {
+      if (!isRepeat) _toggleFullScreen();
+      return KeyEventResult.handled;
+    }
     if (key == LogicalKeyboardKey.escape) {
-      if (!isRepeat) _closePlayer();
+      if (!isRepeat) {
+        // 全屏时先退全屏，再按一次才退出播放页（与常见播放器一致）
+        if (_isFullScreen) {
+          _toggleFullScreen();
+        } else {
+          _closePlayer();
+        }
+      }
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
@@ -1155,6 +1302,8 @@ class _PlayerPageState extends State<PlayerPage> {
           duration: _duration,
           speed: _speed,
           showRestartHint: _showRestartButton,
+          showFullScreenToggle: isDesktopPlatform,
+          isFullScreen: _isFullScreen,
           desktopControls: isDesktopPlatform
               ? _buildDesktopTrackControls()
               : null,
@@ -1165,6 +1314,7 @@ class _PlayerPageState extends State<PlayerPage> {
           onSpeedTap: () => _showSpeedSheet(),
           onToggleOrientation: _toggleOrientation,
           onRestart: _restartFromBeginning,
+          onToggleFullScreen: _toggleFullScreen,
           onScrubStart: _onScrubStart,
           onScrubUpdate: _onScrubUpdate,
           onScrubEnd: _onScrubEnd,
@@ -1191,7 +1341,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
     final player = GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: _toggleControls,
+      // 用 onTapUp 而不是 onTap：需要拿到点击位置来识别"双击画面"（桌面端切全屏）
+      onTapUp: (details) => _handleSurfaceTap(details.globalPosition),
       child: isDesktopPlatform
           ? Focus(
               focusNode: _keyboardFocus,
@@ -1205,7 +1356,7 @@ class _PlayerPageState extends State<PlayerPage> {
                   cursor: _controlsVisible
                       ? SystemMouseCursors.basic
                       : SystemMouseCursors.none,
-                  onHover: (_) => _onPointerActivity(),
+                  onHover: _onPointerActivity,
                   child: content,
                 ),
               ),
@@ -1983,10 +2134,13 @@ class _PlayerBottomControls extends StatelessWidget {
     required this.onSpeedTap,
     required this.onToggleOrientation,
     required this.onRestart,
+    required this.onToggleFullScreen,
     required this.onScrubStart,
     required this.onScrubUpdate,
     required this.onScrubEnd,
     this.showRestartHint = false,
+    this.showFullScreenToggle = false,
+    this.isFullScreen = false,
     this.desktopControls,
     this.mobileTrackControls,
   });
@@ -2002,10 +2156,17 @@ class _PlayerBottomControls extends StatelessWidget {
   /// 是否显示进度条上方的"从头播放"小按钮（续播后短暂出现）。
   final bool showRestartHint;
 
+  /// 是否显示全屏按钮（仅桌面端；移动端本来就是沉浸式全屏）。
+  final bool showFullScreenToggle;
+
+  /// 当前是否处于全屏（决定按钮图标）。
+  final bool isFullScreen;
+
   final VoidCallback onPlayPause;
   final VoidCallback onSpeedTap;
   final VoidCallback onToggleOrientation;
   final VoidCallback onRestart;
+  final VoidCallback onToggleFullScreen;
   final ValueChanged<double> onScrubStart;
   final ValueChanged<double> onScrubUpdate;
   final ValueChanged<double> onScrubEnd;
@@ -2137,6 +2298,19 @@ class _PlayerBottomControls extends StatelessWidget {
                               isLandscape
                                   ? Icons.screen_lock_portrait_rounded
                                   : Icons.screen_rotation_rounded,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                        if (showFullScreenToggle) ...[
+                          const SizedBox(width: 4),
+                          IconButton(
+                            onPressed: onToggleFullScreen,
+                            tooltip: isFullScreen ? '退出全屏 (Esc)' : '全屏 (F11)',
+                            icon: Icon(
+                              isFullScreen
+                                  ? Icons.fullscreen_exit_rounded
+                                  : Icons.fullscreen_rounded,
                               color: Colors.white,
                             ),
                           ),
