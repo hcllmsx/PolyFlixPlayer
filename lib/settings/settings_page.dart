@@ -363,18 +363,15 @@ class _SettingsPageState extends State<SettingsPage> {
                       _buildModelItem(model, scheme),
                 _sectionActionRow([
                   _SectionAction(
-                    icon: Icons.list_alt_rounded,
                     label: '浏览全部模型',
                     onPressed: _browseModels,
                   ),
                   _SectionAction(
-                    icon: Icons.file_download_outlined,
                     label: '导入模型',
                     onPressed: _importModel,
                   ),
                   _SectionAction(
-                    icon: Icons.folder_open_rounded,
-                    label: '打开模型目录',
+                    label: '模型目录',
                     onPressed: _openModelDirectory,
                   ),
                 ]),
@@ -668,12 +665,10 @@ class _SettingsPageState extends State<SettingsPage> {
             _sectionActionRow([
               if (isDesktopPlatform)
                 _SectionAction(
-                  icon: Icons.unarchive_outlined,
                   label: '导入引擎',
                   onPressed: _importEngine,
                 ),
               _SectionAction(
-                icon: Icons.folder_open_rounded,
                 label: '引擎目录',
                 onPressed: () async {
                   await NativeFileHelper.openDirectory(
@@ -785,27 +780,36 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 卡片内小节的操作按钮行：单独一行、右对齐。
   ///
-  /// 用 Wrap 而不是 Row：设置页在双栏模式下只有 420px 宽，
-  /// 按钮多了（浏览/导入/目录）排不下时会自动换行，不会溢出报错。
+  /// 必须套一层 `SizedBox(width: double.infinity)`：Wrap 默认会收缩到内容宽度，
+  /// 在 `crossAxisAlignment.start` 的 Column 里表现为左对齐，`WrapAlignment.end`
+  /// 也就失效了；撑满整行后右对齐才会生效。仍用 Wrap 兜底 —— 窗口极窄时自动
+  /// 换行，比 Row 溢出报错好。
   Widget _sectionActionRow(List<_SectionAction> actions) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 12, 4),
-      child: Wrap(
-        alignment: WrapAlignment.end,
-        spacing: 4,
-        runSpacing: 2,
-        children: [
-          for (final action in actions)
-            TextButton.icon(
-              style: TextButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
+      child: SizedBox(
+        width: double.infinity,
+        child: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 2,
+          runSpacing: 2,
+          children: [
+            for (final action in actions)
+              TextButton(
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: action.onPressed,
+                child: Text(
+                  action.label,
+                  style: const TextStyle(fontSize: 14),
+                ),
               ),
-              onPressed: action.onPressed,
-              icon: Icon(action.icon, size: 16),
-              label: Text(action.label),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1066,12 +1070,10 @@ class _SettingsPageState extends State<SettingsPage> {
 /// 卡片内小节操作按钮的描述。
 class _SectionAction {
   const _SectionAction({
-    required this.icon,
     required this.label,
     required this.onPressed,
   });
 
-  final IconData icon;
   final String label;
   final Future<void> Function() onPressed;
 }

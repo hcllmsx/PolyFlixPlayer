@@ -185,30 +185,29 @@ class ModelManager {
   }
 
   /// 获取指定模型在本地的文件路径。如果不存在返回 null。
+  ///
+  /// 只认应用自己的模型目录（桌面端为 `%LOCALAPPDATA%\PolyFlixPlayer\models\whisper`）。
+  /// 这里**刻意不做**"找不到就去项目 _temp 目录捞一份"的开发回退：那段回退会让
+  /// "已下载"判定与删除操作都指向仓库里的临时副本 —— 删掉真正的模型后列表仍显示
+  /// "已下载"（因为 _temp 那份还在），要点两次才删得掉；发布版更会去访问用户设备上
+  /// 根本不存在的目录。开发调试请把模型放进应用模型目录（设置页「模型目录」可直接打开），
+  /// 或用「导入模型」导入。
   Future<String?> getModelPath(String modelId) async {
     final info = availableModels.where((m) => m.id == modelId).firstOrNull;
     if (info == null) return null;
-    final dirPath = await NativeFileHelper.getWhisperModelDirPath();
-    final file = File('$dirPath${Platform.pathSeparator}${info.fileName}');
+    final file = File(await _managedFilePath(info));
     if (await file.exists()) return file.path;
 
-    // 开发/本地测试回退：自动检查项目 _temp\models\whisper 目录
-    try {
-      final sep = Platform.pathSeparator;
-      final fileName = info.fileName;
-      final root = Directory.current.path;
-      final candidates = [
-        File('$root${sep}_temp${sep}models${sep}whisper$sep$fileName'),
-        File('$root${sep}_temp$sep$fileName'),
-      ];
-      for (final candidate in candidates) {
-        if (await candidate.exists()) {
-          return candidate.path;
-        }
-      }
-    } catch (_) {}
-
     return null;
+  }
+
+  /// 模型在应用模型目录中的目标路径（无论文件是否已存在）。
+  ///
+  /// [getModelPath]、[deleteModel] 都经由它解析路径，保证"显示的、下载的、
+  /// 删除的"始终是同一个文件，不会出现删一次还在的情况。
+  Future<String> _managedFilePath(WhisperModelInfo info) async {
+    final dirPath = await NativeFileHelper.getWhisperModelDirPath();
+    return '$dirPath${Platform.pathSeparator}${info.fileName}';
   }
 
   /// 检查指定模型是否已下载。
@@ -245,7 +244,7 @@ class ModelManager {
     final dir = Directory(dirPath);
     if (!await dir.exists()) await dir.create(recursive: true);
 
-    final filePath = '$dirPath${Platform.pathSeparator}${info.fileName}';
+    final filePath = await _managedFilePath(info);
     final file = File(filePath);
 
     // 已存在则跳过
@@ -414,7 +413,7 @@ class ModelManager {
       final dirPath = await NativeFileHelper.getWhisperModelDirPath();
       final dir = Directory(dirPath);
       if (!await dir.exists()) await dir.create(recursive: true);
-      final destPath = '$dirPath${Platform.pathSeparator}${target.fileName}';
+      final destPath = await _managedFilePath(target);
       final dest = File(destPath);
 
       // 用户直接选中模型目录里已有的那个文件时，绝不能"先删后复制"——会把源文件删掉
@@ -449,11 +448,18 @@ class ModelManager {
   }
 
   /// 删除指定模型。
+  ///
+  /// 只删应用模型目录里的文件（同时清掉可能残留的 `.downloading` 半成品）。
+  /// 路径解析与 [getModelPath] 完全一致，所以**删一次就真的没了**，
+  /// 界面上"已下载"标记也会同步消失。
   Future<void> deleteModel(String modelId) async {
-    final path = await getModelPath(modelId);
-    if (path == null) return;
-    final file = File(path);
-    if (await file.exists()) await file.delete();
+    final info = availableModels.where((m) => m.id == modelId).firstOrNull;
+    if (info == null) return;
+    final filePath = await _managedFilePath(info);
+    for (final path in [filePath, '$filePath.downloading']) {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    }
   }
 
   /// 删除所有已下载的模型。
