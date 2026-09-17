@@ -328,7 +328,10 @@ class _AiTaskTile extends StatelessWidget {
                 ),
                 icon: const Icon(Icons.play_arrow_rounded, size: 16),
                 label: const Text('播放'),
-                onPressed: () => onOpenVideo(task.videoPath, task.videoTitle),
+                // 用 cacheKey（源文件路径）而不是 videoPath 打开：PFLX 任务的
+                // videoPath 是当次会话的随机端口流地址，事后再点必然打不开。
+                // 普通视频两者相同，行为不变。
+                onPressed: () => onOpenVideo(task.cacheKey, task.videoTitle),
               ),
             ],
           ),

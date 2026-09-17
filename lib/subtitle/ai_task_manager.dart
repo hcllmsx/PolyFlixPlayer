@@ -22,11 +22,23 @@ class AiTask extends ChangeNotifier {
     required this.videoTitle,
     required this.modelId,
     required this.language,
+    String? cacheKey,
     DateTime? startTime,
-  }) : startTime = startTime ?? DateTime.now();
+  }) : cacheKey = cacheKey ?? videoPath,
+       startTime = startTime ?? DateTime.now();
 
   final String id;
+
+  /// 提取音频用的地址：本地文件路径，或 PFLX 本次会话的本地流地址。
   final String videoPath;
+
+  /// 字幕缓存的**身份键**，必须是稳定值（本地文件路径 / .pflx 文件路径）。
+  ///
+  /// 为什么不直接用 [videoPath]：PFLX 的播放地址是
+  /// `http://127.0.0.1:<随机端口>/pflx`，端口每次打开都不同，拿它当缓存键会
+  /// 导致"下次打开同一条视频找不到上次的缓存"，于是重复识别、缓存越攒越多。
+  final String cacheKey;
+
   final String videoTitle;
   final String modelId;
   final String language;
@@ -147,6 +159,7 @@ class AiTask extends ChangeNotifier {
   Map<String, dynamic> toJson({DateTime? lastSeen}) => {
     'id': id,
     'videoPath': videoPath,
+    'cacheKey': cacheKey,
     'videoTitle': videoTitle,
     'modelId': modelId,
     'language': language,
@@ -164,9 +177,12 @@ class AiTask extends ChangeNotifier {
   /// 从持久化数据恢复一条历史记录。数据损坏时返回 null（跳过这一条）。
   static AiTask? fromJson(Map<String, dynamic> json) {
     try {
+      final videoPath = json['videoPath'] as String;
       final task = AiTask(
         id: json['id'] as String,
-        videoPath: json['videoPath'] as String,
+        videoPath: videoPath,
+        // 旧记录没有 cacheKey：按 videoPath 兜底（老版本本来就用它当缓存键）
+        cacheKey: (json['cacheKey'] as String?) ?? videoPath,
         videoTitle: (json['videoTitle'] as String?) ?? '',
         modelId: (json['modelId'] as String?) ?? '',
         language: (json['language'] as String?) ?? 'auto',
@@ -323,6 +339,7 @@ class AiTaskManager extends ChangeNotifier {
     required String videoTitle,
     required String modelId,
     String language = 'auto',
+    String? cacheKey,
   }) async {
     final existing = getTask(videoPath);
     if (existing != null && existing.isRunning) return existing;
@@ -330,6 +347,7 @@ class AiTaskManager extends ChangeNotifier {
     final task = AiTask(
       id: '${DateTime.now().millisecondsSinceEpoch}_${_tasks.length}',
       videoPath: videoPath,
+      cacheKey: cacheKey,
       videoTitle: videoTitle,
       modelId: modelId,
       language: language,
@@ -405,8 +423,9 @@ class AiTaskManager extends ChangeNotifier {
           message: '识别完成 (共 ${task.entries.length} 条字幕)',
         );
         // 保存字幕缓存（按模型区分，仅写高效 JSON 缓存，不自动生成冗余 srt）
+        // 用 cacheKey 而不是 videoPath：PFLX 的播放地址带随机端口，不能当身份
         await saveCachedSubtitles(
-          task.videoPath,
+          task.cacheKey,
           task.entries,
           modelId: task.modelId,
         );

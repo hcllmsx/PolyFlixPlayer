@@ -729,7 +729,11 @@ class _PlayerPageState extends State<PlayerPage> {
       return;
     }
 
-    final restored = await _loadAiSubtitleCache(activeKey);
+    // 缓存按 _sourcePath 查（PFLX 也稳定），归属仍按本次会话的地址
+    final restored = await _loadAiSubtitleCache(
+      _sourcePath,
+      ownerKey: activeKey,
+    );
     if (restored == null || !mounted) return;
 
     if (_subtitleTracks.isNotEmpty) {
@@ -750,10 +754,11 @@ class _PlayerPageState extends State<PlayerPage> {
   ///
   /// 返回实际使用的模型与条数；该视频没有任何缓存时返回 null。
   Future<({String modelId, int count})?> _loadAiSubtitleCache(
-    String activeKey,
-  ) async {
+    String cacheKey, {
+    required String ownerKey,
+  }) async {
     final manager = AiTaskManager.instance;
-    final cachedIds = await manager.getCachedModelIds(activeKey);
+    final cachedIds = await manager.getCachedModelIds(cacheKey);
     if (cachedIds.isEmpty) return null;
 
     // 上次使用的模型优先；其余按"模型越大越靠前"排 —— 同一条视频有多份缓存时
@@ -767,11 +772,12 @@ class _PlayerPageState extends State<PlayerPage> {
       });
 
     for (final id in ordered) {
-      final cached = await manager.loadCachedSubtitles(activeKey, modelId: id);
+      final cached = await manager.loadCachedSubtitles(cacheKey, modelId: id);
       if (cached == null || cached.isEmpty) continue;
       SubtitleGenerator.instance.setEntries(
         cached,
-        videoPath: activeKey,
+        // 归属用本次会话的播放地址（面板/叠加层据此判断"是不是本视频"）
+        videoPath: ownerKey,
         markCompleted: true,
       );
       return (modelId: id, count: cached.length);
@@ -1570,8 +1576,11 @@ class _PlayerPageState extends State<PlayerPage> {
 
     await AiSubtitleSheet.show(
       context: context,
+      // 提取音频要用能读的地址（PFLX 走本地流）
       videoPath: _streamServer?.url ?? _sourcePath,
       videoTitle: _title,
+      // 但字幕缓存按源文件路径存：PFLX 的流地址端口每次都变
+      cacheKey: _sourcePath,
       isAiSubtitleActive: _aiSubtitleActive,
       onToggleSubtitleActive: (active) {
         setState(() => _aiSubtitleActive = active);

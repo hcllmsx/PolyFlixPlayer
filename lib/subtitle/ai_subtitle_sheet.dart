@@ -23,13 +23,20 @@ class AiSubtitleSheet extends StatefulWidget {
     super.key,
     required this.videoPath,
     this.videoTitle,
+    this.cacheKey,
     required this.isAiSubtitleActive,
     required this.onToggleSubtitleActive,
     this.onSeekTo,
   });
 
-  /// 当前视频源路径（本地文件或 PFLX 流式地址）。
+  /// 当前视频源路径（本地文件或 PFLX 流式地址），用于提取音频。
   final String videoPath;
+
+  /// 字幕缓存的稳定身份键（本地文件路径 / .pflx 文件路径）。
+  ///
+  /// PFLX 的 [videoPath] 是本次会话的随机端口流地址，不能当缓存键 ——
+  /// 否则下次打开同一条视频会找不到上次的缓存。为空时退回 [videoPath]。
+  final String? cacheKey;
 
   /// 视频标题（可选，用于任务展示）。
   final String? videoTitle;
@@ -48,6 +55,7 @@ class AiSubtitleSheet extends StatefulWidget {
     required BuildContext context,
     required String videoPath,
     String? videoTitle,
+    String? cacheKey,
     required bool isAiSubtitleActive,
     required ValueChanged<bool> onToggleSubtitleActive,
     ValueChanged<Duration>? onSeekTo,
@@ -59,6 +67,7 @@ class AiSubtitleSheet extends StatefulWidget {
       builder: (context) => AiSubtitleSheet(
         videoPath: videoPath,
         videoTitle: videoTitle,
+        cacheKey: cacheKey,
         isAiSubtitleActive: isAiSubtitleActive,
         onToggleSubtitleActive: onToggleSubtitleActive,
         onSeekTo: onSeekTo,
@@ -73,6 +82,12 @@ class AiSubtitleSheet extends StatefulWidget {
 class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   final SubtitleGenerator _generator = SubtitleGenerator.instance;
   StreamSubscription<AsrProgress>? _progressSub;
+
+  /// 字幕缓存读写统一走这个键。
+  ///
+  /// PFLX 时它是 .pflx 文件路径（稳定），而 [AiSubtitleSheet.videoPath] 是
+  /// 带随机端口的本次会话流地址 —— 拿后者当缓存键就再也找不到上次的缓存。
+  String get _cacheKey => widget.cacheKey ?? widget.videoPath;
 
   String _selectedModel = aiAsrModelId.value;
   String _selectedLanguage = 'auto';
@@ -131,7 +146,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     } else if (_generator.entries.isEmpty) {
       // 尝试自动读取当前视频的本地字幕缓存（按模型精准匹配）
       AiTaskManager.instance
-          .loadCachedSubtitles(widget.videoPath, modelId: _selectedModel)
+          .loadCachedSubtitles(_cacheKey, modelId: _selectedModel)
           .then((cached) {
             if (mounted && cached != null && cached.isNotEmpty) {
               _generator.setEntries(cached, videoPath: widget.videoPath);
@@ -217,7 +232,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     // 顺便确认当前视频有哪些模型留下了字幕缓存（界面标记用）
     final cachedList = await AiTaskManager.instance.getCachedModelIds(
-      widget.videoPath,
+      _cacheKey,
     );
     if (!mounted) return;
 
@@ -256,7 +271,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     // 同步状态与字幕：切换到的模型已有缓存则载入，否则清空并回到就绪状态
     final cached = await AiTaskManager.instance.loadCachedSubtitles(
-      widget.videoPath,
+      _cacheKey,
       modelId: id,
     );
     if (mounted && cached != null && cached.isNotEmpty) {
@@ -320,6 +335,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       videoTitle: title,
       modelId: _selectedModel,
       language: _selectedLanguage,
+      // 缓存按下这个稳定键落盘（PFLX 时视频地址带随机端口，不能当身份）
+      cacheKey: _cacheKey,
     );
   }
 
@@ -369,7 +386,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     // 1. 删除磁盘物理缓存文件
     await AiTaskManager.instance.deleteCachedSubtitles(
-      widget.videoPath,
+      _cacheKey,
       modelId: _selectedModel,
     );
 
