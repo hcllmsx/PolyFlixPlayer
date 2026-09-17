@@ -160,10 +160,11 @@ class SubtitleGenerator {
     _updateState(AsrState.preparing, message: '正在准备…');
 
     try {
-      // 1. 检查模型是否已下载
+      // 1. 检查模型是否已导入
       final modelPath = await ModelManager.instance.getModelPath(modelId);
       if (modelPath == null) {
-        _updateState(AsrState.error, message: '模型未下载，请先在设置中下载模型');
+        _updateState(
+            AsrState.error, message: '模型未导入，请在设置页「浏览全部模型」里对照文件名导入');
         return [];
       }
 

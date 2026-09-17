@@ -7,9 +7,10 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../main.dart';
 import '../subtitle/device_capability.dart';
+import '../subtitle/engine_catalog_sheet.dart';
 import '../subtitle/engine_pack.dart';
+import '../subtitle/model_catalog_sheet.dart';
 import '../subtitle/model_manager.dart';
-import '../subtitle/model_picker_sheet.dart';
 import '../subtitle/whisper_server.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
@@ -42,7 +43,6 @@ class _SettingsPageState extends State<SettingsPage> {
 
   // AI 字幕模型状态
   Set<String> _downloadedModels = {};
-  final Map<String, double> _downloadProgress = {};
 
   /// 本机 GPU 能力。
   GpuCapability? _gpu;
@@ -88,46 +88,12 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
-  Future<void> _downloadModel(WhisperModelInfo model) async {
-    if (_downloadProgress.containsKey(model.id)) return;
-    setState(() => _downloadProgress[model.id] = 0.0);
-
-    try {
-      await ModelManager.instance.downloadModel(
-        model.id,
-        onProgress: (received, total) {
-          if (mounted && total > 0) {
-            setState(() {
-              _downloadProgress[model.id] = received / total;
-            });
-          }
-        },
-      );
-      await _refreshModels();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('模型 ${model.displayName} 下载完成')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('下载失败: $e')),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _downloadProgress.remove(model.id));
-      }
-    }
-  }
-
   Future<void> _deleteModel(WhisperModelInfo model) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('删除模型'),
-        content: Text('确定要删除 ${model.displayName} 吗？\n删除后如需使用需重新下载。'),
+        content: Text('确定要删除 ${model.displayName} 吗？\n删除后如需使用需重新导入。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -343,13 +309,14 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
                 const SizedBox(height: 4),
-                // 只列出已下载的模型：模型清单有二十多个，全列出来长得没法看，
-                // 浏览 / 下载 / 切换统一走「浏览全部模型」面板。
+                // 只列出已导入的模型：模型清单有四十多个，全列出来长得没法看，
+                // 对照表 / 选用 / 删除统一走「浏览全部模型」面板。
                 if (_downloadedModels.isEmpty)
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
                     child: Text(
-                      '尚未下载任何模型。点击下方「浏览全部模型」下载，或把已有的 ggml-*.bin 导入进来。',
+                      '尚未导入任何模型。点「浏览全部模型」看对照表 → 按文件名去网盘下载 → '
+                      '回到这里点「导入模型」。只需导入你要用的那一个。',
                       style: TextStyle(
                         fontSize: 12,
                         height: 1.5,
@@ -375,39 +342,6 @@ class _SettingsPageState extends State<SettingsPage> {
                     onPressed: _openModelDirectory,
                   ),
                 ]),
-                ListenableBuilder(
-                  listenable: modelDownloadSource,
-                  builder: (context, _) => ListTile(
-                    dense: true,
-                    leading: Icon(Icons.cloud_download_outlined,
-                        size: 20, color: scheme.primary),
-                    title: const Text('模型下载源', style: TextStyle(fontSize: 13)),
-                    subtitle: Text(
-                      switch (modelDownloadSource.value) {
-                        'mirror' => '仅国内镜像 hf-mirror',
-                        'official' => '仅 HuggingFace 官方源',
-                        _ => '默认：先国内镜像，失败回退官方源',
-                      },
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                    ),
-                    trailing: DropdownButton<String>(
-                      value: modelDownloadSource.value,
-                      focusColor: Colors.transparent,
-                      underline: const SizedBox.shrink(),
-                      items: const [
-                        DropdownMenuItem(value: 'auto', child: Text('自动', style: TextStyle(fontSize: 13))),
-                        DropdownMenuItem(value: 'mirror', child: Text('仅镜像', style: TextStyle(fontSize: 13))),
-                        DropdownMenuItem(value: 'official', child: Text('仅官方', style: TextStyle(fontSize: 13))),
-                      ],
-                      onChanged: (v) {
-                        if (v != null) setModelDownloadSource(v);
-                      },
-                    ),
-                  ),
-                ),
                 const Divider(height: 1),
                 _buildAsrPerformanceRow(scheme),
                 const SizedBox(height: 8),
@@ -663,6 +597,13 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ),
             _sectionActionRow([
+              _SectionAction(
+                label: '浏览全部引擎',
+                onPressed: () async {
+                  await EngineCatalogSheet.show(context);
+                  await _refreshEnginePacks();
+                },
+              ),
               if (isDesktopPlatform)
                 _SectionAction(
                   label: '导入引擎',
@@ -814,9 +755,9 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 浏览 / 下载 / 切换全部模型。
+  /// 查看模型对照表 / 切换已导入的模型。
   Future<void> _browseModels() async {
-    final result = await ModelPickerSheet.show(context);
+    final result = await ModelCatalogSheet.show(context);
     await _refreshModels();
     if (result == null || !mounted) return;
     // 在设置页选中的模型同样记忆下来，AI 面板下次打开就用它
@@ -998,7 +939,8 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _engineHintText() {
     if (_checkingEngine) return null;
     if (_enginePacks.isEmpty) {
-      return '把 whisper.cpp 官方预编译包解压到引擎目录即可启用 GPU 加速。';
+      return '点「浏览全部引擎」看对照表：按文件名去网盘下载官方 zip，'
+          '再用「导入引擎」导入即可启用 GPU 加速。';
     }
     if (_enginePacks.length > 1) {
       return '同类型有多个引擎包时，默认使用最近导入的那个；不需要的包可直接在引擎目录里删除。';
@@ -1011,58 +953,31 @@ class _SettingsPageState extends State<SettingsPage> {
     await NativeFileHelper.openDirectory(Directory(path));
   }
 
+  /// 已导入模型列表项：显示原名与体积，右侧只能删除（下载入口已全部移除）。
   Widget _buildModelItem(WhisperModelInfo model, ColorScheme scheme) {
-    final isDownloaded = _downloadedModels.contains(model.id);
-    final progress = _downloadProgress[model.id];
-    final isDownloading = progress != null;
-
     return ListTile(
-      leading: Icon(
-        isDownloaded ? Icons.check_circle_outline_rounded : Icons.download_for_offline_outlined,
-        color: isDownloaded ? Colors.green : scheme.onSurfaceVariant,
+      leading: const Icon(
+        Icons.check_circle_outline_rounded,
+        color: Colors.green,
       ),
       title: Text(
-        model.displayName,
-        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+        model.fileName,
+        style: const TextStyle(
+          fontSize: 13,
+          fontFamily: 'Consolas',
+          fontFamilyFallback: ['Menlo', 'monospace'],
+          fontWeight: FontWeight.w500,
+        ),
       ),
-      subtitle: isDownloading
-          ? Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  LinearProgressIndicator(value: progress > 0 ? progress : null),
-                  const SizedBox(height: 2),
-                  Text(
-                    '下载中 ${(progress * 100).toStringAsFixed(1)}%',
-                    style: TextStyle(fontSize: 11, color: scheme.primary),
-                  ),
-                ],
-              ),
-            )
-          : Text(
-              isDownloaded ? '已下载并就绪' : '约 ${_formatBytes(model.sizeBytes)}',
-              style: TextStyle(
-                fontSize: 12,
-                color: isDownloaded ? Colors.green : scheme.onSurfaceVariant,
-              ),
-            ),
-      trailing: isDownloading
-          ? const SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          : isDownloaded
-              ? IconButton(
-                  icon: const Icon(Icons.delete_outline_rounded, size: 20),
-                  tooltip: '删除模型',
-                  onPressed: () => _deleteModel(model),
-                )
-              : FilledButton.tonal(
-                  onPressed: () => _downloadModel(model),
-                  child: const Text('下载'),
-                ),
+      subtitle: Text(
+        '${model.displayName} · ${_formatBytes(model.sizeBytes)}',
+        style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+      ),
+      trailing: IconButton(
+        icon: const Icon(Icons.delete_outline_rounded, size: 20),
+        tooltip: '删除模型',
+        onPressed: () => _deleteModel(model),
+      ),
     );
   }
 }

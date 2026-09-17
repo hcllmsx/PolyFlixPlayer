@@ -1,32 +1,32 @@
-/// Whisper 模型管理：下载、校验、查询、删除。
+/// Whisper 模型管理：清单、已导入查询、导入与删除。
 ///
-/// 模型文件存放在独立的 models/ 目录下（与 cache/ 分离），清理缓存
-/// 时不会被误删。用户可通过设置页的"管理模型"入口手动管理。
+/// 重要：应用**不内置任何下载链接**（官方源与镜像都不内置）。模型由用户自行获取
+/// （设置页「浏览全部模型」里有对照表与网盘入口）后，用「导入模型」导入到本地目录。
 ///
-/// 下载 URL 支持多源回退：默认走国内镜像 hf-mirror，失败自动回退
-/// HuggingFace 官方源，两者都不可用时用户可用"导入模型"离线加载。
-/// 若将来改为自建存储桶分发，只需把自定义源加到 [ModelManager] 的源列表里。
+/// 模型文件存放在独立的 models/ 目录下（与 cache/ 分离），清理缓存时不会被误删。
+/// 用户可通过设置页的「模型目录」按钮直接查看该目录。
 library;
 
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
-import 'package:http/http.dart' as http;
-
-import '../settings/app_settings.dart';
 import '../utils/native_file_helper.dart';
 
 /// 模型信息。
+///
+/// 应用**不内置任何下载链接**（官方源与镜像都不内置）。这里既是界面上
+/// "模型对照表"的数据源，也用于「导入模型」时按文件名 / 体积识别用户导入的是哪个模型。
 class WhisperModelInfo {
   const WhisperModelInfo({
     required this.id,
     required this.displayName,
     required this.fileName,
-    required this.downloadUrl,
     required this.sizeBytes,
-    this.sha256,
+    required this.tier,
+    required this.summary,
+    this.cpuHint,
     this.isEnglishOnly = false,
     this.isQuantized = false,
+    this.legacy = false,
   });
 
   final String id;
@@ -34,16 +34,30 @@ class WhisperModelInfo {
   /// 界面上展示的名称（如 "Small · 英语专用 · q5"）。
   final String displayName;
 
+  /// 官方原始文件名（如 `ggml-small-q5_1.bin`）。
+  ///
+  /// 表格里按它显示——用户去网盘找文件、或自己核对导入结果时，认的是这个名字。
   final String fileName;
-  final String downloadUrl;
+
   final int sizeBytes;
-  final String? sha256;
+
+  /// 档位文案：极速 / 平衡 / 精确 / 高精度 / 旗舰。
+  final String tier;
+
+  /// 一句话说明：这个模型适合什么场景、有什么取舍。
+  final String summary;
+
+  /// 纯 CPU 识别 1 小时视频的大致耗时（参考值）。
+  final String? cpuHint;
 
   /// 英文专用模型（`.en`）：只能识别英语，英语准确率略高、速度略快。
   final bool isEnglishOnly;
 
   /// 量化版（q5/q8）：体积更小、速度更快，精度略降。
   final bool isQuantized;
+
+  /// 旧版本（large-v1）：仅作兼容，不推荐新用户使用。
+  final bool legacy;
 
   /// 体积展示文案，如 "466 MB" / "1.5 GB"。
   String get sizeLabel {
@@ -53,17 +67,19 @@ class WhisperModelInfo {
     }
     return '${(sizeBytes / mb).round()} MB';
   }
-
-  /// 国内镜像地址（hf-mirror）。
-  ///
-  /// 国内网络直连 huggingface.co 会被拒（而且 Dart 的 HttpClient 不读系统代理），
-  /// 实测 hf-mirror 可直连，因此作为**默认下载源**，官方源只在其失败时兜底。
-  String get mirrorUrl =>
-      'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/$fileName';
 }
 
-/// 生成一条模型定义（文件名与下载地址都按 id 推导，避免手写出错）。
-WhisperModelInfo _model(String id, int sizeMiB) {
+/// 生成一条模型定义（文件名按 id 推导，避免手写出错）。
+///
+/// [sizeMiB] 取官方文件的真实体积（MiB），仅用于展示与导入时的体积比对。
+WhisperModelInfo _model(
+  String id,
+  double sizeMiB,
+  String tier,
+  String summary, {
+  String? cpuHint,
+  bool legacy = false,
+}) {
   final englishOnly = id.contains('.en');
   final quant = RegExp(r'-(q\d_\d)$').firstMatch(id)?.group(1);
   final family = id
@@ -75,8 +91,10 @@ WhisperModelInfo _model(String id, int sizeMiB) {
     'base': 'Base 平衡',
     'small': 'Small 精确',
     'medium': 'Medium 高精度',
-    'large-v3-turbo': 'Large v3 Turbo',
+    'large-v1': 'Large v1',
+    'large-v2': 'Large v2',
     'large-v3': 'Large v3',
+    'large-v3-turbo': 'Large v3 Turbo',
   };
 
   final parts = <String>[
@@ -89,15 +107,17 @@ WhisperModelInfo _model(String id, int sizeMiB) {
     id: id,
     displayName: parts.join(' · '),
     fileName: 'ggml-$id.bin',
-    downloadUrl:
-        'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$id.bin',
-    sizeBytes: sizeMiB * 1024 * 1024,
+    sizeBytes: (sizeMiB * 1024 * 1024).round(),
+    tier: tier,
+    summary: summary,
+    cpuHint: cpuHint,
     isEnglishOnly: englishOnly,
     isQuantized: quant != null,
+    legacy: legacy,
   );
 }
 
-/// 可用的 Whisper 模型清单（都是 ggml 格式，与识别引擎包通用）。
+/// 全部可用模型清单（对应官方 ggerganov/whisper.cpp 仓库里的 ggml-*.bin 文件）。
 ///
 /// 说明：
 ///  - **多语言**：支持 99 种语言自动侦测，日常首选；
@@ -105,39 +125,60 @@ WhisperModelInfo _model(String id, int sizeMiB) {
 ///  - **量化（q5 / q8）**：体积小、速度快，精度略降，适合 CPU 或磁盘紧张的用户；
 ///  - **Large v3 Turbo**：精度接近 large，速度快得多，配合 GPU 引擎包性价比最高。
 ///
-/// 体积来自 HuggingFace 上的实际文件大小；下载后按体积做完整性校验。
+/// 体积取自官方文件真实大小（MiB）；导入时按体积做容差比对。
+/// CPU 耗时是纯 CPU 识别 1 小时视频的大致参考（12 线程实测，实际取决于机器）。
 final List<WhisperModelInfo> availableModels = [
-  // ---- 多语言 ----
-  _model('tiny', 75),
-  _model('tiny-q5_1', 31),
-  _model('tiny-q8_0', 42),
-  _model('base', 142),
-  _model('base-q5_1', 57),
-  _model('base-q8_0', 78),
-  _model('small', 466),
-  _model('small-q5_1', 181),
-  _model('small-q8_0', 252),
-  _model('medium', 1463),
-  _model('medium-q5_0', 514),
-  _model('medium-q8_0', 785),
-  _model('large-v3-turbo', 1549),
-  _model('large-v3-turbo-q5_0', 547),
-  _model('large-v3-turbo-q8_0', 834),
-  _model('large-v3', 2952),
-  _model('large-v3-q5_0', 1126),
+  // ---------------- 多语言 ----------------
+  _model('tiny', 74.1, '极速', '最快的一档，精度最低；低配机器、或只想快速看个大概时用',
+      cpuHint: '约 1 分钟'),
+  _model('tiny-q5_1', 30.7, '极速', 'tiny 的量化版：体积不到一半、速度略快，精度再降一点',
+      cpuHint: '约 1 分钟'),
+  _model('tiny-q8_0', 41.5, '极速', 'tiny 的轻量化版，比 q5 稍准、稍大', cpuHint: '约 1 分钟'),
+  _model('base', 141.1, '平衡', '入门档：比 tiny 明显准确，速度依然很快', cpuHint: '约 2 分钟'),
+  _model('base-q5_1', 56.9, '平衡', 'base 的量化版，体积小、速度快', cpuHint: '约 1.5 分钟'),
+  _model('base-q8_0', 78.0, '平衡', 'base 的轻量化版，精度损失比 q5 小', cpuHint: '约 1.5 分钟'),
+  _model('small', 465.0, '精确', '日常首选：精度与速度的平衡点，中文识别够用',
+      cpuHint: '约 4~5 分钟'),
+  _model('small-q5_1', 181.3, '精确', 'small 的量化版：体积不到四成，省空间的首选',
+      cpuHint: '约 3~4 分钟'),
+  _model('small-q8_0', 252.2, '精确', 'small 的轻量化版，精度损失比 q5 小', cpuHint: '约 3~4 分钟'),
+  _model('medium', 1462.7, '高精度', '精度明显提升，口音与专业词汇更稳；CPU 上耗时明显变长',
+      cpuHint: '约 13 分钟'),
+  _model('medium-q5_0', 514.2, '高精度', 'medium 的量化版，体积接近 small', cpuHint: '约 9 分钟'),
+  _model('medium-q8_0', 785.2, '高精度', 'medium 的轻量化版', cpuHint: '约 11 分钟'),
+  _model('large-v3-turbo', 1549.3, '旗舰·快速', '精度接近 large-v3 但快数倍；有 GPU 时的首选',
+      cpuHint: '约 6~8 分钟'),
+  _model('large-v3-turbo-q5_0', 547.4, '旗舰·快速',
+      '综合推荐：体积小、速度快，大模型里性价比最高', cpuHint: '约 5 分钟'),
+  _model('large-v3-turbo-q8_0', 833.7, '旗舰·快速', 'turbo 的轻量化版，精度损失更小',
+      cpuHint: '约 6 分钟'),
+  _model('large-v3', 2951.7, '旗舰', '官方最强多语言精度；纯 CPU 上很慢，建议配合 CUDA 引擎包',
+      cpuHint: '约 30 分钟'),
+  _model('large-v3-q5_0', 1031.1, '旗舰', 'large-v3 的量化版，体积约三分之一',
+      cpuHint: '约 20 分钟'),
+  _model('large-v2', 2951.3, '旗舰', '上一代 large，精度与 v3 接近，某些素材上更稳',
+      cpuHint: '约 30 分钟'),
+  _model('large-v2-q5_0', 1030.7, '旗舰', 'large-v2 的量化版', cpuHint: '约 20 分钟'),
+  _model('large-v2-q8_0', 1579.4, '旗舰', 'large-v2 的轻量化版', cpuHint: '约 24 分钟'),
+  _model('large-v1', 2951.3, '旗舰·旧版', '初代 large，已过时；仅作兼容，不推荐新用户使用',
+      cpuHint: '约 30 分钟', legacy: true),
 
-  // ---- 英语专用 ----
-  _model('tiny.en', 75),
-  _model('tiny.en-q5_1', 31),
-  _model('base.en', 142),
-  _model('base.en-q5_1', 57),
-  _model('base.en-q8_0', 78),
-  _model('small.en', 465),
-  _model('small.en-q5_1', 181),
-  _model('small.en-q8_0', 252),
-  _model('medium.en', 1463),
-  _model('medium.en-q5_0', 514),
-  _model('medium.en-q8_0', 785),
+  // ---------------- 英语专用（.en：只识别英语，同档位更快更准） ----------------
+  _model('tiny.en', 74.1, '极速', '仅英语：同档位下更快更准；别拿去识别其它语言',
+      cpuHint: '约 1 分钟'),
+  _model('tiny.en-q5_1', 30.7, '极速', '仅英语，tiny.en 的量化版', cpuHint: '约 1 分钟'),
+  _model('tiny.en-q8_0', 41.5, '极速', '仅英语，tiny.en 的轻量化版', cpuHint: '约 1 分钟'),
+  _model('base.en', 141.1, '平衡', '仅英语：比 tiny.en 明显准确', cpuHint: '约 2 分钟'),
+  _model('base.en-q5_1', 57.0, '平衡', '仅英语，base.en 的量化版', cpuHint: '约 1.5 分钟'),
+  _model('base.en-q8_0', 78.0, '平衡', '仅英语，base.en 的轻量化版', cpuHint: '约 1.5 分钟'),
+  _model('small.en', 465.0, '精确', '仅英语：英语场景下精度与速度兼顾的首选',
+      cpuHint: '约 4~5 分钟'),
+  _model('small.en-q5_1', 181.3, '精确', '仅英语，small.en 的量化版', cpuHint: '约 3~4 分钟'),
+  _model('small.en-q8_0', 252.2, '精确', '仅英语，small.en 的轻量化版', cpuHint: '约 3~4 分钟'),
+  _model('medium.en', 1462.7, '高精度', '仅英语：英语精度很高，CPU 上耗时不短',
+      cpuHint: '约 13 分钟'),
+  _model('medium.en-q5_0', 514.2, '高精度', '仅英语，medium.en 的量化版', cpuHint: '约 9 分钟'),
+  _model('medium.en-q8_0', 785.2, '高精度', '仅英语，medium.en 的轻量化版', cpuHint: '约 11 分钟'),
 ];
 
 /// 多语言模型（按体积升序）。
@@ -147,11 +188,6 @@ List<WhisperModelInfo> get multilingualModels =>
 /// 英语专用模型（按体积升序）。
 List<WhisperModelInfo> get englishOnlyModels =>
     availableModels.where((m) => m.isEnglishOnly).toList();
-
-/// 模型下载进度回调。
-///
-/// [received] 已下载字节数，[total] 总字节数（-1 表示未知）。
-typedef ModelDownloadProgress = void Function(int received, int total);
 
 /// 本地导入模型的结果。
 class ModelImportResult {
@@ -164,7 +200,7 @@ class ModelImportResult {
   final bool success;
   final String message;
 
-  /// 成功时写入的模型 ID（tiny / base / small）。
+  /// 成功时写入的模型 ID（如 tiny / base / small）。
   final String? modelId;
 }
 
@@ -172,9 +208,6 @@ class ModelImportResult {
 class ModelManager {
   ModelManager._();
   static final ModelManager instance = ModelManager._();
-
-  /// 最近一次下载实际使用的源（供界面提示，如"国内镜像 hf-mirror"）。
-  static String? lastDownloadSourceLabel;
 
   /// 按 ID 取模型定义；未知 ID 返回 null。
   WhisperModelInfo? infoOf(String modelId) {
@@ -188,34 +221,32 @@ class ModelManager {
   ///
   /// 只认应用自己的模型目录（桌面端为 `%LOCALAPPDATA%\PolyFlixPlayer\models\whisper`）。
   /// 这里**刻意不做**"找不到就去项目 _temp 目录捞一份"的开发回退：那段回退会让
-  /// "已下载"判定与删除操作都指向仓库里的临时副本 —— 删掉真正的模型后列表仍显示
-  /// "已下载"（因为 _temp 那份还在），要点两次才删得掉；发布版更会去访问用户设备上
+  /// "已导入"判定与删除操作都指向仓库里的临时副本 —— 删掉真正的模型后列表仍显示
+  /// "已导入"（因为 _temp 那份还在），要点两次才删得掉；发布版更会去访问用户设备上
   /// 根本不存在的目录。开发调试请把模型放进应用模型目录（设置页「模型目录」可直接打开），
   /// 或用「导入模型」导入。
   Future<String?> getModelPath(String modelId) async {
     final info = availableModels.where((m) => m.id == modelId).firstOrNull;
     if (info == null) return null;
     final file = File(await _managedFilePath(info));
-    if (await file.exists()) return file.path;
-
-    return null;
+    return await file.exists() ? file.path : null;
   }
 
   /// 模型在应用模型目录中的目标路径（无论文件是否已存在）。
   ///
-  /// [getModelPath]、[deleteModel] 都经由它解析路径，保证"显示的、下载的、
+  /// [getModelPath]、[deleteModel] 都经由它解析路径，保证"显示的、导入的、
   /// 删除的"始终是同一个文件，不会出现删一次还在的情况。
   Future<String> _managedFilePath(WhisperModelInfo info) async {
     final dirPath = await NativeFileHelper.getWhisperModelDirPath();
     return '$dirPath${Platform.pathSeparator}${info.fileName}';
   }
 
-  /// 检查指定模型是否已下载。
+  /// 检查指定模型是否已导入到本地。
   Future<bool> isModelDownloaded(String modelId) async {
     return await getModelPath(modelId) != null;
   }
 
-  /// 获取所有已下载模型的 ID 列表。
+  /// 获取所有已导入模型的 ID 列表。
   Future<List<String>> getDownloadedModels() async {
     final downloaded = <String>[];
     for (final model in availableModels) {
@@ -226,121 +257,9 @@ class ModelManager {
     return downloaded;
   }
 
-  /// 下载模型文件。
-  ///
-  /// [modelId] 模型 ID（如 'tiny'、'base'、'small'）。
-  /// [onProgress] 下载进度回调。
-  /// 返回下载后的本地文件路径。
-  ///
-  /// 如果模型已存在，直接返回路径不重复下载。
-  Future<String> downloadModel(
-    String modelId, {
-    ModelDownloadProgress? onProgress,
-  }) async {
-    final info = availableModels.where((m) => m.id == modelId).firstOrNull;
-    if (info == null) throw ArgumentError('未知模型 ID: $modelId');
-
-    final dirPath = await NativeFileHelper.getWhisperModelDirPath();
-    final dir = Directory(dirPath);
-    if (!await dir.exists()) await dir.create(recursive: true);
-
-    final filePath = await _managedFilePath(info);
-    final file = File(filePath);
-
-    // 已存在则跳过
-    if (await file.exists()) {
-      final size = await file.length();
-      // 检查文件大小是否合理（防止下载中断产生的残文件）
-      if (size > info.sizeBytes * 0.9) return filePath;
-      // 大小异常，删除重新下载
-      await file.delete();
-    }
-
-    // 下载到临时文件，完成后再重命名，避免中断产生的残文件
-    final tmpFile = File('$filePath.downloading');
-
-    // 下载源顺序：面向国内用户，默认**镜像优先**，失败再回退官方 HF。
-    // 镜像本身不可用时也不会白等——连接超时会直接跳到下一个源。
-    final preferMirror = modelDownloadSource.value != 'official';
-    final preferOfficial = modelDownloadSource.value != 'mirror';
-    final sources = <({String label, String url})>[
-      if (preferMirror) (label: '国内镜像 hf-mirror', url: info.mirrorUrl),
-      if (preferOfficial) (
-        label: 'HuggingFace 官方源',
-        url: info.downloadUrl
-      ),
-    ];
-
-    Object? lastError;
-    for (final source in sources) {
-      try {
-        await _downloadFrom(source.url, tmpFile, info, onProgress);
-        await tmpFile.rename(filePath);
-        lastDownloadSourceLabel = source.label;
-        return filePath;
-      } catch (e) {
-        lastError = e;
-        try {
-          if (await tmpFile.exists()) await tmpFile.delete();
-        } catch (_) {}
-      }
-    }
-    throw Exception('所有下载源均失败（${sources.map((s) => s.label).join("、")}）：$lastError');
-  }
-
-  /// 从指定地址下载到临时文件并做完整性校验。
-  Future<void> _downloadFrom(
-    String url,
-    File tmpFile,
-    WhisperModelInfo info,
-    ModelDownloadProgress? onProgress,
-  ) async {
-    final client = http.Client();
-    try {
-      final request = http.Request('GET', Uri.parse(url));
-      // 连接阶段设超时：官方源在国内常被拒，卡住会白等很久
-      final response = await client
-          .send(request)
-          .timeout(const Duration(seconds: 20));
-
-      if (response.statusCode != 200) {
-        throw HttpException('HTTP ${response.statusCode}', uri: Uri.parse(url));
-      }
-
-      final contentLength = response.contentLength ?? info.sizeBytes;
-      final sink = tmpFile.openWrite();
-      var received = 0;
-      try {
-        await for (final chunk in response.stream) {
-          sink.add(chunk);
-          received += chunk.length;
-          onProgress?.call(received, contentLength);
-        }
-      } finally {
-        await sink.close();
-      }
-
-      // 体积校验：拦截被墙返回的 HTML 错误页 / 中断产生的残文件
-      final downloadedSize = await tmpFile.length();
-      if (downloadedSize < info.sizeBytes * 0.9) {
-        throw Exception('文件体积异常（$downloadedSize 字节），可能下载不完整');
-      }
-
-      if (info.sha256 != null) {
-        final bytes = await tmpFile.readAsBytes();
-        final hash = sha256.convert(bytes).toString();
-        if (hash != info.sha256) {
-          throw Exception('文件校验失败：哈希不匹配');
-        }
-      }
-    } finally {
-      client.close();
-    }
-  }
-
   /// 从本地文件导入一个已下载好的 ggml 模型。
   ///
-  /// 用于"网络不好，自己离线下载模型再导入"的场景：校验文件确实是 ggml
+  /// 用于"自己去网盘下载模型再导入"的场景：校验文件确实是 ggml
   /// 模型（magic 头 4 字节为 `ggml`），再按文件名或体积判断属于哪个模型，
   /// 最后流式复制到模型目录，复制过程通过 [onProgress] 回报字节数。
   Future<ModelImportResult> importModelFile(
@@ -375,23 +294,34 @@ class ModelManager {
         );
       }
 
-      // 2) 判断属于哪个模型：先看文件名，再看体积
+      // 2) 判断属于哪个模型：文件名优先，体积兜底
       final fileName = sourcePath.split(Platform.pathSeparator).last;
       final lowerName = fileName.toLowerCase();
       final size = await source.length();
 
       WhisperModelInfo? target;
+      // 2a) 完整文件名精确匹配（最可靠）：必须先走这一步，
+      //     否则 `ggml-small.en.bin` 会被 `small` 抢先匹配成非英语模型。
       for (final model in availableModels) {
-        if (lowerName.contains(model.id)) {
+        if (lowerName == model.fileName.toLowerCase()) {
           target = model;
           break;
         }
       }
+      // 2b) 文件名被改过时按"最长 ID 包含"匹配，同样避免 short 抢走 long（small vs small.en）
+      if (target == null) {
+        for (final model in availableModels) {
+          if (lowerName.contains(model.id) &&
+              (target == null || model.id.length > target.id.length)) {
+            target = model;
+          }
+        }
+      }
+      // 2c) 名字完全对不上时按体积近似匹配
       if (target == null) {
         var bestDelta = double.infinity;
         for (final model in availableModels) {
-          final delta =
-              (size - model.sizeBytes).abs() / model.sizeBytes;
+          final delta = (size - model.sizeBytes).abs() / model.sizeBytes;
           if (delta < 0.15 && delta < bestDelta) {
             bestDelta = delta;
             target = model;
@@ -399,13 +329,12 @@ class ModelManager {
         }
       }
       if (target == null) {
-        final expected = availableModels
-            .map((m) => '${m.id} 约 ${(m.sizeBytes ~/ (1024 * 1024))}MB')
-            .join('、');
         return ModelImportResult(
           success: false,
-          message: '无法识别模型类型（文件体积 ${(size / (1024 * 1024)).toStringAsFixed(0)}MB）。'
-              '请使用官方 ggml-*.bin 文件，或将文件名带上模型名。预期：$expected',
+          message: '无法识别模型类型（文件名 $fileName，体积 '
+              '${(size / (1024 * 1024)).toStringAsFixed(0)}MB）。\n'
+              '请使用官方 ggml-*.bin 文件（文件名不要改），'
+              '完整清单见「浏览全部模型」表格。',
         );
       }
 
@@ -439,7 +368,7 @@ class ModelManager {
 
       return ModelImportResult(
         success: true,
-        message: '已导入 ${target.displayName} 模型',
+        message: '已导入 ${target.displayName}（${target.fileName}）',
         modelId: target.id,
       );
     } catch (e) {
@@ -449,9 +378,9 @@ class ModelManager {
 
   /// 删除指定模型。
   ///
-  /// 只删应用模型目录里的文件（同时清掉可能残留的 `.downloading` 半成品）。
+  /// 只删应用模型目录里的文件（同时清掉历史遗留的 `.downloading` 半成品）。
   /// 路径解析与 [getModelPath] 完全一致，所以**删一次就真的没了**，
-  /// 界面上"已下载"标记也会同步消失。
+  /// 界面上"已导入"标记也会同步消失。
   Future<void> deleteModel(String modelId) async {
     final info = availableModels.where((m) => m.id == modelId).firstOrNull;
     if (info == null) return;
@@ -462,7 +391,7 @@ class ModelManager {
     }
   }
 
-  /// 删除所有已下载的模型。
+  /// 删除所有已导入的模型。
   Future<int> deleteAllModels() async {
     return NativeFileHelper.clearModels();
   }

@@ -8,10 +8,11 @@ import 'package:flutter/material.dart';
 
 import 'ai_task_manager.dart';
 import '../settings/app_settings.dart';
+import '../utils/app_toast.dart';
 import 'device_capability.dart';
 import 'engine_pack.dart';
+import 'model_catalog_sheet.dart';
 import 'model_manager.dart';
-import 'model_picker_sheet.dart';
 import 'subtitle_generator.dart';
 
 /// AI 语音识别字幕控制面板。
@@ -192,12 +193,12 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Future<void> _checkModels() async {
-    // 只探测"当前选中的模型"是否已下载（模型有二十多个，不逐个扫描）
+    // 只探测"当前选中的模型"是否已导入（模型有四十多个，不逐个扫描）
     var activeId = _selectedModel;
     var activeReady = await ModelManager.instance.isModelDownloaded(activeId);
     if (!activeReady) {
-      // 选中的模型没下载：回落到任一个已下载的模型；
-      // 一个都没下载就保持原选择，由界面提示去下载。
+      // 选中的模型没导入：回落到任一个已导入的模型；
+      // 一个都没导入就保持原选择，由界面提示去导入。
       for (final m in availableModels) {
         if (await ModelManager.instance.isModelDownloaded(m.id)) {
           activeId = m.id;
@@ -268,17 +269,20 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     // 低端/老旧设备不做兼容降级，直接明确拒绝
     final caps = _deviceCaps;
     if (caps != null && !caps.meetsMinimumRequirements) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('当前设备不支持 AI 语音识别：${caps.unsupportedReason ?? '硬件不满足最低要求'}'),
-        ),
+      AppToast.show(
+        context,
+        '当前设备不支持 AI 语音识别：${caps.unsupportedReason ?? '硬件不满足最低要求'}',
+        isError: true,
       );
       return;
     }
 
     if (!(_modelAvailability[_selectedModel] ?? false)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('所选模型 $_selectedModel 尚未就绪，请先在设置页中下载或放置模型')),
+      AppToast.show(
+        context,
+        '所选模型 $_selectedModel 尚未导入：请在设置页「浏览全部模型」里按文件名对照，'
+            '从网盘下载后用「导入模型」导入',
+        isError: true,
       );
       return;
     }
@@ -360,12 +364,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         _statusMessage = null;
         _previewExpanded = false;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('已成功删除 $modelName 模型字幕缓存，可重新识别'),
-          duration: const Duration(seconds: 2),
-        ),
-      );
+      AppToast.show(context, '已成功删除 $modelName 模型字幕缓存，可重新识别');
     }
   }
 
@@ -410,22 +409,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       }
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('已成功导出 SRT 字幕至：$displayPath'),
-            backgroundColor: Colors.green.shade800,
-            duration: const Duration(seconds: 4),
-          ),
-        );
+        AppToast.show(context, '已成功导出 SRT 字幕至：$displayPath');
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('导出失败: $e'),
-            backgroundColor: Colors.redAccent.shade700,
-          ),
-        );
+        AppToast.show(context, '导出失败: $e', isError: true);
       }
     }
   }
@@ -797,7 +785,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     required bool hasCache,
   }) {
     if (isRunning) return '识别进行中，暂不能切换模型';
-    if (!isAvailable) return '模型文件未下载，点击右侧去选择或下载';
+    if (!isAvailable) return '模型文件未导入，点击右侧查看对照表并导入';
 
     final buffer = StringBuffer(info?.sizeLabel ?? '');
     if (hasCache) buffer.write(' · 已生成该模型字幕缓存');
@@ -824,13 +812,13 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   /// 打开模型选择面板；选中的模型会立即生效（有缓存则载入该模型缓存）。
   Future<void> _openModelPicker() async {
-    final result = await ModelPickerSheet.show(
+    final result = await ModelCatalogSheet.show(
       context,
       selectedId: _selectedModel,
     );
     if (result == null || !mounted) return;
 
-    // 模型文件状态可能变了（刚下载 / 刚删除），重新检测
+    // 模型文件状态可能变了（刚导入 / 刚删除），重新检测
     await _checkModels();
     if (!mounted) return;
     await _onSelectModel(result.modelId);

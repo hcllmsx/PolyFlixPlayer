@@ -194,11 +194,20 @@ class _PlayerPageState extends State<PlayerPage> {
         }
       });
     });
+    // AI 字幕总开关：设置页关掉后播放页要立刻同步，因此监听它触发重建。
+    // （设置页与播放页是两条独立路由，不会自动互相刷新。）
+    aiSubtitleEnabled.addListener(_onAiSubtitleSettingChanged);
     _initPlayer();
+  }
+
+  /// AI 字幕总开关变化：重建界面，让 AI 入口与叠层同步显隐。
+  void _onAiSubtitleSettingChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
     _asrProgressSub?.cancel();
     _cancelAutoHide();
     _osdTimer?.cancel();
@@ -807,7 +816,8 @@ class _PlayerPageState extends State<PlayerPage> {
           child: Video(controller: _controller, controls: NoVideoControls),
         ),
         // AI 字幕叠加层（独立于内置字幕，可同时显示）
-        if (_aiSubtitleActive)
+        // 总开关关闭时一律不显示，避免"设置里已关掉、画面上还在"
+        if (aiSubtitleEnabled.value && _aiSubtitleActive)
           SubtitleOverlay(
             generator: SubtitleGenerator.instance,
             position: currentPosition,
@@ -939,26 +949,27 @@ class _PlayerPageState extends State<PlayerPage> {
           tooltip: '字幕',
           icon: const Icon(Icons.subtitles_outlined, color: Colors.white),
         ),
-        // AI 字幕按钮（常驻可见，点击弹出控制面板）
-        IconButton(
-          onPressed: _showAiSubtitleSheet,
-          tooltip: 'AI 语音识别字幕',
-          icon: _aiSubtitleRunning
-              ? SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: Theme.of(context).colorScheme.primary,
+        // AI 字幕按钮（总开关打开时常驻可见，点击弹出控制面板）
+        if (aiSubtitleEnabled.value)
+          IconButton(
+            onPressed: _showAiSubtitleSheet,
+            tooltip: 'AI 语音识别字幕',
+            icon: _aiSubtitleRunning
+                ? SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                  )
+                : Icon(
+                    Icons.auto_awesome_rounded,
+                    color: _aiSubtitleActive
+                        ? Theme.of(context).colorScheme.primary
+                        : Colors.white,
                   ),
-                )
-              : Icon(
-                  Icons.auto_awesome_rounded,
-                  color: _aiSubtitleActive
-                      ? Theme.of(context).colorScheme.primary
-                      : Colors.white,
-                ),
-        ),
+          ),
       ],
     );
   }
@@ -1009,18 +1020,21 @@ class _PlayerPageState extends State<PlayerPage> {
               // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
               selected: t.id == _activeSubtitleId,
             ),
-          _TrackOption(
-            id: '__ai_subtitle__',
-            label: _aiSubtitleRunning
-                ? 'AI 语音识别字幕 (识别中…)'
-                : (_aiIsPrimary
-                    ? 'AI 语音识别字幕（主字幕）'
-                    : 'AI 语音识别字幕（副字幕）'),
-            selected: _aiSubtitleActive,
-          ),
+          // AI 字幕总开关关闭时，整项从字幕列表里隐藏
+          if (aiSubtitleEnabled.value)
+            _TrackOption(
+              id: '__ai_subtitle__',
+              label: _aiSubtitleRunning
+                  ? 'AI 语音识别字幕 (识别中…)'
+                  : (_aiIsPrimary
+                      ? 'AI 语音识别字幕（主字幕）'
+                      : 'AI 语音识别字幕（副字幕）'),
+              selected: _aiSubtitleActive,
+            ),
         ],
-        footerNote:
-            _subtitleTracks.isEmpty ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）' : null,
+        footerNote: _subtitleTracks.isEmpty
+            ? (aiSubtitleEnabled.value ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）' : '该视频没有内嵌字幕')
+            : null,
       ),
     );
     if (selected != null) {
@@ -1113,38 +1127,42 @@ class _PlayerPageState extends State<PlayerPage> {
                 ),
             ],
             // AI 语音识别字幕：副字幕槽位（没有内置字幕在显示时升为主字幕）
-            const PopupMenuDivider(),
-            _trackMenuItem(
-              value: '__ai_subtitle__',
-              label: _aiSubtitleRunning
-                  ? 'AI 语音识别字幕 (识别中…)'
-                  : (_aiIsPrimary
-                      ? 'AI 语音识别字幕（主字幕）'
-                      : 'AI 语音识别字幕（副字幕）'),
-              selected: _aiSubtitleActive,
-            ),
+            // 总开关关闭时整项隐藏，菜单里不再出现任何 AI 相关入口
+            if (aiSubtitleEnabled.value) ...[
+              const PopupMenuDivider(),
+              _trackMenuItem(
+                value: '__ai_subtitle__',
+                label: _aiSubtitleRunning
+                    ? 'AI 语音识别字幕 (识别中…)'
+                    : (_aiIsPrimary
+                        ? 'AI 语音识别字幕（主字幕）'
+                        : 'AI 语音识别字幕（副字幕）'),
+                selected: _aiSubtitleActive,
+              ),
+            ],
           ],
         ),
-        // 桌面端独立的 AI 语音字幕快捷按钮（点击弹出控制面板）
-        IconButton(
-          onPressed: _showAiSubtitleSheet,
-          tooltip: 'AI 语音识别字幕',
-          icon: _aiSubtitleRunning
-              ? SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: Theme.of(context).colorScheme.primary,
+        // 桌面端独立的 AI 语音字幕快捷按钮（总开关打开时才显示）
+        if (aiSubtitleEnabled.value)
+          IconButton(
+            onPressed: _showAiSubtitleSheet,
+            tooltip: 'AI 语音识别字幕',
+            icon: _aiSubtitleRunning
+                ? SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                  )
+                : Icon(
+                    Icons.auto_awesome_rounded,
+                    color: _aiSubtitleActive
+                        ? Theme.of(context).colorScheme.primary
+                        : Colors.white,
                   ),
-                )
-              : Icon(
-                  Icons.auto_awesome_rounded,
-                  color: _aiSubtitleActive
-                      ? Theme.of(context).colorScheme.primary
-                      : Colors.white,
-                ),
-        ),
+          ),
       ],
     );
   }
