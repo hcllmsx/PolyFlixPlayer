@@ -208,9 +208,6 @@ class _PlayerPageState extends State<PlayerPage> {
         systemNavigationBarIconBrightness: Brightness.dark,
       ));
     }
-    // 释放 AI 字幕资源
-    SubtitleGenerator.instance.cancel();
-    SubtitleGenerator.instance.releaseModel();
     // 不在这里同步销毁 player 和 streamServer：_closePlayer 已先暂停播放
     // 并停止了 streamServer。底层资源（mpv 纹理）延迟释放，确保 Flutter
     // 渲染管线完成当前帧的合成、不再引用该纹理后才真正回收。
@@ -460,6 +457,21 @@ class _PlayerPageState extends State<PlayerPage> {
     return null;
   }
 
+  /// 当前是否存在"翻译字幕"。
+  ///
+  /// 预留位：翻译功能上线后改为真实状态即可，主/副槽位的取舍逻辑无需改动。
+  bool get _hasTranslation => false;
+
+  /// 主字幕来源优先级：翻译字幕 > 内置字幕 > AI 识别字幕。
+  ///
+  /// AI 字幕只有在"没有翻译字幕、也没有内置字幕在显示"时才升为主字幕；
+  /// 否则一律作为副字幕，与内置字幕同时显示（内置在下、AI 在上）。
+  bool get _aiIsPrimary =>
+      _aiSubtitleActive && _activeSubtitleId == null && !_hasTranslation;
+
+  /// AI 字幕叠层的底部间距：作副字幕时抬到内置字幕上方，避免两行字叠在一起。
+  double get _aiOverlayBottom => _aiIsPrimary ? 80 : 132;
+
   /// 拼出便于识别的轨道描述：标题 · [语言] · 编码。
   String _trackLabel({
     required String id,
@@ -495,6 +507,11 @@ class _PlayerPageState extends State<PlayerPage> {
     _showOsd('音轨：${_audioLabel(track)}');
   }
 
+  /// 选择字幕。
+  ///
+  /// 内置字幕轨与 AI 字幕分属"主/副"两个槽位，互不顶掉：
+  /// 选内置轨只换主字幕，AI 副字幕保持原状；开关 AI 也不会关掉内置字幕。
+  /// 只有"关闭字幕"会把两个槽位一起清空。
   Future<void> _selectSubtitle(String id) async {
     if (id == _kSubtitlesOff) {
       await _player.setSubtitleTrack(SubtitleTrack.no());
@@ -506,9 +523,14 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     if (id == '__ai_subtitle__') {
       if (SubtitleGenerator.instance.entries.isNotEmpty) {
-        await _player.setSubtitleTrack(SubtitleTrack.no());
-        setState(() => _aiSubtitleActive = true);
-        _showOsd('字幕：AI 语音识别字幕');
+        // 已有识别结果时按开关处理：再点一次即关闭这条副/主字幕
+        setState(() => _aiSubtitleActive = !_aiSubtitleActive);
+        final role = _hasTranslation
+            ? '副字幕'
+            : (_activeSubtitleId == null ? '主字幕' : '副字幕');
+        _showOsd(_aiSubtitleActive
+            ? '$role：AI 语音识别字幕'
+            : '已关闭$role：AI 语音识别字幕');
       } else {
         await _showAiSubtitleSheet();
       }
@@ -516,11 +538,11 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     final track = _subtitleTracks.where((t) => t.id == id).firstOrNull;
     if (track == null) return;
-    if (_aiSubtitleActive) {
-      setState(() => _aiSubtitleActive = false);
-    }
+    // 不动 _aiSubtitleActive：内置字幕与 AI 字幕可以同时显示
     await _player.setSubtitleTrack(track);
-    _showOsd('字幕：${_subtitleLabel(track)}');
+    _showOsd(_aiSubtitleActive
+        ? '主字幕：${_subtitleLabel(track)}（AI 副字幕同时显示）'
+        : '主字幕：${_subtitleLabel(track)}');
   }
 
   /// 打开视频后主动选中一条字幕，让它真正显示出来。
@@ -540,7 +562,7 @@ class _PlayerPageState extends State<PlayerPage> {
       orElse: () => tracks.first,
     );
     await _player.setSubtitleTrack(target);
-    if (mounted) _showOsd('字幕：${_subtitleLabel(target)}');
+    if (mounted) _showOsd('主字幕：${_subtitleLabel(target)}');
   }
 
   /// 退出播放页。
@@ -777,6 +799,9 @@ class _PlayerPageState extends State<PlayerPage> {
             generator: SubtitleGenerator.instance,
             position: currentPosition,
             visible: true,
+            // 主字幕在下（贴近画面底部），副字幕抬到内置字幕上方，避免叠字
+            isPrimary: _aiIsPrimary,
+            bottomOffset: _aiOverlayBottom,
           ),
         _PlayerScrim(showControls: _controlsVisible),
         _PlayerTopBar(
@@ -957,7 +982,7 @@ class _PlayerPageState extends State<PlayerPage> {
       showDragHandle: true,
       builder: (context) => _TrackSelectionSheet(
         title: '字幕',
-        subtitle: '选择要显示的字幕轨道，或开启离线 AI 语音识别字幕。',
+        subtitle: '内置字幕与 AI 识别字幕可同时显示（内置在下，AI 在上）。',
         options: [
           _TrackOption(
             id: _kSubtitlesOff,
@@ -968,13 +993,16 @@ class _PlayerPageState extends State<PlayerPage> {
             _TrackOption(
               id: t.id,
               label: _subtitleLabel(t),
-              selected: t.id == _activeSubtitleId && !_aiSubtitleActive,
+              // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
+              selected: t.id == _activeSubtitleId,
             ),
           _TrackOption(
             id: '__ai_subtitle__',
             label: _aiSubtitleRunning
                 ? 'AI 语音识别字幕 (识别中…)'
-                : 'AI 语音识别字幕',
+                : (_aiIsPrimary
+                    ? 'AI 语音识别字幕（主字幕）'
+                    : 'AI 语音识别字幕（副字幕）'),
             selected: _aiSubtitleActive,
           ),
         ],
@@ -1067,16 +1095,19 @@ class _PlayerPageState extends State<PlayerPage> {
                 _trackMenuItem(
                   value: t.id,
                   label: _subtitleLabel(t),
-                  selected: t.id == _activeSubtitleId && !_aiSubtitleActive,
+                  // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
+                  selected: t.id == _activeSubtitleId,
                 ),
             ],
-            // AI 语音识别字幕（作为与内置字幕平级的标准字幕轨）
+            // AI 语音识别字幕：副字幕槽位（没有内置字幕在显示时升为主字幕）
             const PopupMenuDivider(),
             _trackMenuItem(
               value: '__ai_subtitle__',
               label: _aiSubtitleRunning
                   ? 'AI 语音识别字幕 (识别中…)'
-                  : 'AI 语音识别字幕',
+                  : (_aiIsPrimary
+                      ? 'AI 语音识别字幕（主字幕）'
+                      : 'AI 语音识别字幕（副字幕）'),
               selected: _aiSubtitleActive,
             ),
           ],
@@ -1193,6 +1224,7 @@ class _PlayerPageState extends State<PlayerPage> {
     await AiSubtitleSheet.show(
       context: context,
       videoPath: _streamServer?.url ?? _sourcePath,
+      videoTitle: _title,
       isAiSubtitleActive: _aiSubtitleActive,
       onToggleSubtitleActive: (active) {
         setState(() => _aiSubtitleActive = active);

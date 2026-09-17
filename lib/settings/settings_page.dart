@@ -10,7 +10,17 @@ import 'app_settings.dart';
 import 'update_service.dart';
 
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key});
+  const SettingsPage({
+    super.key,
+    this.embedded = false,
+    this.onClose,
+  });
+
+  /// 是否作为右侧面板内嵌展示。
+  final bool embedded;
+
+  /// 内嵌模式下的关闭/返回回调。
+  final VoidCallback? onClose;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -179,20 +189,16 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('设置'),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        children: [
-          const _SectionTitle(title: '外观与主题'),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+    final body = ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      children: [
+        const _SectionTitle(title: '外观与主题'),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
                   const Text(
                     '应用外观',
                     style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
@@ -278,9 +284,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         color: scheme.primary,
                       ),
                       title: const Text('启用 AI 字幕功能'),
-                      subtitle: const Text(
-                        '在播放视频时自动识别音频并生成字幕。独立于内置字幕，无字幕或需外挂均可开启。',
-                      ),
+                      subtitle: const Text('自动识别音频并生成字幕。'),
                       value: aiSubtitleEnabled.value,
                       onChanged: (value) => setAiSubtitleEnabled(value),
                     );
@@ -288,7 +292,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
                 const Divider(height: 1),
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
                   child: Row(
                     children: [
                       Text(
@@ -310,20 +314,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     ],
                   ),
                 ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 4,
-                  ),
-                  child: Text(
-                    '模型保存在专用目录，清理应用临时缓存不会误删模型。支持自动识别项目 _temp/models/whisper/ 中的模型。',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 4),
                 for (final model in availableModels)
                   _buildModelItem(model, scheme),
                 const SizedBox(height: 8),
@@ -334,28 +325,78 @@ class _SettingsPageState extends State<SettingsPage> {
           const _SectionTitle(title: '存储与空间'),
           Card(
             clipBehavior: Clip.antiAlias,
-            child: ListTile(
-              leading: Icon(
-                Icons.cleaning_services_rounded,
-                color: scheme.primary,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.cleaning_services_rounded,
+                        color: scheme.primary,
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('清理应用缓存'),
+                            const SizedBox(height: 4),
+                            Text(
+                              _loadingCache
+                                  ? '正在计算缓存大小…'
+                                  : '当前临时缓存占用: ${_formatBytes(_cacheBytes)}',
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: scheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              '不包含离线语音模型',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: scheme.onSurfaceVariant.withValues(alpha: .7),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (isDesktopPlatform) ...[
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.folder_open_rounded, size: 16),
+                          label: const Text('打开目录'),
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                          ),
+                          onPressed: () => NativeFileHelper.openDirectory(
+                            NativeFileHelper.desktopCacheDir(),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      _clearingCache
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2.2),
+                            )
+                          : FilledButton.tonal(
+                              onPressed: _cacheBytes > 0 ? _clearCache : null,
+                              child: const Text('清理'),
+                            ),
+                    ],
+                  ),
+                ],
               ),
-              title: const Text('清理应用缓存'),
-              subtitle: Text(
-                _loadingCache
-                    ? '正在计算缓存大小…'
-                    : '当前临时缓存占用: ${_formatBytes(_cacheBytes)}（不包含离线语音模型）',
-              ),
-              trailing: _clearingCache
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2.2),
-                    )
-                  : FilledButton.tonal(
-                      onPressed: _cacheBytes > 0 ? _clearCache : null,
-                      child: const Text('清理'),
-                    ),
-              onTap: _cacheBytes > 0 && !_clearingCache ? _clearCache : null,
             ),
           ),
           const SizedBox(height: 18),
@@ -407,7 +448,52 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
         ],
+      );
+
+    if (widget.embedded) {
+      return Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(8, 10, 12, 10),
+            decoration: BoxDecoration(
+              border: Border(
+                bottom: BorderSide(
+                  color: scheme.outlineVariant.withValues(alpha: .5),
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.arrow_back_rounded),
+                  tooltip: '返回播放列表',
+                  onPressed: widget.onClose,
+                ),
+                const SizedBox(width: 4),
+                const Text(
+                  '应用设置',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+                const Spacer(),
+                if (widget.onClose != null)
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded, size: 20),
+                    tooltip: '关闭',
+                    onPressed: widget.onClose,
+                  ),
+              ],
+            ),
+          ),
+          Expanded(child: body),
+        ],
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('设置'),
       ),
+      body: body,
     );
   }
 

@@ -24,6 +24,8 @@ class SubtitleOverlay extends StatefulWidget {
     required this.generator,
     required this.position,
     this.visible = true,
+    this.isPrimary = true,
+    this.bottomOffset = 80,
   });
 
   /// 字幕生成器实例。
@@ -34,6 +36,15 @@ class SubtitleOverlay extends StatefulWidget {
 
   /// 是否显示。
   final bool visible;
+
+  /// 是否作为"主字幕"呈现。
+  ///
+  /// 只有当视频没有内置字幕（也没有翻译字幕）在显示时，AI 字幕才会升为主字幕，
+  /// 此时字号更大、位置更贴近画面底部；否则作为副字幕抬头显示、字号略小。
+  final bool isPrimary;
+
+  /// 叠层距底部的间距，由外部按主/副身份给出，避免与 mpv 渲染的内置字幕重叠。
+  final double bottomOffset;
 
   @override
   State<SubtitleOverlay> createState() => _SubtitleOverlayState();
@@ -117,13 +128,13 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
     return Positioned(
       left: 16,
       right: 16,
-      bottom: 80, // 留出控制条空间
+      bottom: widget.bottomOffset, // 留出控制条空间
       child: IgnorePointer(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             // 原始文本
-            _buildSubtitleText(text, isPrimary: true),
+            _buildSubtitleText(text, isPrimary: widget.isPrimary),
             // 翻译文本（第二阶段启用）
             if (entry.translatedText != null && entry.translatedText!.isNotEmpty)
               Padding(
@@ -150,8 +161,9 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
         text,
         textAlign: TextAlign.center,
         style: TextStyle(
-          color: isPrimary ? Colors.white : Colors.white70,
-          fontSize: isPrimary ? 16 : 14,
+          color: isPrimary ? Colors.white : Colors.white.withValues(alpha: .88),
+          // 副字幕略小一档，与主字幕在视觉上分层
+          fontSize: isPrimary ? 16 : 14.5,
           fontWeight: isPrimary ? FontWeight.w500 : FontWeight.w400,
           height: 1.4,
           shadows: const [

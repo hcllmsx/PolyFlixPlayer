@@ -16,6 +16,7 @@ import '../pflx/pflx.dart';
 import '../player/player_page.dart';
 import '../settings/settings_page.dart';
 import '../settings/update_service.dart';
+import '../subtitle/ai_task_manager.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 
@@ -49,6 +50,9 @@ class _HomePageState extends State<HomePage> {
   /// 是否接收拖放事件。进入播放页前必须关掉：DropTarget 被其他页面覆盖后
   /// 仍会继续收到拖放事件，会和播放页自己的拖放目标互相抢占。
   bool _dropEnabled = true;
+
+  /// 宽屏双栏模式下，右侧面板是否展示内嵌设置页。
+  bool _showSettingsInPanel = false;
 
   @override
   void initState() {
@@ -363,8 +367,7 @@ class _HomePageState extends State<HomePage> {
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 child: Text(
                   item.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                  // 文件名通常很长，这里完整展示，一行放不下就自动换行
                   style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),
@@ -430,22 +433,49 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final bodyContent = LayoutBuilder(
+      builder: (context, constraints) {
+        final isWide = constraints.maxWidth >= 840;
+        if (isWide) {
+          return _buildWideLayout(context);
+        }
+        return _buildNarrowLayout(context);
+      },
+    );
+
     final scaffold = Scaffold(
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _scanning ? null : () => _pickFiles(),
-        icon: _scanning
-            ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2.4),
-              )
-            : const Icon(Icons.add_rounded),
-        label: Text(
-          _scanning ? '正在识别' : (isDesktopPlatform ? '添加到列表' : '添加文件'),
-        ),
+      body: _AmbientBackground(child: bodyContent),
+    );
+
+    if (!isDesktopPlatform) return scaffold;
+
+    // 桌面端支持把视频文件直接拖进窗口播放。
+    return DropTarget(
+      enable: _dropEnabled,
+      onDragEntered: (_) => setState(() => _dropActive = true),
+      onDragExited: (_) => setState(() => _dropActive = false),
+      onDragDone: (details) {
+        setState(() => _dropActive = false);
+        final paths = details.files
+            .map((f) => f.path)
+            .where((p) => p.isNotEmpty)
+            .toList();
+        if (paths.isNotEmpty) _openDroppedFile(paths.first);
+      },
+      child: Stack(
+        children: [
+          scaffold,
+          if (_dropActive) const _DropHintOverlay(),
+        ],
       ),
-      body: _AmbientBackground(
-        child: CustomScrollView(
+    );
+  }
+
+  /// 窄屏（手机竖屏或小窗口）单栏布局。
+  Widget _buildNarrowLayout(BuildContext context) {
+    return Stack(
+      children: [
+        CustomScrollView(
           physics: const BouncingScrollPhysics(),
           slivers: [
             SliverAppBar(
@@ -453,6 +483,7 @@ class _HomePageState extends State<HomePage> {
               titleSpacing: 24,
               title: const _BrandLockup(compact: true),
               actions: [
+                _AiTaskIndicatorButton(onOpenVideo: _playPath),
                 const ThemeToggleButton(),
                 IconButton(
                   tooltip: '设置',
@@ -502,30 +533,253 @@ class _HomePageState extends State<HomePage> {
             ),
           ],
         ),
+        Positioned(
+          right: 20,
+          bottom: 24,
+          child: FloatingActionButton.extended(
+            onPressed: _scanning ? null : () => _pickFiles(),
+            icon: _scanning
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2.4),
+                  )
+                : const Icon(Icons.add_rounded),
+            label: Text(
+              _scanning ? '正在识别' : (isDesktopPlatform ? '添加到列表' : '添加文件'),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 宽屏（Windows 桌面端与平板横屏）双栏布局。
+  Widget _buildWideLayout(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+
+    return Row(
+      children: [
+        // 左侧主要展示与快捷投放区
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(32, 20, 24, 16),
+                child: Row(
+                  children: [
+                    const _BrandLockup(compact: false),
+                    const Spacer(),
+                    _AiTaskIndicatorButton(onOpenVideo: _playPath),
+                    const SizedBox(width: 8),
+                    const ThemeToggleButton(),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(32, 10, 32, 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      _buildWideHeroDropCard(context, scheme),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        // 垂直分割线
+        VerticalDivider(
+          width: 1,
+          thickness: 1,
+          color: scheme.outlineVariant.withValues(alpha: .35),
+        ),
+
+        // 右侧面板（宽度固定 420，收缩呈现播放列表或内嵌设置）
+        SizedBox(
+          width: 420,
+          child: Material(
+            color: Colors.transparent,
+            child: _showSettingsInPanel
+                ? SettingsPage(
+                    embedded: true,
+                    onClose: () => setState(() => _showSettingsInPanel = false),
+                  )
+                : _buildWideRightPlaylist(context, scheme),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildWideHeroDropCard(BuildContext context, ColorScheme scheme) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 560),
+        child: InkWell(
+          onTap: () => _pickFiles(),
+          borderRadius: BorderRadius.circular(20),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 44, horizontal: 32),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: .32),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: scheme.primary.withValues(alpha: .14),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    Icons.video_library_rounded,
+                    size: 46,
+                    color: scheme.primary,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  '拖拽视频到此处播放',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: scheme.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '或点击此处选择本地视频',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 20),
+                FilledButton.tonalIcon(
+                  onPressed: () => _pickFiles(),
+                  icon: const Icon(Icons.file_open_rounded, size: 18),
+                  label: const Text('选择视频文件'),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
+  }
 
-    if (!isDesktopPlatform) return scaffold;
 
-    // 桌面端支持把视频文件直接拖进窗口播放。
-    return DropTarget(
-      enable: _dropEnabled,
-      onDragEntered: (_) => setState(() => _dropActive = true),
-      onDragExited: (_) => setState(() => _dropActive = false),
-      onDragDone: (details) {
-        setState(() => _dropActive = false);
-        final paths = details.files
-            .map((f) => f.path)
-            .where((p) => p.isNotEmpty)
-            .toList();
-        if (paths.isNotEmpty) _openDroppedFile(paths.first);
-      },
-      child: Stack(
-        children: [
-          scaffold,
-          if (_dropActive) const _DropHintOverlay(),
-        ],
-      ),
+
+  Widget _buildWideRightPlaylist(BuildContext context, ColorScheme scheme) {
+    return Column(
+      children: [
+        // 顶部面板 Header
+        Container(
+          padding: const EdgeInsets.fromLTRB(20, 16, 12, 12),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                color: scheme.outlineVariant.withValues(alpha: .35),
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              const Text(
+                '播放列表',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: scheme.primary.withValues(alpha: .15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '${_items.length}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.primary,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.add_rounded),
+                tooltip: '添加视频',
+                onPressed: _scanning ? null : () => _pickFiles(),
+              ),
+              IconButton(
+                icon: const Icon(Icons.settings_outlined),
+                tooltip: '设置',
+                onPressed: () => setState(() => _showSettingsInPanel = true),
+              ),
+            ],
+          ),
+        ),
+        if (_scanning) const LinearProgressIndicator(),
+        // 列表区域
+        Expanded(
+          child: _items.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.movie_filter_outlined,
+                          size: 48,
+                          color: scheme.onSurfaceVariant.withValues(alpha: .5),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          '播放列表暂无内容',
+                          style: TextStyle(
+                            color: scheme.onSurfaceVariant,
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        OutlinedButton.icon(
+                          onPressed: () => _pickFiles(),
+                          icon: const Icon(Icons.add_rounded, size: 18),
+                          label: const Text('添加视频'),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                  itemCount: _items.length,
+                  itemBuilder: (context, index) {
+                    final item = _items[index];
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _VideoLibraryCard(
+                        item: item,
+                        onOpen: () => _open(item),
+                        onExport: () => _export(item),
+                        onDelete: () => _removeItem(item),
+                        onLongPress: () => _showItemOptions(item),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 }
@@ -881,12 +1135,6 @@ class _VideoLibraryCard extends StatelessWidget {
                           ),
                         ],
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton.filledTonal(
-                      tooltip: '播放',
-                      onPressed: onOpen,
-                      icon: const Icon(Icons.play_arrow_rounded),
                     ),
                   ],
                 ),
@@ -1423,6 +1671,212 @@ class _UndoCountdownButtonState extends State<_UndoCountdownButton>
           ),
         ),
       ),
+    );
+  }
+}
+
+class _AiTaskIndicatorButton extends StatelessWidget {
+  const _AiTaskIndicatorButton({required this.onOpenVideo});
+
+  final void Function(String path, String name) onOpenVideo;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: AiTaskManager.instance,
+      builder: (context, _) {
+        final activeTasks = AiTaskManager.instance.activeTasks;
+        if (activeTasks.isEmpty) return const SizedBox.shrink();
+
+        final count = activeTasks.length;
+        final theme = Theme.of(context);
+        final scheme = theme.colorScheme;
+
+        return Tooltip(
+          message: '后台正在进行 $count 个语音识别任务 (点击查看)',
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: () => _showAiTasksDialog(context, onOpenVideo),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: scheme.primaryContainer.withValues(alpha: 0.8),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: scheme.primary.withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: scheme.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'AI 识别中 ($count)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: scheme.onPrimaryContainer,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  static void _showAiTasksDialog(
+    BuildContext context,
+    void Function(String path, String name) onOpenVideo,
+  ) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogCtx) {
+        return AlertDialog(
+          title: Row(
+            children: [
+              Icon(
+                Icons.auto_awesome_rounded,
+                color: Theme.of(dialogCtx).colorScheme.primary,
+                size: 22,
+              ),
+              const SizedBox(width: 8),
+              const Text('AI 语音识别任务中心', style: TextStyle(fontSize: 17)),
+            ],
+          ),
+          content: SizedBox(
+            width: 480,
+            child: ListenableBuilder(
+              listenable: AiTaskManager.instance,
+              builder: (context, _) {
+                final tasks = AiTaskManager.instance.activeTasks;
+                if (tasks.isEmpty) {
+                  return const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Center(
+                      child: Text(
+                        '当前没有正在处理的 AI 任务',
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    ),
+                  );
+                }
+
+                return ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: tasks.length,
+                  separatorBuilder: (context, index) => const Divider(height: 16),
+                  itemBuilder: (context, index) {
+                    final task = tasks[index];
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                task.videoTitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                task.modelDisplayName,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Theme.of(context).colorScheme.primary,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: LinearProgressIndicator(
+                            value: task.percent > 0 ? task.percent : null,
+                            minHeight: 6,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                task.statusMessage ?? '正在处理中…',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ),
+                            TextButton.icon(
+                              style: TextButton.styleFrom(
+                                visualDensity: VisualDensity.compact,
+                                foregroundColor: Theme.of(context).colorScheme.error,
+                              ),
+                              icon: const Icon(Icons.cancel_outlined, size: 16),
+                              label: const Text('取消'),
+                              onPressed: () => task.cancel(),
+                            ),
+                            const SizedBox(width: 4),
+                            FilledButton.tonalIcon(
+                              style: FilledButton.styleFrom(
+                                visualDensity: VisualDensity.compact,
+                              ),
+                              icon: const Icon(Icons.play_arrow_rounded, size: 16),
+                              label: const Text('播放'),
+                              onPressed: () {
+                                Navigator.of(dialogCtx).pop();
+                                onOpenVideo(task.videoPath, task.videoTitle);
+                              },
+                            ),
+                          ],
+                        ),
+                      ],
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogCtx).pop(),
+              child: const Text('关闭'),
+            ),
+          ],
+        );
+      },
     );
   }
 }

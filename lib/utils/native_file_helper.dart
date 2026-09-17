@@ -61,7 +61,7 @@ abstract final class NativeFileHelper {
   // ─────────────────────────────────────────────────
 
   /// 桌面端缓存目录：%TEMP%\PolyFlixPlayer\cache\
-  static Directory _desktopCacheDir() {
+  static Directory desktopCacheDir() {
     final base = Directory.systemTemp.path;
     final sep = Platform.pathSeparator;
     return Directory('$base${sep}PolyFlixPlayer${sep}cache');
@@ -74,11 +74,34 @@ abstract final class NativeFileHelper {
     return Directory('$base${sep}PolyFlixPlayer${sep}models');
   }
 
+  /// 桌面端音频提取缓存目录：%TEMP%\PolyFlixPlayer\cache\audio\
+  static Directory desktopCacheAudioDir() {
+    final base = desktopCacheDir().path;
+    final sep = Platform.pathSeparator;
+    return Directory('$base${sep}audio');
+  }
+
   /// 桌面端字幕缓存目录：%TEMP%\PolyFlixPlayer\cache\subtitles\
   static Directory desktopSubtitleCacheDir() {
-    final base = _desktopCacheDir().path;
+    final base = desktopCacheDir().path;
     final sep = Platform.pathSeparator;
     return Directory('$base${sep}subtitles');
+  }
+
+  /// 打开系统文件管理器并定位到指定目录（桌面端生效）。
+  static Future<void> openDirectory(Directory dir) async {
+    try {
+      if (!dir.existsSync()) {
+        dir.createSync(recursive: true);
+      }
+      if (Platform.isWindows) {
+        await Process.run('explorer.exe', [dir.path]);
+      } else if (Platform.isMacOS) {
+        await Process.run('open', [dir.path]);
+      } else if (Platform.isLinux) {
+        await Process.run('xdg-open', [dir.path]);
+      }
+    } catch (_) {}
   }
 
   /// 桌面端 Whisper 模型目录：%TEMP%\PolyFlixPlayer\models\whisper\
@@ -136,7 +159,7 @@ abstract final class NativeFileHelper {
     }
     // 桌面端：统计 cache/ 目录
     try {
-      return await _directorySize(_desktopCacheDir());
+      return await _directorySize(desktopCacheDir());
     } catch (_) {}
     return 0;
   }
@@ -168,7 +191,7 @@ abstract final class NativeFileHelper {
     } else {
       // 桌面端：删除 cache/ 目录（连同内容），下次使用时按需重建
       try {
-        final dir = _desktopCacheDir();
+        final dir = desktopCacheDir();
         if (dir.existsSync()) {
           cleared = await _directorySize(dir);
           await dir.delete(recursive: true);

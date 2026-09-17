@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 const String _kFitWindowToVideo = 'settings.fitWindowToVideo';
 const String _kAiSubtitleEnabled = 'settings.aiSubtitleEnabled';
+const String _kAiAsrModelId = 'settings.aiAsrModelId';
 
 /// 打开视频后是否让播放窗口自动适应视频画面比例（仅桌面端生效）。
 ///
@@ -21,12 +22,21 @@ final ValueNotifier<bool> fitWindowToVideo = ValueNotifier<bool>(false);
 /// 生成字幕。此开关独立于视频是否有内置字幕——即使有内置字幕也可开启。
 final ValueNotifier<bool> aiSubtitleEnabled = ValueNotifier<bool>(true);
 
+/// AI 语音识别上次使用的模型 ID（tiny / base / small）。
+///
+/// 打开 AI 字幕面板时自动恢复为上次选用的模型，避免每次都回到 tiny。
+final ValueNotifier<String> aiAsrModelId = ValueNotifier<String>('tiny');
+
 /// 从本地存储载入设置，应在 runApp 之前调用一次。
 Future<void> loadAppSettings() async {
   try {
     final prefs = await SharedPreferences.getInstance();
     fitWindowToVideo.value = prefs.getBool(_kFitWindowToVideo) ?? false;
     aiSubtitleEnabled.value = prefs.getBool(_kAiSubtitleEnabled) ?? true;
+    final savedModel = prefs.getString(_kAiAsrModelId) ?? 'tiny';
+    // 仅接受合法的模型 ID，防止脏数据导致面板找不到模型
+    aiAsrModelId.value =
+        const ['tiny', 'base', 'small'].contains(savedModel) ? savedModel : 'tiny';
   } catch (_) {
     // 读取失败时保留默认值，不能因为设置读不出来就启动不了。
   }
@@ -49,6 +59,17 @@ Future<void> setAiSubtitleEnabled(bool value) async {
   try {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kAiSubtitleEnabled, value);
+  } catch (_) {
+    // 持久化失败不影响本次生效。
+  }
+}
+
+/// 写入"AI 语音识别模型"选择，下次打开面板时恢复。
+Future<void> setAiAsrModelId(String value) async {
+  aiAsrModelId.value = value;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kAiAsrModelId, value);
   } catch (_) {
     // 持久化失败不影响本次生效。
   }

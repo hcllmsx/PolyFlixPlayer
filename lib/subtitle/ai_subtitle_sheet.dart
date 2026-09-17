@@ -1,7 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import 'ai_task_manager.dart';
+import '../settings/app_settings.dart';
 import 'model_manager.dart';
 import 'subtitle_generator.dart';
 
@@ -12,6 +18,7 @@ class AiSubtitleSheet extends StatefulWidget {
   const AiSubtitleSheet({
     super.key,
     required this.videoPath,
+    this.videoTitle,
     required this.isAiSubtitleActive,
     required this.onToggleSubtitleActive,
     this.onSeekTo,
@@ -19,6 +26,9 @@ class AiSubtitleSheet extends StatefulWidget {
 
   /// 当前视频源路径（本地文件或 PFLX 流式地址）。
   final String videoPath;
+
+  /// 视频标题（可选，用于任务展示）。
+  final String? videoTitle;
 
   /// 画面上 AI 字幕叠加层是否处于激活显示状态。
   final bool isAiSubtitleActive;
@@ -33,6 +43,7 @@ class AiSubtitleSheet extends StatefulWidget {
   static Future<void> show({
     required BuildContext context,
     required String videoPath,
+    String? videoTitle,
     required bool isAiSubtitleActive,
     required ValueChanged<bool> onToggleSubtitleActive,
     ValueChanged<Duration>? onSeekTo,
@@ -43,6 +54,7 @@ class AiSubtitleSheet extends StatefulWidget {
       backgroundColor: Colors.transparent,
       builder: (context) => AiSubtitleSheet(
         videoPath: videoPath,
+        videoTitle: videoTitle,
         isAiSubtitleActive: isAiSubtitleActive,
         onToggleSubtitleActive: onToggleSubtitleActive,
         onSeekTo: onSeekTo,
@@ -58,7 +70,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   final SubtitleGenerator _generator = SubtitleGenerator.instance;
   StreamSubscription<AsrProgress>? _progressSub;
 
-  String _selectedModel = 'tiny';
+  String _selectedModel = aiAsrModelId.value;
   String _selectedLanguage = 'auto';
   late bool _isAiSubtitleActive;
   bool _previewExpanded = false;
@@ -70,6 +82,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   bool _checkingModels = true;
   String? _statusMessage;
   AsrState _currentState = AsrState.idle;
+  Set<String> _cachedModels = {};
 
   final List<Map<String, String>> _languageOptions = const [
     {'code': 'auto', 'label': '自动侦测（原音频语言）'},
@@ -84,6 +97,32 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     super.initState();
     _isAiSubtitleActive = widget.isAiSubtitleActive;
     _currentState = _generator.state;
+
+    // 检查并优先同步当前视频正在执行的后台任务
+    final runningTask = AiTaskManager.instance.getTask(widget.videoPath);
+    if (runningTask != null &&
+        !runningTask.isCancelled &&
+        (runningTask.state == AsrState.preparing ||
+            runningTask.state == AsrState.processing)) {
+      _selectedModel = runningTask.modelId;
+      _selectedLanguage = runningTask.language;
+      _currentState = runningTask.state;
+      _statusMessage = runningTask.statusMessage;
+    } else if (_generator.entries.isEmpty) {
+      // 尝试自动读取已有的本地字幕缓存（优先当前默认模型或历史最高精度模型）
+      AiTaskManager.instance.loadCachedSubtitles(widget.videoPath, modelId: _selectedModel).then((cached) {
+        if (mounted && cached != null && cached.isNotEmpty) {
+          _generator.setEntries(cached);
+          setState(() {
+            _currentState = AsrState.completed;
+            _statusMessage = '已载入历史字幕缓存 (共 ${cached.length} 条)';
+          });
+        }
+      });
+    }
+
+    AiTaskManager.instance.addListener(_onTaskManagerChanged);
+
     _progressSub = _generator.progressStream.listen((p) {
       if (!mounted) return;
       setState(() {
@@ -94,8 +133,26 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     _checkModels();
   }
 
+  void _onTaskManagerChanged() {
+    if (!mounted) return;
+    final task = AiTaskManager.instance.getTask(widget.videoPath);
+    if (task != null) {
+      setState(() {
+        _currentState = task.state;
+        _statusMessage = task.statusMessage;
+        if (task.state == AsrState.preparing || task.state == AsrState.processing) {
+          _selectedModel = task.modelId;
+        }
+      });
+      if (task.state == AsrState.completed) {
+        _checkModels();
+      }
+    }
+  }
+
   @override
   void dispose() {
+    AiTaskManager.instance.removeListener(_onTaskManagerChanged);
     _progressSub?.cancel();
     super.dispose();
   }
@@ -104,15 +161,18 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     final tinyReady = await ModelManager.instance.isModelDownloaded('tiny');
     final baseReady = await ModelManager.instance.isModelDownloaded('base');
     final smallReady = await ModelManager.instance.isModelDownloaded('small');
+    final cachedList = await AiTaskManager.instance.getCachedModelIds(widget.videoPath);
     if (!mounted) return;
     setState(() {
+      _cachedModels = cachedList.toSet();
       _modelAvailability = {
         'tiny': tinyReady,
         'base': baseReady,
         'small': smallReady,
       };
-      // 如果默认选中的模型不可用，自动切换到首个可用的模型
-      if (!(_modelAvailability[_selectedModel] ?? false)) {
+      // 如果当前没有运行中的任务，且选中的模型不可用，切换到首个可用的模型
+      final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
+      if (!isRunning && !(_modelAvailability[_selectedModel] ?? false)) {
         for (final m in ['tiny', 'base', 'small']) {
           if (_modelAvailability[m] == true) {
             _selectedModel = m;
@@ -124,8 +184,38 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     });
   }
 
+  Future<void> _onSelectModel(String id) async {
+    final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
+    if (isRunning) return;
+
+    setState(() => _selectedModel = id);
+    // 记住用户的选择，下次打开面板时恢复
+    setAiAsrModelId(id);
+
+    // 同步状态与字幕：切换到的模型已有缓存则载入，否则清空并回到就绪状态
+    final cached = await AiTaskManager.instance.loadCachedSubtitles(
+      widget.videoPath,
+      modelId: id,
+    );
+    if (mounted && cached != null && cached.isNotEmpty) {
+      _generator.setEntries(cached);
+      setState(() {
+        _currentState = AsrState.completed;
+        _statusMessage = '已切换并载入 ${id.toUpperCase()} 模型历史缓存 (共 ${cached.length} 条)';
+      });
+    } else {
+      _generator.clear();
+      setState(() {
+        _currentState = AsrState.idle;
+        _statusMessage = null;
+        _previewExpanded = false;
+      });
+    }
+  }
+
   void _startTranscribing() {
-    if (_generator.isRunning) return;
+    final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
+    if (isRunning) return;
 
     if (!(_modelAvailability[_selectedModel] ?? false)) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -140,20 +230,145 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       widget.onToggleSubtitleActive(true);
     }
 
-    _generator.transcribeVideo(
+    final title = widget.videoTitle ??
+        (widget.videoPath.contains(Platform.pathSeparator)
+            ? widget.videoPath.split(Platform.pathSeparator).last
+            : widget.videoPath);
+
+    AiTaskManager.instance.startTask(
       videoPath: widget.videoPath,
+      videoTitle: title,
       modelId: _selectedModel,
       language: _selectedLanguage,
     );
   }
 
   void _stopTranscribing() {
-    _generator.cancel();
+    AiTaskManager.instance.cancelTask(widget.videoPath);
   }
 
-  void _clearSubtitles() {
+  Future<void> _deleteSubtitlesWithConfirm() async {
+    final modelName = _selectedModel.toUpperCase();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF262630),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 22),
+            SizedBox(width: 8),
+            Text('删除字幕缓存', style: TextStyle(fontSize: 16, color: Colors.white)),
+          ],
+        ),
+        content: Text(
+          '确定要删除当前 $modelName 模型的字幕缓存吗？\n删除后可重新识别原音频。',
+          style: const TextStyle(fontSize: 13, color: Colors.white70, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消', style: TextStyle(color: Colors.white60)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.redAccent.shade700,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('确认删除'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    // 1. 删除磁盘物理缓存文件
+    await AiTaskManager.instance.deleteCachedSubtitles(
+      widget.videoPath,
+      modelId: _selectedModel,
+    );
+
+    // 2. 清空内存字幕
     _generator.clear();
-    setState(() {});
+
+    // 3. 刷新状态并恢复识别按钮可点击
+    if (mounted) {
+      setState(() {
+        _cachedModels.remove(_selectedModel);
+        // 重置状态为就绪，避免仍显示「识别已完成」的提示
+        _currentState = AsrState.idle;
+        _statusMessage = null;
+        _previewExpanded = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已成功删除 $modelName 模型字幕缓存，可重新识别'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<void> _exportSrtFile() async {
+    final entries = _generator.entries;
+    if (entries.isEmpty) return;
+
+    try {
+      final srtContent = SubtitleGenerator.convertToSrt(entries);
+      final srtBytes = Uint8List.fromList(utf8.encode(srtContent));
+
+      // 提取建议的导出文件名
+      String defaultName = 'subtitle.srt';
+      if (widget.videoTitle != null && widget.videoTitle!.trim().isNotEmpty) {
+        final sanitized = widget.videoTitle!.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+        defaultName = '$sanitized.srt';
+      } else {
+        final base = widget.videoPath.split(Platform.isWindows ? r'\' : '/').last;
+        final dotIdx = base.lastIndexOf('.');
+        if (dotIdx > 0) {
+          defaultName = '${base.substring(0, dotIdx)}.srt';
+        } else {
+          defaultName = '$base.srt';
+        }
+      }
+
+      final savedUri = await FilePicker.saveFile(
+        dialogTitle: '导出 SRT 字幕文件',
+        fileName: defaultName,
+        bytes: srtBytes,
+        type: FileType.custom,
+        allowedExtensions: ['srt'],
+      );
+
+      if (savedUri == null) return; // 用户取消
+
+      String displayPath;
+      try {
+        displayPath = savedUri.toFilePath(windows: Platform.isWindows);
+      } catch (_) {
+        displayPath = savedUri.path;
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('已成功导出 SRT 字幕至：$displayPath'),
+            backgroundColor: Colors.green.shade800,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('导出失败: $e'),
+            backgroundColor: Colors.redAccent.shade700,
+          ),
+        );
+      }
+    }
   }
 
   @override
@@ -313,6 +528,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Widget _buildStatusCard(ThemeData theme, bool isRunning, int entryCount) {
+    final task = AiTaskManager.instance.getTask(widget.videoPath);
     Color bg = const Color(0xFF262630);
     Color accent = Colors.white54;
     IconData icon = Icons.info_outline_rounded;
@@ -322,7 +538,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       bg = theme.colorScheme.primary.withValues(alpha: .12);
       accent = theme.colorScheme.primary;
       icon = Icons.graphic_eq_rounded;
-      text = _statusMessage ?? '正在处理音频...';
+      text = task?.statusMessage ?? _statusMessage ?? '正在处理音频...';
     } else if (_currentState == AsrState.completed) {
       bg = Colors.green.withValues(alpha: .12);
       accent = Colors.greenAccent;
@@ -342,32 +558,49 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: accent.withValues(alpha: .3)),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (isRunning)
-            SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
+          Row(
+            children: [
+              if (isRunning)
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.2,
+                    color: accent,
+                  ),
+                )
+              else
+                Icon(icon, color: accent, size: 20),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: isRunning || _currentState != AsrState.idle
+                        ? Colors.white
+                        : Colors.white70,
+                    fontWeight: isRunning ? FontWeight.w500 : FontWeight.normal,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (isRunning && task != null && task.percent > 0) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: task.percent > 0 ? task.percent : null,
+                minHeight: 5,
+                backgroundColor: Colors.white12,
                 color: accent,
               ),
-            )
-          else
-            Icon(icon, color: accent, size: 20),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              text,
-              style: TextStyle(
-                fontSize: 13,
-                color: isRunning || _currentState != AsrState.idle
-                    ? Colors.white
-                    : Colors.white70,
-                fontWeight: isRunning ? FontWeight.w500 : FontWeight.normal,
-              ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -387,6 +620,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       );
     }
 
+    final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
     final models = [
       {'id': 'tiny', 'name': 'Tiny 极速版', 'desc': '约75MB · 速度最快'},
       {'id': 'base', 'name': 'Base 标准版', 'desc': '约140MB · 速度平衡'},
@@ -398,10 +632,12 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         final id = m['id']!;
         final isAvailable = _modelAvailability[id] ?? false;
         final isSelected = _selectedModel == id;
+        final isCurrentRunning = isRunning && isSelected;
+        final hasCache = _cachedModels.contains(id);
 
         return Expanded(
           child: GestureDetector(
-            onTap: isAvailable ? () => setState(() => _selectedModel = id) : null,
+            onTap: (isAvailable && !isRunning) ? () => _onSelectModel(id) : null,
             child: Container(
               margin: const EdgeInsets.symmetric(horizontal: 4),
               padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
@@ -419,18 +655,49 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               ),
               child: Column(
                 children: [
-                  Text(
-                    m['name']!,
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-                      color: isAvailable ? Colors.white : Colors.white38,
-                    ),
-                    textAlign: TextAlign.center,
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          m['name']!,
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                            color: isAvailable ? Colors.white : Colors.white38,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                      if (isCurrentRunning) ...[
+                        const SizedBox(width: 3),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: Colors.green,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text('运行中', style: TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold)),
+                        ),
+                      ] else if (hasCache) ...[
+                        const SizedBox(width: 3),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: Colors.teal.shade700,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text('已缓存', style: TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+                    ],
                   ),
                   const SizedBox(height: 3),
                   Text(
-                    isAvailable ? m['desc']! : '未检测到模型',
+                    isAvailable
+                        ? (hasCache ? '已生成专属缓存' : m['desc']!)
+                        : '未检测到模型',
                     style: TextStyle(
                       fontSize: 10,
                       color: isAvailable ? Colors.white54 : Colors.redAccent.withValues(alpha: .7),
@@ -480,6 +747,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Widget _buildSubtitleControls(ThemeData theme) {
+    final hasEntries = _generator.entries.isNotEmpty;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       decoration: BoxDecoration(
@@ -505,11 +773,21 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               widget.onToggleSubtitleActive(val);
             },
           ),
-          const SizedBox(width: 6),
+          if (hasEntries) ...[
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: '导出为 SRT 字幕文件',
+              icon: const Icon(Icons.file_download_outlined, color: Colors.white70, size: 20),
+              onPressed: _exportSrtFile,
+            ),
+          ],
+          const SizedBox(width: 4),
           IconButton(
-            tooltip: '清空字幕',
+            tooltip: '删除字幕缓存',
             icon: const Icon(Icons.delete_outline_rounded, color: Colors.white60, size: 20),
-            onPressed: _clearSubtitles,
+            onPressed: (hasEntries || _cachedModels.contains(_selectedModel))
+                ? _deleteSubtitlesWithConfirm
+                : null,
           ),
         ],
       ),
@@ -619,23 +897,36 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     }
 
     final hasModel = _modelAvailability[_selectedModel] ?? false;
+    final hasCache = _cachedModels.contains(_selectedModel);
 
     return Row(
       children: [
         Expanded(
           child: FilledButton.icon(
             style: FilledButton.styleFrom(
-              backgroundColor: theme.colorScheme.primary,
-              foregroundColor: Colors.white,
+              backgroundColor: hasCache ? Colors.white12 : theme.colorScheme.primary,
+              foregroundColor: hasCache ? Colors.white38 : Colors.white,
+              disabledBackgroundColor: Colors.white10,
+              disabledForegroundColor: Colors.white30,
               padding: const EdgeInsets.symmetric(vertical: 14),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             ),
-            icon: const Icon(Icons.mic_none_rounded, size: 20),
-            label: Text(
-              hasModel ? '开始识别原音频' : '未就绪 (缺少模型)',
-              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+            icon: Icon(
+              hasCache ? Icons.check_circle_outline_rounded : Icons.mic_none_rounded,
+              size: 20,
+              color: hasCache ? Colors.white38 : Colors.white,
             ),
-            onPressed: hasModel ? _startTranscribing : null,
+            label: Text(
+              hasModel
+                  ? (hasCache ? '已有字幕缓存' : '开始识别原音频')
+                  : '未就绪 (缺少模型)',
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                color: hasCache ? Colors.white38 : Colors.white,
+              ),
+            ),
+            onPressed: (hasModel && !hasCache) ? _startTranscribing : null,
           ),
         ),
       ],
