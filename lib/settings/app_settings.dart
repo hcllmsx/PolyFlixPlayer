@@ -12,6 +12,7 @@ const String _kAiSubtitleEnabled = 'settings.aiSubtitleEnabled';
 const String _kAiAsrModelId = 'settings.aiAsrModelId';
 const String _kAiAsrThreads = 'settings.aiAsrThreads';
 const String _kAiAsrForceCpu = 'settings.aiAsrForceCpu';
+const String _kModelDownloadSource = 'settings.modelDownloadSource';
 
 /// 打开视频后是否让播放窗口自动适应视频画面比例（仅桌面端生效）。
 ///
@@ -42,6 +43,15 @@ final ValueNotifier<int> aiAsrThreadCount = ValueNotifier<int>(0);
 /// 引擎包也会以 `-ng` 启动，退回 CPU 推理，不用删掉引擎包。
 final ValueNotifier<bool> aiAsrForceCpu = ValueNotifier<bool>(false);
 
+/// Whisper 模型下载源。
+///
+/// - `auto`（默认）：先试 HuggingFace 官方源，失败自动回退国内镜像 hf-mirror；
+/// - `mirror`：直接走国内镜像，适合官方源被墙、不想白等的用户。
+///
+/// 之所以需要这个开关：Dart 的 HttpClient **不读取 Windows 系统代理**，
+/// 即使本机挂了代理，应用内下载也是直连——国内直连 huggingface.co 会被拒。
+final ValueNotifier<String> modelDownloadSource = ValueNotifier<String>('auto');
+
 /// 从本地存储载入设置，应在 runApp 之前调用一次。
 Future<void> loadAppSettings() async {
   try {
@@ -54,6 +64,8 @@ Future<void> loadAppSettings() async {
         const ['tiny', 'base', 'small'].contains(savedModel) ? savedModel : 'tiny';
     aiAsrThreadCount.value = prefs.getInt(_kAiAsrThreads) ?? 0;
     aiAsrForceCpu.value = prefs.getBool(_kAiAsrForceCpu) ?? false;
+    final source = prefs.getString(_kModelDownloadSource) ?? 'auto';
+    modelDownloadSource.value = source == 'mirror' ? 'mirror' : 'auto';
   } catch (_) {
     // 读取失败时保留默认值，不能因为设置读不出来就启动不了。
   }
@@ -109,6 +121,17 @@ Future<void> setAiAsrForceCpu(bool value) async {
   try {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kAiAsrForceCpu, value);
+  } catch (_) {
+    // 持久化失败不影响本次生效。
+  }
+}
+
+/// 写入"模型下载源"（auto / mirror）。
+Future<void> setModelDownloadSource(String value) async {
+  modelDownloadSource.value = value;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kModelDownloadSource, value);
   } catch (_) {
     // 持久化失败不影响本次生效。
   }

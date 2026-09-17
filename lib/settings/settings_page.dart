@@ -9,6 +9,7 @@ import '../main.dart';
 import '../subtitle/device_capability.dart';
 import '../subtitle/engine_pack.dart';
 import '../subtitle/model_manager.dart';
+import '../subtitle/model_picker_sheet.dart';
 import '../subtitle/whisper_server.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
@@ -342,9 +343,30 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
                 const SizedBox(height: 4),
-                for (final model in availableModels)
-                  _buildModelItem(model, scheme),
+                // 只列出已下载的模型：模型清单有二十多个，全列出来长得没法看，
+                // 浏览 / 下载 / 切换统一走「浏览全部模型」面板。
+                if (_downloadedModels.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                    child: Text(
+                      '尚未下载任何模型。点击下方「浏览全部模型」下载，或把已有的 ggml-*.bin 导入进来。',
+                      style: TextStyle(
+                        fontSize: 12,
+                        height: 1.5,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  )
+                else
+                  for (final model in availableModels)
+                    if (_downloadedModels.contains(model.id))
+                      _buildModelItem(model, scheme),
                 _sectionActionRow([
+                  _SectionAction(
+                    icon: Icons.list_alt_rounded,
+                    label: '浏览全部模型',
+                    onPressed: _browseModels,
+                  ),
                   _SectionAction(
                     icon: Icons.file_download_outlined,
                     label: '导入模型',
@@ -356,6 +378,36 @@ class _SettingsPageState extends State<SettingsPage> {
                     onPressed: _openModelDirectory,
                   ),
                 ]),
+                ListenableBuilder(
+                  listenable: modelDownloadSource,
+                  builder: (context, _) => ListTile(
+                    dense: true,
+                    leading: Icon(Icons.cloud_download_outlined,
+                        size: 20, color: scheme.primary),
+                    title: const Text('模型下载源', style: TextStyle(fontSize: 13)),
+                    subtitle: Text(
+                      modelDownloadSource.value == 'mirror'
+                          ? '国内镜像 hf-mirror（官方源不可达时选这个）'
+                          : '自动：先试官方源，失败自动回退国内镜像',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                    trailing: DropdownButton<String>(
+                      value: modelDownloadSource.value,
+                      focusColor: Colors.transparent,
+                      underline: const SizedBox.shrink(),
+                      items: const [
+                        DropdownMenuItem(value: 'auto', child: Text('自动', style: TextStyle(fontSize: 13))),
+                        DropdownMenuItem(value: 'mirror', child: Text('仅镜像', style: TextStyle(fontSize: 13))),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) setModelDownloadSource(v);
+                      },
+                    ),
+                  ),
+                ),
                 const Divider(height: 1),
                 _buildAsrPerformanceRow(scheme),
                 const SizedBox(height: 8),
@@ -729,27 +781,45 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   /// 卡片内小节的操作按钮行：单独一行、右对齐。
+  ///
+  /// 用 Wrap 而不是 Row：设置页在双栏模式下只有 420px 宽，
+  /// 按钮多了（浏览/导入/目录）排不下时会自动换行，不会溢出报错。
   Widget _sectionActionRow(List<_SectionAction> actions) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 12, 10),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.end,
+      padding: const EdgeInsets.fromLTRB(16, 8, 12, 4),
+      child: Wrap(
+        alignment: WrapAlignment.end,
+        spacing: 4,
+        runSpacing: 2,
         children: [
-          for (var i = 0; i < actions.length; i++) ...[
-            if (i > 0) const SizedBox(width: 4),
+          for (final action in actions)
             TextButton.icon(
               style: TextButton.styleFrom(
                 visualDensity: VisualDensity.compact,
                 padding: const EdgeInsets.symmetric(horizontal: 10),
               ),
-              onPressed: actions[i].onPressed,
-              icon: Icon(actions[i].icon, size: 16),
-              label: Text(actions[i].label),
+              onPressed: action.onPressed,
+              icon: Icon(action.icon, size: 16),
+              label: Text(action.label),
             ),
-          ],
         ],
       ),
     );
+  }
+
+  /// 浏览 / 下载 / 切换全部模型。
+  Future<void> _browseModels() async {
+    final result = await ModelPickerSheet.show(context);
+    await _refreshModels();
+    if (result == null || !mounted) return;
+    // 在设置页选中的模型同样记忆下来，AI 面板下次打开就用它
+    await setAiAsrModelId(result.modelId);
+    if (!mounted) return;
+    final label =
+        ModelManager.instance.infoOf(result.modelId)?.displayName ?? result.modelId;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('已选用：$label')));
   }
 
   /// 导入本地已下载好的 ggml 模型文件。

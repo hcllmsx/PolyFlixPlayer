@@ -174,11 +174,21 @@ class _PlayerPageState extends State<PlayerPage> {
     _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
     _asrProgressSub = SubtitleGenerator.instance.progressStream.listen((p) {
       if (!mounted) return;
+      // 识别用的是同一个全局生成器：只有当完成的这批字幕属于"当前播放的视频"
+      // 时才自动显示，否则会给正在看的另一部片子叠上别人的字幕。
+      final activeKey = _streamServer?.url ?? _sourcePath;
+      final forThisVideo =
+          SubtitleGenerator.instance.holdsEntriesFor(activeKey);
+
       setState(() {
         _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
         if (p.state == AsrState.completed) {
-          _aiSubtitleActive = true;
-          _showOsd('AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)');
+          if (forThisVideo) {
+            _aiSubtitleActive = true;
+            _showOsd('AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)');
+          } else {
+            _showOsd('AI 字幕识别完成（属于其他视频，未在此画面显示）');
+          }
         } else if (p.state == AsrState.error) {
           _showOsd(p.message ?? 'AI 语音识别失败');
         }
@@ -522,7 +532,10 @@ class _PlayerPageState extends State<PlayerPage> {
       return;
     }
     if (id == '__ai_subtitle__') {
-      if (SubtitleGenerator.instance.entries.isNotEmpty) {
+      // 只有"属于当前视频"的字幕才能直接开关显示；
+      // 生成器里若是别的视频的字幕，则引导用户打开面板去识别/载入本视频字幕。
+      final activeKey = _streamServer?.url ?? _sourcePath;
+      if (SubtitleGenerator.instance.holdsEntriesFor(activeKey)) {
         // 已有识别结果时按开关处理：再点一次即关闭这条副/主字幕
         setState(() => _aiSubtitleActive = !_aiSubtitleActive);
         final role = _hasTranslation

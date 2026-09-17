@@ -11,6 +11,7 @@ import '../settings/app_settings.dart';
 import 'device_capability.dart';
 import 'engine_pack.dart';
 import 'model_manager.dart';
+import 'model_picker_sheet.dart';
 import 'subtitle_generator.dart';
 
 /// AI 语音识别字幕控制面板。
@@ -107,6 +108,13 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   void initState() {
     super.initState();
     _isAiSubtitleActive = widget.isAiSubtitleActive;
+
+    // 单例里可能还留着"上一个视频"的字幕：先清掉，否则面板会显示别的视频的
+    // 状态与条数（表现为"串台"），甚至把上一个视频的字幕当成当前视频的缓存。
+    if (_generator.entries.isNotEmpty &&
+        _generator.entriesVideoPath != widget.videoPath) {
+      _generator.clear();
+    }
     _currentState = _generator.state;
 
     // 检查并优先同步当前视频正在执行的后台任务
@@ -120,10 +128,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _currentState = runningTask.state;
       _statusMessage = runningTask.statusMessage;
     } else if (_generator.entries.isEmpty) {
-      // 尝试自动读取已有的本地字幕缓存（优先当前默认模型或历史最高精度模型）
+      // 尝试自动读取当前视频的本地字幕缓存（按模型精准匹配）
       AiTaskManager.instance.loadCachedSubtitles(widget.videoPath, modelId: _selectedModel).then((cached) {
         if (mounted && cached != null && cached.isNotEmpty) {
-          _generator.setEntries(cached);
+          _generator.setEntries(cached, videoPath: widget.videoPath);
           setState(() {
             _currentState = AsrState.completed;
             _statusMessage = '已载入历史字幕缓存 (共 ${cached.length} 条)';
@@ -184,30 +192,42 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Future<void> _checkModels() async {
-    final tinyReady = await ModelManager.instance.isModelDownloaded('tiny');
-    final baseReady = await ModelManager.instance.isModelDownloaded('base');
-    final smallReady = await ModelManager.instance.isModelDownloaded('small');
-    final cachedList = await AiTaskManager.instance.getCachedModelIds(widget.videoPath);
-    if (!mounted) return;
-    setState(() {
-      _cachedModels = cachedList.toSet();
-      _modelAvailability = {
-        'tiny': tinyReady,
-        'base': baseReady,
-        'small': smallReady,
-      };
-      // 如果当前没有运行中的任务，且选中的模型不可用，切换到首个可用的模型
-      final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
-      if (!isRunning && !(_modelAvailability[_selectedModel] ?? false)) {
-        for (final m in ['tiny', 'base', 'small']) {
-          if (_modelAvailability[m] == true) {
-            _selectedModel = m;
-            break;
-          }
+    // 只探测"当前选中的模型"是否已下载（模型有二十多个，不逐个扫描）
+    var activeId = _selectedModel;
+    var activeReady = await ModelManager.instance.isModelDownloaded(activeId);
+    if (!activeReady) {
+      // 选中的模型没下载：回落到任一个已下载的模型；
+      // 一个都没下载就保持原选择，由界面提示去下载。
+      for (final m in availableModels) {
+        if (await ModelManager.instance.isModelDownloaded(m.id)) {
+          activeId = m.id;
+          activeReady = true;
+          break;
         }
       }
+    }
+    // 顺便确认当前视频有哪些模型留下了字幕缓存（界面标记用）
+    final cachedList =
+        await AiTaskManager.instance.getCachedModelIds(widget.videoPath);
+    if (!mounted) return;
+
+    setState(() {
+      _cachedModels = cachedList.toSet();
+      _modelAvailability = {activeId: activeReady};
+      final isRunning = _currentState == AsrState.preparing ||
+          _currentState == AsrState.processing;
+      if (!isRunning && activeReady) _selectedModel = activeId;
       _checkingModels = false;
     });
+    _syncEnglishOnlyLanguage();
+  }
+
+  /// 英语专用模型（.en）只能识别英语：选中它时把语言锁定为英语。
+  void _syncEnglishOnlyLanguage() {
+    final info = ModelManager.instance.infoOf(_selectedModel);
+    if (info != null && info.isEnglishOnly && _selectedLanguage != 'en') {
+      setState(() => _selectedLanguage = 'en');
+    }
   }
 
   Future<void> _onSelectModel(String id) async {
@@ -217,6 +237,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     setState(() => _selectedModel = id);
     // 记住用户的选择，下次打开面板时恢复
     setAiAsrModelId(id);
+    // 英语专用模型：语言锁定为英语
+    _syncEnglishOnlyLanguage();
 
     // 同步状态与字幕：切换到的模型已有缓存则载入，否则清空并回到就绪状态
     final cached = await AiTaskManager.instance.loadCachedSubtitles(
@@ -224,7 +246,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       modelId: id,
     );
     if (mounted && cached != null && cached.isNotEmpty) {
-      _generator.setEntries(cached);
+      _generator.setEntries(cached, videoPath: widget.videoPath);
       setState(() {
         _currentState = AsrState.completed;
         _statusMessage = '已切换并载入 ${id.toUpperCase()} 模型历史缓存 (共 ${cached.length} 条)';
@@ -663,6 +685,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     );
   }
 
+  /// 当前模型卡片：展示所选模型 + 状态标记，点击打开"模型选择/下载"面板。
+  ///
+  /// 模型清单有二十多个，不再用并排卡片（放不下），统一收敛到选择面板里。
   Widget _buildModelSelector(ThemeData theme) {
     if (_checkingModels) {
       return const Padding(
@@ -677,100 +702,168 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       );
     }
 
-    final isRunning = _currentState == AsrState.preparing || _currentState == AsrState.processing;
-    final models = [
-      {'id': 'tiny', 'name': 'Tiny 极速版', 'desc': '约75MB · 速度最快'},
-      {'id': 'base', 'name': 'Base 标准版', 'desc': '约140MB · 速度平衡'},
-      {'id': 'small', 'name': 'Small 精确版', 'desc': '约460MB · 精确度高'},
-    ];
+    final isRunning =
+        _currentState == AsrState.preparing || _currentState == AsrState.processing;
+    final info = ModelManager.instance.infoOf(_selectedModel);
+    final isAvailable = _modelAvailability[_selectedModel] ?? false;
+    final hasCache = _cachedModels.contains(_selectedModel);
 
-    return Row(
-      children: models.map((m) {
-        final id = m['id']!;
-        final isAvailable = _modelAvailability[id] ?? false;
-        final isSelected = _selectedModel == id;
-        final isCurrentRunning = isRunning && isSelected;
-        final hasCache = _cachedModels.contains(id);
-
-        return Expanded(
-          child: GestureDetector(
-            onTap: (isAvailable && !isRunning) ? () => _onSelectModel(id) : null,
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 4),
-              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
-              decoration: BoxDecoration(
-                color: isSelected
-                    ? theme.colorScheme.primary.withValues(alpha: .2)
-                    : const Color(0xFF262630),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: isSelected
-                      ? theme.colorScheme.primary
-                      : (isAvailable ? Colors.white12 : Colors.white10),
-                  width: isSelected ? 1.5 : 1,
-                ),
-              ),
+    return InkWell(
+      onTap: isRunning ? null : _openModelPicker,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF262630),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: isAvailable ? Colors.white12 : Colors.redAccent.withValues(alpha: .5),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              isAvailable ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded,
+              size: 20,
+              color: isAvailable ? Colors.green : Colors.redAccent,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
               child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Flexible(
                         child: Text(
-                          m['name']!,
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-                            color: isAvailable ? Colors.white : Colors.white38,
+                          info?.displayName ?? _selectedModel,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
                           ),
                           overflow: TextOverflow.ellipsis,
-                          textAlign: TextAlign.center,
                         ),
                       ),
-                      if (isCurrentRunning) ...[
-                        const SizedBox(width: 3),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
-                          decoration: BoxDecoration(
-                            color: Colors.green,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Text('运行中', style: TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold)),
-                        ),
+                      if (isRunning) ...[
+                        const SizedBox(width: 6),
+                        _tag('运行中', Colors.green),
                       ] else if (hasCache) ...[
-                        const SizedBox(width: 3),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
-                          decoration: BoxDecoration(
-                            color: Colors.teal.shade700,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Text('已缓存', style: TextStyle(fontSize: 8, color: Colors.white, fontWeight: FontWeight.bold)),
-                        ),
+                        const SizedBox(width: 6),
+                        _tag('已缓存字幕', Colors.teal.shade700),
                       ],
                     ],
                   ),
                   const SizedBox(height: 3),
                   Text(
-                    isAvailable
-                        ? (hasCache ? '已生成专属缓存' : m['desc']!)
-                        : '未检测到模型',
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: isAvailable ? Colors.white54 : Colors.redAccent.withValues(alpha: .7),
+                    _modelSubtitle(
+                      info: info,
+                      isRunning: isRunning,
+                      isAvailable: isAvailable,
+                      hasCache: hasCache,
                     ),
-                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: isAvailable ? Colors.white54 : Colors.redAccent.withValues(alpha: .8),
+                    ),
                   ),
                 ],
               ),
             ),
-          ),
-        );
-      }).toList(),
+            const SizedBox(width: 8),
+            Text(
+              '更换',
+              style: TextStyle(
+                fontSize: 12,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 18,
+              color: theme.colorScheme.primary,
+            ),
+          ],
+        ),
+      ),
     );
   }
 
+  /// 当前模型卡片下方的状态说明。
+  String _modelSubtitle({
+    required WhisperModelInfo? info,
+    required bool isRunning,
+    required bool isAvailable,
+    required bool hasCache,
+  }) {
+    if (isRunning) return '识别进行中，暂不能切换模型';
+    if (!isAvailable) return '模型文件未下载，点击右侧去选择或下载';
+
+    final buffer = StringBuffer(info?.sizeLabel ?? '');
+    if (hasCache) buffer.write(' · 已生成该模型字幕缓存');
+    return buffer.toString();
+  }
+
+  Widget _tag(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 9,
+          color: Colors.white,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+
+  /// 打开模型选择面板；选中的模型会立即生效（有缓存则载入该模型缓存）。
+  Future<void> _openModelPicker() async {
+    final result = await ModelPickerSheet.show(
+      context,
+      selectedId: _selectedModel,
+    );
+    if (result == null || !mounted) return;
+
+    // 模型文件状态可能变了（刚下载 / 刚删除），重新检测
+    await _checkModels();
+    if (!mounted) return;
+    await _onSelectModel(result.modelId);
+  }
+
   Widget _buildLanguageSelector(ThemeData theme) {
+    // 英语专用模型只能识别英语，这里直接锁死语言，避免用户选错后得到乱码
+    final englishOnly =
+        ModelManager.instance.infoOf(_selectedModel)?.isEnglishOnly ?? false;
+
+    if (englishOnly) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF262630),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: const Row(
+          children: [
+            Icon(Icons.lock_outline_rounded, size: 16, color: Colors.white54),
+            SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '英语（当前模型为英语专用，只能识别英语）',
+                style: TextStyle(fontSize: 13, color: Colors.white70),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
       decoration: BoxDecoration(

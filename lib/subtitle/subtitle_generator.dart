@@ -113,6 +113,17 @@ class SubtitleGenerator {
   final List<SubtitleEntry> _entries = [];
   List<SubtitleEntry> get entries => List.unmodifiable(_entries);
 
+  /// 当前这批字幕属于哪个视频。
+  ///
+  /// 本类是全局单例：切到另一个视频后，里面可能还留着上一个视频的字幕，
+  /// 面板与叠加层必须据此判断归属，否则会出现"识别界面串台/显示别的视频字幕"。
+  String? _entriesVideoPath;
+  String? get entriesVideoPath => _entriesVideoPath;
+
+  /// 这批字幕是否属于指定视频。
+  bool holdsEntriesFor(String videoPath) =>
+      _entries.isNotEmpty && _entriesVideoPath == videoPath;
+
   /// 当前状态。
   AsrState _state = AsrState.idle;
   AsrState get state => _state;
@@ -145,6 +156,7 @@ class SubtitleGenerator {
 
     _cancelled = false;
     _entries.clear();
+    _entriesVideoPath = videoPath;
     _updateState(AsrState.preparing, message: '正在准备…');
 
     try {
@@ -184,7 +196,7 @@ class SubtitleGenerator {
       _updateState(AsrState.processing, message: '正在分析语音并生成字幕…');
       _isModelInUse = true;
 
-      final langCode = language.trim().isEmpty ? 'auto' : language;
+      final langCode = _resolveLanguage(modelId, language);
       // 本次识别统一用同一个线程数，避免识别途中改设置造成前后不一致
       final asrThreads = resolveAsrThreads();
 
@@ -225,6 +237,15 @@ class SubtitleGenerator {
   /// 把"识别阶段"的 0~1 进度映射到整体进度的后 92%。
   static double _remapRecognitionPercent(double p) =>
       _kExtractProgressShare + (1 - _kExtractProgressShare) * p.clamp(0.0, 1.0);
+
+  /// 解析实际要传给引擎的识别语言。
+  ///
+  /// 英语专用模型（`.en`）只能处理英语：用户即使设成 auto 或其它语言，
+  /// 也必须按英语处理，否则输出会是乱码式的英文。
+  static String _resolveLanguage(String modelId, String language) {
+    if (modelId.toLowerCase().contains('.en')) return 'en';
+    return language.trim().isEmpty ? 'auto' : language;
+  }
 
   /// 解析本次识别使用的 CPU 线程数。
   ///
@@ -407,13 +428,17 @@ class SubtitleGenerator {
   /// 清除当前字幕数据。
   void clear() {
     _entries.clear();
+    _entriesVideoPath = null;
     _state = AsrState.idle;
   }
 
   /// 批量设置字幕条目（从缓存恢复或从后台任务同步）。
-  void setEntries(List<SubtitleEntry> list) {
+  ///
+  /// [videoPath] 用于记录这批字幕属于哪个视频，供面板/叠加层判断归属。
+  void setEntries(List<SubtitleEntry> list, {String? videoPath}) {
     _entries.clear();
     _entries.addAll(list);
+    _entriesVideoPath = videoPath;
   }
 
   /// 根据当前播放位置获取应显示的字幕。
@@ -437,6 +462,7 @@ class SubtitleGenerator {
   }) async {
     _cancelled = false;
     _entries.clear();
+    _entriesVideoPath = videoPath;
     _updateState(AsrState.preparing, message: '正在准备模型…');
     onProgress?.call(AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在准备模型…');
 
@@ -491,7 +517,7 @@ class SubtitleGenerator {
     // 分析音频能量（静音区间与人声发音点），用于消除前导静音漂移和长句按停顿智能拆分
     final energyProfile = await AudioEnergyProfile.fromWavFile(wavPath);
 
-    final langCode = language.trim().isEmpty ? 'auto' : language;
+    final langCode = _resolveLanguage(modelId, language);
     // 本次识别统一用同一个线程数，避免识别途中改设置造成前后不一致
     final asrThreads = resolveAsrThreads();
 
@@ -649,7 +675,8 @@ class SubtitleGenerator {
 
     for (int i = 0; i < sourceList.length; i++) {
       final cur = sourceList[i];
-      final text = cur.text.trim();
+      // 先剥掉 "MUSIC" 之类的非语音标签（模型常把它和台词粘成一段）
+      final text = _stripNonSpeechLabels(cur.text);
       if (text.isEmpty) continue;
 
       int sMs = cur.start.inMilliseconds;
@@ -670,8 +697,9 @@ class SubtitleGenerator {
       //    "Okay, Whisper, start listening for commands."），必须整句保留：
       //      · 撕碎会让引导词单独闪半秒再留白，观感断裂；
       //      · 旧版本用 min(分句数, 块数) 截取，块数不足时会静默丢弃后半句，造成丢字。
+      //    中文还要额外按句末标点（。！？）切分，否则一长段中文会整条显示。
       final clauses = text
-          .split(RegExp(r'[,;，；]\s*'))
+          .split(RegExp(r'[,;，；。！？]\s*'))
           .map((c) => c.trim())
           .where((c) => c.isNotEmpty)
           .toList();
@@ -722,15 +750,18 @@ class SubtitleGenerator {
                 endTarget = max(bStart + 1000, nextStart - 300);
               }
 
-              // 仅当分句自身没有句末标点时才补句号，避免出现 "lights.." 这类重复标点
-              final needPeriod = cIdx == clauses.length - 1 &&
-                  text.endsWith('.') &&
+              // 末尾分句补回原句的句末标点（中英文都处理），
+              // 但分句自身已有标点时不补，避免出现 "lights.." 这类重复标点
+              final tailPunct =
+                  RegExp(r'[.。！？!?…]$').firstMatch(text)?.group(0);
+              final needPunct = cIdx == clauses.length - 1 &&
+                  tailPunct != null &&
                   !RegExp(r'[.!?。！？…]$').hasMatch(cText);
 
               preprocessed.add(SubtitleEntry(
                 start: Duration(milliseconds: bStart),
                 end: Duration(milliseconds: endTarget),
-                text: needPeriod ? '$cText.' : cText,
+                text: needPunct ? '$cText$tailPunct' : cText,
                 translatedText: cur.translatedText,
               ));
             }
@@ -822,6 +853,35 @@ class SubtitleGenerator {
     return result;
   }
 
+  /// 去掉 whisper 贴在台词前后的非语音标签。
+  ///
+  /// 典型情况是模型把音乐标记和台词连成一段：`"MUSIC What the fuck?"`。
+  /// 这里只处理**明确是标签**的写法：带括号的 `[MUSIC]` / `(music)`，
+  /// 或全大写的 `MUSIC` / `APPLAUSE` 等；小写普通单词不动，
+  /// 避免把 `Listen to music`（"听音乐"是正常台词）误伤。
+  static String _stripNonSpeechLabels(String text) {
+    const labels = 'music|applause|laughter|silence|noise|inaudible|beep';
+    var result = text.trim();
+
+    // 带括号的标签：出现在开头或结尾都清掉
+    final bracket = RegExp(r'^[\[(](?:' + labels + r')[\])]\s*',
+        caseSensitive: false);
+    final bracketTail = RegExp(r'\s*[\[(](?:' + labels + r')[\])]$',
+        caseSensitive: false);
+    result = result.replaceFirst(bracket, '');
+    result = result.replaceFirst(bracketTail, '');
+
+    // 全大写、不带括号的标签（whisper 输出标记时的典型写法）
+    final capsHead = RegExp(r'^(?:MUSIC|APPLAUSE|LAUGHTER|SILENCE|NOISE|INAUDIBLE)'
+        r'\b[\s:.\-–—,]*');
+    final capsTail = RegExp(
+        r'[\s:.\-–—,]*(?:MUSIC|APPLAUSE|LAUGHTER|SILENCE|NOISE|INAUDIBLE)\s*$');
+    result = result.replaceFirst(capsHead, '');
+    result = result.replaceFirst(capsTail, '');
+
+    return result.trim();
+  }
+
   /// 合并被引擎在句中截断的相邻原始分段。
   ///
   /// whisper 在 30 秒窗口边界处会把一句话切成两段，例如：
@@ -843,15 +903,21 @@ class SubtitleGenerator {
     if (raw.length < 2) return raw;
 
     const int maxMergeGapMs = 300;
-    const int maxMergedWords = 30;
+    const int maxMergedUnits = 30;
     final sentenceEnd = RegExp(r'[.!?。！？…]$');
     final startsNewSentence = RegExp(r'^["“(\[]?[A-Z\u4e00-\u9fa5]');
 
-    int wordCount(String text) =>
-        text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+    // 长度单位：西文按词、中文按字。
+    // 中文没有空格，若只数"词"会永远算作 1，长度上限形同虚设，
+    // 结果就是把整段中文对白粘成一条超长字幕。
+    int textUnits(String text) {
+      final cjk = RegExp(r'[\u4e00-\u9fa5]').allMatches(text).length;
+      final words = text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+      return cjk + words;
+    }
 
     final merged = <SubtitleEntry>[];
-    var mergedWords = 0;
+    var mergedUnits = 0;
 
     for (final cur in raw) {
       if (merged.isNotEmpty) {
@@ -859,22 +925,22 @@ class SubtitleGenerator {
         final prevText = prev.text.trim();
         final curText = cur.text.trim();
         final gapMs = cur.start.inMilliseconds - prev.end.inMilliseconds;
-        final curWords = wordCount(curText);
-        final totalWords = mergedWords + curWords;
+        final curUnits = textUnits(curText);
+        final totalUnits = mergedUnits + curUnits;
 
         // 当前段是否只是上一句的尾巴：不以大写/汉字开头，或本身很短
         final looksLikeTail =
-            !startsNewSentence.hasMatch(curText) || curWords <= 3;
+            !startsNewSentence.hasMatch(curText) || curUnits <= 4;
 
         // 注意：这里**不能**再用"合并后总跨度"做限制。
         // whisper 的段末会延伸到下一个起点（含大段静音），跨度常常虚高，
-        // 用它做判据会把合法的"句尾被截断"场景也一并否掉。词数上限已足够防滚雪球。
+        // 用它做判据会把合法的"句尾被截断"场景也一并否掉。长度上限已足够防滚雪球。
         final canMerge = prevText.isNotEmpty &&
             curText.isNotEmpty &&
             !sentenceEnd.hasMatch(prevText) &&
             gapMs <= maxMergeGapMs &&
             looksLikeTail &&
-            totalWords <= maxMergedWords;
+            totalUnits <= maxMergedUnits;
 
         if (canMerge) {
           merged[merged.length - 1] = SubtitleEntry(
@@ -883,12 +949,12 @@ class SubtitleGenerator {
             text: '$prevText $curText',
             translatedText: prev.translatedText,
           );
-          mergedWords = totalWords;
+          mergedUnits = totalUnits;
           continue;
         }
       }
       merged.add(cur);
-      mergedWords = wordCount(cur.text.trim());
+      mergedUnits = textUnits(cur.text.trim());
     }
     return merged;
   }
