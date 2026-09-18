@@ -23,6 +23,7 @@ class SubtitleOverlay extends StatefulWidget {
     super.key,
     required this.generator,
     required this.position,
+    this.videoPath,
     this.visible = true,
     this.isPrimary = true,
     this.bottomOffset = 80,
@@ -33,6 +34,9 @@ class SubtitleOverlay extends StatefulWidget {
 
   /// 当前播放位置（由外部持续更新）。
   final Duration position;
+
+  /// 当前播放视频路径/地址，用于确认生成器里的字幕是否真正属于本视频。
+  final String? videoPath;
 
   /// 是否显示。
   final bool visible;
@@ -53,7 +57,6 @@ class SubtitleOverlay extends StatefulWidget {
 class _SubtitleOverlayState extends State<SubtitleOverlay> {
   SubtitleEntry? _currentEntry;
   StreamSubscription<AsrProgress>? _progressSub;
-  String? _statusText;
 
   @override
   void initState() {
@@ -65,7 +68,8 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
   @override
   void didUpdateWidget(SubtitleOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.position != widget.position) {
+    if (oldWidget.position != widget.position ||
+        oldWidget.videoPath != widget.videoPath) {
       _updateEntry();
     }
     if (oldWidget.generator != widget.generator) {
@@ -82,27 +86,20 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
 
   void _onProgress(AsrProgress progress) {
     if (!mounted) return;
-    setState(() {
-      switch (progress.state) {
-        case AsrState.preparing:
-        case AsrState.processing:
-          _statusText = progress.message;
-          break;
-        case AsrState.completed:
-          _statusText = null;
-          _updateEntry();
-          break;
-        case AsrState.error:
-          _statusText = progress.message;
-          break;
-        case AsrState.idle:
-          _statusText = null;
-          break;
-      }
-    });
+    if (progress.state == AsrState.completed || progress.state == AsrState.idle) {
+      _updateEntry();
+    }
   }
 
   void _updateEntry() {
+    // 画面字幕严格归属校验：如果生成器里当前装的不是本视频的字幕，绝对不在画面上显示！
+    if (widget.videoPath != null &&
+        !widget.generator.holdsEntriesFor(widget.videoPath!)) {
+      if (_currentEntry != null) {
+        setState(() => _currentEntry = null);
+      }
+      return;
+    }
     final entry = widget.generator.getEntryAt(widget.position);
     if (entry != _currentEntry) {
       setState(() => _currentEntry = entry);
@@ -112,11 +109,6 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
   @override
   Widget build(BuildContext context) {
     if (!widget.visible) return const SizedBox.shrink();
-
-    // 正在处理中，显示状态提示
-    if (_statusText != null && widget.generator.isRunning) {
-      return _buildStatusBadge(_statusText!);
-    }
 
     // 没有字幕内容
     if (_currentEntry == null) return const SizedBox.shrink();
@@ -152,9 +144,9 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
 
   Widget _buildSubtitleText(String text, {required bool isPrimary}) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: .72),
+        color: Colors.black.withValues(alpha: .68),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
@@ -169,43 +161,6 @@ class _SubtitleOverlayState extends State<SubtitleOverlay> {
           shadows: const [
             Shadow(offset: Offset(1, 1), blurRadius: 3, color: Colors.black54),
           ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStatusBadge(String text) {
-    return Positioned(
-      right: 16,
-      top: 16,
-      child: IgnorePointer(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: .6),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.5,
-                  color: Colors.white70,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                text,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
         ),
       ),
     );

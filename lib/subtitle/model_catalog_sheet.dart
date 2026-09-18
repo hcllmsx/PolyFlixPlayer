@@ -178,6 +178,7 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
               shrinkWrap: true,
               children: [
                 _netdiskCard(scheme),
+                _modelChoiceGuide(scheme),
                 _groupHeader(scheme, '多语言模型（支持 99 种语言自动侦测）'),
                 _columnHeader(scheme),
                 for (final m in multilingualModels) _row(m),
@@ -186,7 +187,6 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
                 for (final m in englishOnlyModels) _row(m),
                 _groupHeader(scheme, '无需下载的文件'),
                 _notNeededNote(scheme),
-                _footerNote(scheme),
               ],
             ),
           ),
@@ -388,12 +388,14 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
                         color: scheme.onSurfaceVariant,
                       ),
                     ),
-                    if (model.cpuHint != null) ...[
+                    if (model.detailHint != null &&
+                        model.detailHint!.isNotEmpty) ...[
                       const SizedBox(height: 2),
                       Text(
-                        '纯 CPU 识别 1 小时视频约 ${model.cpuHint}',
+                        model.detailHint!,
                         style: TextStyle(
                           fontSize: 11,
+                          height: 1.35,
                           color: scheme.onSurfaceVariant.withValues(alpha: .7),
                         ),
                       ),
@@ -493,33 +495,97 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
     );
   }
 
-  Widget _footerNote(ColorScheme scheme) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+  Widget _modelChoiceGuide(ColorScheme scheme) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(20, 8, 20, 6),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: .4),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: scheme.outlineVariant.withValues(alpha: .45),
+          width: 0.8,
+        ),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            '怎么选：不确定就用 Large v3 Turbo · q5（547 MB）——体积与精度兼顾；'
-            '机器较弱就用 Small 系列；只在确定是英语视频时才选「英语专用」的 .en 版本。',
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.5,
-              color: scheme.onSurfaceVariant,
-            ),
+          Row(
+            children: [
+              Icon(
+                Icons.tips_and_updates_outlined,
+                size: 15,
+                color: scheme.primary,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '选型建议',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: scheme.primary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          _choiceItem(
+            scheme,
+            platform: 'Windows 版',
+            content: '推荐 Large v3 Turbo 或 Medium，配置较低选 Small；识别精度最高。',
           ),
           const SizedBox(height: 6),
-          Text(
-            '量化版（q5/q8）比同档位原版更小更快、精度略降；'
-            '已导入的模型点一下即可切换使用，右侧垃圾桶图标可删除。',
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.5,
-              color: scheme.onSurfaceVariant.withValues(alpha: .8),
-            ),
+          _choiceItem(
+            scheme,
+            platform: 'Android 版',
+            content: '推荐 Base，极速选 Tiny；手机算力有限，不推荐更高级别模型。',
+          ),
+          const SizedBox(height: 6),
+          _choiceItem(
+            scheme,
+            platform: '通用说明',
+            content: '纯英文视频选「.en」专用版；q5/q8 量化版占用内存更小、速度稍快。',
           ),
         ],
       ),
+    );
+  }
+
+  Widget _choiceItem(
+    ColorScheme scheme, {
+    required String platform,
+    required String content,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+          decoration: BoxDecoration(
+            color: scheme.primary.withValues(alpha: .12),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Text(
+            platform,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: scheme.primary,
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            content,
+            style: TextStyle(
+              fontSize: 11.5,
+              height: 1.4,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
     );
   }
 

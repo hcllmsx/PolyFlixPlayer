@@ -219,6 +219,12 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   double _dragStartY = 0.0;
   double _dragStartValue = 0.0;
 
+  /// 水平手势调节播放进度（快进/快退）。
+  bool _horizontalDragging = false;
+  double _dragStartX = 0.0;
+  Duration _seekDragStartPosition = Duration.zero;
+  Duration _seekDragTargetPosition = Duration.zero;
+
   // ---------------- 播放进度（续播） ----------------
   /// 读到续播位置后暂存，等媒体加载完再 seek（此时 seek 才生效）。
   Duration? _pendingResume;
@@ -297,7 +303,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       windowManager.addListener(this);
       _syncFullScreenState();
     }
-    _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
+    _syncAiSubtitleRunningState();
+    AiTaskManager.instance.addListener(_onAiTaskManagerUpdated);
     _asrProgressSub = SubtitleGenerator.instance.progressStream.listen((p) {
       if (!mounted) return;
       // 识别用的是同一个全局生成器：只有当完成的这批字幕属于"当前播放的视频"
@@ -308,17 +315,15 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       );
 
       setState(() {
-        _aiSubtitleRunning = SubtitleGenerator.instance.isRunning;
+        _syncAiSubtitleRunningState();
         if (p.state == AsrState.completed) {
           if (forThisVideo) {
             _aiSubtitleActive = true;
             _showOsd(
               'AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)',
             );
-          } else {
-            _showOsd('AI 字幕识别完成（属于其他视频，未在此画面显示）');
           }
-        } else if (p.state == AsrState.error) {
+        } else if (p.state == AsrState.error && forThisVideo) {
           _showOsd(p.message ?? 'AI 语音识别失败');
         }
       });
@@ -327,6 +332,21 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     // （设置页与播放页是两条独立路由，不会自动互相刷新。）
     aiSubtitleEnabled.addListener(_onAiSubtitleSettingChanged);
     _initPlayer();
+  }
+
+  /// 同步当前播放视频自身的 AI 语音识别运行状态。
+  void _syncAiSubtitleRunningState() {
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    final task = AiTaskManager.instance.getTask(activeKey);
+    final running = task != null && task.isRunning;
+    if (_aiSubtitleRunning != running) {
+      setState(() => _aiSubtitleRunning = running);
+    }
+  }
+
+  void _onAiTaskManagerUpdated() {
+    if (!mounted) return;
+    _syncAiSubtitleRunningState();
   }
 
   /// AI 字幕总开关变化：重建界面，让 AI 入口与叠层同步显隐。
@@ -338,6 +358,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   void dispose() {
     if (isDesktopPlatform) windowManager.removeListener(this);
     aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
+    AiTaskManager.instance.removeListener(_onAiTaskManagerUpdated);
     _asrProgressSub?.cancel();
     _aiRestoreDebounce?.cancel();
     _cancelAutoHide();
@@ -1150,6 +1171,52 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _dragType = null;
   }
 
+  void _handleHorizontalDragStart(DragStartDetails details) {
+    if (_duration <= Duration.zero) return;
+    _horizontalDragging = true;
+    _dragStartX = details.globalPosition.dx;
+    _seekDragStartPosition = _scrubbing ? _scrubPosition : _position;
+    _seekDragTargetPosition = _seekDragStartPosition;
+  }
+
+  void _handleHorizontalDragUpdate(DragUpdateDetails details) {
+    if (!_horizontalDragging || _duration <= Duration.zero) return;
+    final screenWidth = MediaQuery.of(context).size.width;
+    final deltaX = details.globalPosition.dx - _dragStartX;
+    // 滑动整屏宽度对应 90 秒快进/快退，手感适中细腻
+    final seekDeltaSeconds = (deltaX / screenWidth) * 90.0;
+    final deltaDuration =
+        Duration(milliseconds: (seekDeltaSeconds * 1000).round());
+    final target = _clampDuration(
+      _seekDragStartPosition + deltaDuration,
+      Duration.zero,
+      _duration,
+    );
+    _seekDragTargetPosition = target;
+
+    final diffSeconds = (target - _seekDragStartPosition).inSeconds;
+    final signStr = diffSeconds > 0 ? '+$diffSeconds' : '$diffSeconds';
+    final icon = diffSeconds >= 0
+        ? Icons.fast_forward_rounded
+        : Icons.fast_rewind_rounded;
+    final text =
+        '${_formatDuration(target)} / ${_formatDuration(_duration)} ($signStr秒)';
+
+    _showOsd(text, icon: icon);
+  }
+
+  Future<void> _handleHorizontalDragEnd(DragEndDetails details) async {
+    if (!_horizontalDragging) return;
+    _horizontalDragging = false;
+    final target = _seekDragTargetPosition;
+    await _player.seek(target);
+    _scheduleAutoHide();
+  }
+
+  void _handleHorizontalDragCancel() {
+    _horizontalDragging = false;
+  }
+
   // ------------------------------------------------------------ 播放进度（续播）
 
   /// 媒体加载完成后跳到上次的播放位置（每个播放源只做一次）。
@@ -1381,6 +1448,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         if (aiSubtitleEnabled.value && _aiSubtitleActive)
           SubtitleOverlay(
             generator: SubtitleGenerator.instance,
+            videoPath: _streamServer?.url ?? _sourcePath,
             position: currentPosition,
             visible: true,
             // 主字幕在下（贴近画面底部），副字幕抬到内置字幕上方，避免叠字
@@ -1467,6 +1535,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       onVerticalDragUpdate: !isDesktopPlatform ? _handleVerticalDragUpdate : null,
       onVerticalDragEnd: !isDesktopPlatform ? _handleVerticalDragEnd : null,
       onVerticalDragCancel: !isDesktopPlatform ? _handleVerticalDragCancel : null,
+      onHorizontalDragStart: !isDesktopPlatform ? _handleHorizontalDragStart : null,
+      onHorizontalDragUpdate: !isDesktopPlatform ? _handleHorizontalDragUpdate : null,
+      onHorizontalDragEnd: !isDesktopPlatform ? _handleHorizontalDragEnd : null,
+      onHorizontalDragCancel: !isDesktopPlatform ? _handleHorizontalDragCancel : null,
       child: isDesktopPlatform
           ? Focus(
               focusNode: _keyboardFocus,
@@ -1835,20 +1907,6 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   Future<void> _showAiSubtitleSheet() async {
     setState(() => _controlsVisible = true);
 
-    // 全局同一时刻只跑一个识别任务：别的视频正在识别时，本视频的面板打开也没用
-    // （点开始会被拒），所以直接挡一层蒙版说明原因，避免用户在里面白折腾。
-    final activeKey = _streamServer?.url ?? _sourcePath;
-    final busy = AiTaskManager.instance.activeTasks
-        .where((t) => t.videoPath != activeKey)
-        .toList();
-    if (busy.isNotEmpty) {
-      final cancelled = await _showOtherVideoBusyDialog(busy.first);
-      if (!mounted) return;
-      // 用户选择取消那个任务：回到正常流程，直接打开本视频的面板
-      if (cancelled) await _showAiSubtitleSheet();
-      return;
-    }
-
     await AiSubtitleSheet.show(
       context: context,
       // 提取音频要用能读的地址（PFLX 走本地流）
@@ -1864,57 +1922,6 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         _player.seek(position);
       },
     );
-  }
-
-  /// 其他视频正在识别时的提示。返回 true 表示用户选择"取消那个任务"。
-  Future<bool> _showOtherVideoBusyDialog(AiTask other) async {
-    final percent = other.percent > 0
-        ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%'
-        : null;
-    final result = await showDialog<bool>(
-      context: context,
-      // 半透明蒙版：明确表示"这个面板现在打不开"，而不是让用户以为按钮坏了
-      barrierColor: Colors.black.withValues(alpha: .62),
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF202027),
-        icon: const Icon(Icons.hourglass_top_rounded, size: 34),
-        title: const Text('正在识别其他视频', style: TextStyle(fontSize: 16)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '「${other.videoTitle}」的字幕识别还没结束'
-              '${percent != null ? '（$percent）' : ''}。',
-              style: const TextStyle(fontSize: 13, height: 1.5),
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              '同一时间只能识别一个视频：等它完成，或先取消那个任务，再来识别本视频。',
-              style: TextStyle(
-                fontSize: 12.5,
-                height: 1.6,
-                color: Colors.white60,
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('知道了'),
-          ),
-          FilledButton(
-            onPressed: () {
-              AiTaskManager.instance.cancelTask(other.videoPath);
-              Navigator.of(ctx).pop(true);
-            },
-            child: const Text('取消那个任务'),
-          ),
-        ],
-      ),
-    );
-    return result ?? false;
   }
 }
 
@@ -2810,6 +2817,7 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
     final percentText = task.percent > 0
         ? ' ${(task.percent * 100).toStringAsFixed(0)}%'
         : '';
+    final actionName = task.state == AsrState.preparing ? '正在提取音频' : 'AI 识别中';
 
     return Material(
       color: Colors.transparent,
@@ -2819,7 +2827,7 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
           decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: .62),
+            color: Colors.black.withValues(alpha: .68),
             borderRadius: BorderRadius.circular(20),
             border: Border.all(color: scheme.primary.withValues(alpha: .55)),
           ),
@@ -2836,7 +2844,7 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
               ),
               const SizedBox(width: 8),
               Text(
-                'AI 识别中$percentText · 已用 ${AiTask.formatDuration(task.elapsed)}',
+                '$actionName$percentText · 已用 ${AiTask.formatDuration(task.elapsed)}',
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 12,

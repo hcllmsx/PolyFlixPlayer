@@ -7,6 +7,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import 'ai_task_manager.dart';
+import '../main.dart';
 import '../settings/app_settings.dart';
 import '../utils/app_toast.dart';
 import 'device_capability.dart';
@@ -103,6 +104,24 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   AsrState _currentState = AsrState.idle;
   Set<String> _cachedModels = {};
 
+  /// 本地面板自身维护的当前视频字幕缓存列表，防止被后台其他视频的识别任务污染。
+  List<SubtitleEntry> _localEntries = [];
+
+  /// 获取当前面板应展示的字幕条目列表（严格限定当前视频）。
+  List<SubtitleEntry> get _currentDisplayEntries {
+    final task = AiTaskManager.instance.getTask(widget.videoPath);
+    if (task != null && task.isRunning) {
+      return task.entries;
+    }
+    if (_localEntries.isNotEmpty) {
+      return _localEntries;
+    }
+    if (_generator.holdsEntriesFor(widget.videoPath)) {
+      return _generator.entries;
+    }
+    return const <SubtitleEntry>[];
+  }
+
   /// 设备能力检测结果；为 null 表示还在检测中。
   ///
   /// 明确不做降级兼容：不满足最低要求（内存 / 核数）的设备直接提示"不支持"，
@@ -143,17 +162,22 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _selectedLanguage = runningTask.language;
       _currentState = runningTask.state;
       _statusMessage = runningTask.statusMessage;
-    } else if (_generator.entries.isEmpty) {
+    } else {
       // 尝试自动读取当前视频的本地字幕缓存（按模型精准匹配）
       AiTaskManager.instance
           .loadCachedSubtitles(_cacheKey, modelId: _selectedModel)
           .then((cached) {
             if (mounted && cached != null && cached.isNotEmpty) {
-              _generator.setEntries(cached, videoPath: widget.videoPath);
               setState(() {
+                _localEntries = cached;
                 _currentState = AsrState.completed;
                 _statusMessage = '已载入历史字幕缓存 (共 ${cached.length} 条)';
               });
+              _generator.setEntries(
+                cached,
+                videoPath: widget.videoPath,
+                markCompleted: true,
+              );
             }
           });
     }
@@ -162,6 +186,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     _progressSub = _generator.progressStream.listen((p) {
       if (!mounted) return;
+      // 串台拦截：只有当生成器当前确属本视频时才同步单例进度
+      if (_generator.entriesVideoPath != null &&
+          _generator.entriesVideoPath != widget.videoPath) {
+        return;
+      }
       setState(() {
         _currentState = p.state;
         _statusMessage = p.message;
@@ -185,6 +214,18 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         });
   }
 
+  /// 获取当前正在后台运行且非本视频的识别任务。
+  AiTask? get _otherRunningTask {
+    final activeKey = widget.videoPath;
+    final cacheKey = _cacheKey;
+    for (final task in AiTaskManager.instance.activeTasks) {
+      if (task.videoPath != activeKey && task.videoPath != cacheKey) {
+        return task;
+      }
+    }
+    return null;
+  }
+
   void _onTaskManagerChanged() {
     if (!mounted) return;
     final task = AiTaskManager.instance.getTask(widget.videoPath);
@@ -200,6 +241,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       if (task.state == AsrState.completed) {
         _checkModels();
       }
+    } else {
+      // 其它视频任务状态变化（例如进度、完成或被取消）时，触发重绘更新通知横幅与操作按钮
+      setState(() {});
     }
   }
 
@@ -275,19 +319,27 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       modelId: id,
     );
     if (mounted && cached != null && cached.isNotEmpty) {
-      _generator.setEntries(cached, videoPath: widget.videoPath);
       setState(() {
+        _localEntries = cached;
         _currentState = AsrState.completed;
         _statusMessage =
             '已切换并载入 ${id.toUpperCase()} 模型历史缓存 (共 ${cached.length} 条)';
       });
+      _generator.setEntries(
+        cached,
+        videoPath: widget.videoPath,
+        markCompleted: true,
+      );
     } else {
-      _generator.clear();
       setState(() {
+        _localEntries = [];
         _currentState = AsrState.idle;
         _statusMessage = null;
         _previewExpanded = false;
       });
+      if (_generator.holdsEntriesFor(widget.videoPath)) {
+        _generator.clear();
+      }
     }
   }
 
@@ -391,7 +443,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     );
 
     // 2. 清空内存字幕
-    _generator.clear();
+    _localEntries.clear();
+    if (_generator.holdsEntriesFor(widget.videoPath)) {
+      _generator.clear();
+    }
 
     // 3. 刷新状态并恢复识别按钮可点击
     if (mounted) {
@@ -407,7 +462,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Future<void> _exportSrtFile() async {
-    final entries = _generator.entries;
+    final entries = _currentDisplayEntries;
     if (entries.isEmpty) return;
 
     try {
@@ -463,8 +518,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final isRunning = _generator.isRunning;
-    final entries = _generator.entries;
+    final currentTask = AiTaskManager.instance.getTask(widget.videoPath);
+    final isRunning = currentTask != null && currentTask.isRunning;
+    final entries = _currentDisplayEntries;
 
     return Container(
       constraints: BoxConstraints(
@@ -514,27 +570,14 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'AI 语音识别字幕',
-                          style: TextStyle(
-                            fontSize: 17,
-                            fontWeight: FontWeight.w600,
-                            color: Colors.white,
-                          ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '本地离线 Whisper 原声识别，忠实还原原音频字幕',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.white.withValues(alpha: .5),
-                          ),
-                        ),
-                      ],
+                  const Expanded(
+                    child: Text(
+                      'AI 语音识别字幕',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
                     ),
                   ),
                   IconButton(
@@ -556,6 +599,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                 padding: const EdgeInsets.all(20),
                 shrinkWrap: true,
                 children: [
+                  if (_otherRunningTask != null)
+                    _buildOtherTaskNotice(_otherRunningTask!),
                   // 1. 状态看板
                   _buildStatusCard(theme, isRunning, entries.length),
                   const SizedBox(height: 6),
@@ -647,8 +692,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     String text = '就绪，点击下方开始识别原音频';
 
     if (isRunning) {
-      bg = theme.colorScheme.primary.withValues(alpha: .12);
-      accent = theme.colorScheme.primary;
+      bg = PolyFlixColors.violet.withValues(alpha: .15);
+      accent = const Color(0xFF9D91FF);
       icon = Icons.graphic_eq_rounded;
       text = task?.statusMessage ?? _statusMessage ?? '正在处理音频...';
     } else if (_currentState == AsrState.completed) {
@@ -661,6 +706,11 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       accent = Colors.redAccent;
       icon = Icons.error_outline_rounded;
       text = _statusMessage ?? '识别发生错误';
+    } else if (_otherRunningTask != null) {
+      bg = const Color(0xFF262630);
+      accent = Colors.amber.shade300;
+      icon = Icons.hourglass_top_rounded;
+      text = '其他视频正在识别，当前视频已暂停新识别';
     }
 
     return Container(
@@ -1111,6 +1161,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     final hasCache = _cachedModels.contains(_selectedModel);
     final unsupported =
         _deviceCaps != null && !_deviceCaps!.meetsMinimumRequirements;
+    final otherRunning = _otherRunningTask;
+    final isOtherBusyAction =
+        !hasCache && !unsupported && hasModel && otherRunning != null;
 
     return Row(
       children: [
@@ -1119,10 +1172,17 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             style: FilledButton.styleFrom(
               backgroundColor: hasCache
                   ? Colors.white12
-                  : theme.colorScheme.primary,
-              foregroundColor: hasCache ? Colors.white38 : Colors.white,
+                  : (isOtherBusyAction
+                        ? const Color(0xFF382E1E)
+                        : PolyFlixColors.violet),
+              foregroundColor: hasCache
+                  ? Colors.white38
+                  : (isOtherBusyAction ? Colors.amberAccent : Colors.white),
               disabledBackgroundColor: Colors.white10,
               disabledForegroundColor: Colors.white30,
+              side: isOtherBusyAction
+                  ? const BorderSide(color: Color(0xFF6B582E), width: 1)
+                  : null,
               padding: const EdgeInsets.symmetric(vertical: 14),
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(12),
@@ -1133,29 +1193,243 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                   ? Icons.block_rounded
                   : (hasCache
                         ? Icons.check_circle_outline_rounded
-                        : Icons.mic_none_rounded),
+                        : (isOtherBusyAction
+                              ? Icons.hourglass_top_rounded
+                              : Icons.mic_none_rounded)),
               size: 20,
-              color: hasCache ? Colors.white38 : Colors.white,
+              color: hasCache
+                  ? Colors.white38
+                  : (isOtherBusyAction ? Colors.amberAccent : Colors.white),
             ),
             label: Text(
               unsupported
                   ? '当前设备不支持此功能'
                   : (hasModel
-                        ? (hasCache ? '已有字幕缓存' : '开始识别原音频')
+                        ? (hasCache
+                              ? '已有字幕缓存'
+                              : (isOtherBusyAction
+                                    ? '其他视频识别中 (点击处理)'
+                                    : '开始识别原音频'))
                         : '未就绪 (缺少模型)'),
               style: TextStyle(
                 fontSize: 15,
                 fontWeight: FontWeight.w600,
-                color: hasCache ? Colors.white38 : Colors.white,
+                color: hasCache
+                    ? Colors.white38
+                    : (isOtherBusyAction ? Colors.amberAccent : Colors.white),
               ),
             ),
-            onPressed: (!unsupported && hasModel && !hasCache)
-                ? _startTranscribing
-                : null,
+            onPressed: unsupported
+                ? null
+                : (!hasModel
+                      ? null
+                      : (hasCache
+                            ? null
+                            : (isOtherBusyAction
+                                  ? () => _handleStartWithOtherBusy(otherRunning)
+                                  : _startTranscribing))),
           ),
         ),
       ],
     );
+  }
+
+  /// 顶部醒目提示：后台有其他视频正在进行识别任务。
+  Widget _buildOtherTaskNotice(AiTask other) {
+    final percent = other.percent > 0
+        ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%'
+        : null;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 14),
+      padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+      decoration: BoxDecoration(
+        color: Colors.amber.withValues(alpha: .12),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: Colors.amber.withValues(alpha: .35),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 1),
+            child: Icon(
+              Icons.hourglass_top_rounded,
+              size: 18,
+              color: Colors.amberAccent,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '「${other.videoTitle}」正在识别中${percent != null ? '（$percent）' : ''}',
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '后台已有识别任务。您仍可自由切换和查看本视频已有的字幕缓存；同一时间只支持一个视频识别。',
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.45,
+                    color: Colors.white70,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.amberAccent,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            onPressed: () => _confirmCancelOtherTask(other),
+            child: const Text('取消任务', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 确认取消其他视频正在执行的后台识别任务。
+  Future<void> _confirmCancelOtherTask(AiTask other) async {
+    final percent = other.percent > 0
+        ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%'
+        : null;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: .62),
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF202027),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text(
+          '取消识别任务？',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: Colors.white,
+          ),
+        ),
+        content: Text(
+          '当前正在后台识别「${other.videoTitle}」${percent != null ? '（$percent）' : ''}，'
+          '取消后该任务将中断。\n\n确认取消该任务吗？',
+          style: const TextStyle(
+            fontSize: 13,
+            height: 1.5,
+            color: Colors.white70,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('暂不取消', style: TextStyle(color: Colors.white60)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.redAccent.shade700,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('取消任务'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      AiTaskManager.instance.cancelTask(other.videoPath);
+      AppToast.show(context, '已取消「${other.videoTitle}」的识别任务');
+      setState(() {});
+    }
+  }
+
+  /// 点击"其他视频识别中"按钮时的处理逻辑。
+  Future<void> _handleStartWithOtherBusy(AiTask other) async {
+    final percent = other.percent > 0
+        ? '已完成 ${(other.percent * 100).toStringAsFixed(0)}%'
+        : null;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: .62),
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF202027),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        icon: const Icon(
+          Icons.hourglass_top_rounded,
+          size: 34,
+          color: Colors.amberAccent,
+        ),
+        title: const Text(
+          '当前有其他视频正在识别',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: Colors.white,
+          ),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '「${other.videoTitle}」的字幕识别还没结束'
+              '${percent != null ? '（$percent）' : ''}。',
+              style: const TextStyle(
+                fontSize: 13,
+                height: 1.5,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              '同一时间只能识别一个视频。\n是否取消该任务，并立即开始当前视频的识别？',
+              style: TextStyle(
+                fontSize: 12.5,
+                height: 1.6,
+                color: Colors.white70,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text(
+              '暂不识别',
+              style: TextStyle(color: Colors.white60),
+            ),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: PolyFlixColors.violet,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text(
+              '取消并开始当前识别',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      AiTaskManager.instance.cancelTask(other.videoPath);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      if (!mounted) return;
+      _startTranscribing();
+    }
   }
 
   String _formatDuration(Duration d) {

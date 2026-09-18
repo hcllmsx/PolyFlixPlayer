@@ -23,7 +23,7 @@ class WhisperModelInfo {
     required this.sizeBytes,
     required this.tier,
     required this.summary,
-    this.cpuHint,
+    this.detailHint,
     this.isEnglishOnly = false,
     this.isQuantized = false,
     this.legacy = false,
@@ -44,11 +44,11 @@ class WhisperModelInfo {
   /// 档位文案：极速 / 平衡 / 精确 / 高精度 / 旗舰。
   final String tier;
 
-  /// 一句话说明：这个模型适合什么场景、有什么取舍。
+  /// 第一行简要说明：核心特征定位。
   final String summary;
 
-  /// 纯 CPU 识别 1 小时视频的大致耗时（参考值）。
-  final String? cpuHint;
+  /// 第二行弱化说明：适用场景或推荐建议（如「低配机器、或只想快速看个大概时用」）。
+  final String? detailHint;
 
   /// 英文专用模型（`.en`）：只能识别英语，英语准确率略高、速度略快。
   final bool isEnglishOnly;
@@ -77,7 +77,7 @@ WhisperModelInfo _model(
   double sizeMiB,
   String tier,
   String summary, {
-  String? cpuHint,
+  String? detailHint,
   bool legacy = false,
 }) {
   final englishOnly = id.contains('.en');
@@ -110,7 +110,7 @@ WhisperModelInfo _model(
     sizeBytes: (sizeMiB * 1024 * 1024).round(),
     tier: tier,
     summary: summary,
-    cpuHint: cpuHint,
+    detailHint: detailHint,
     isEnglishOnly: englishOnly,
     isQuantized: quant != null,
     legacy: legacy,
@@ -126,59 +126,76 @@ WhisperModelInfo _model(
 ///  - **Large v3 Turbo**：精度接近 large，速度快得多，配合 GPU 引擎包性价比最高。
 ///
 /// 体积取自官方文件真实大小（MiB）；导入时按体积做容差比对。
-/// CPU 耗时是纯 CPU 识别 1 小时视频的大致参考（12 线程实测，实际取决于机器）。
 final List<WhisperModelInfo> availableModels = [
   // ---------------- 多语言 ----------------
-  _model('tiny', 74.1, '极速', '最快的一档，精度最低；低配机器、或只想快速看个大概时用',
-      cpuHint: '约 1 分钟'),
-  _model('tiny-q5_1', 30.7, '极速', 'tiny 的量化版：体积不到一半、速度略快，精度再降一点',
-      cpuHint: '约 1 分钟'),
-  _model('tiny-q8_0', 41.5, '极速', 'tiny 的轻量化版，比 q5 稍准、稍大', cpuHint: '约 1 分钟'),
-  _model('base', 141.1, '平衡', '入门档：比 tiny 明显准确，速度依然很快', cpuHint: '约 2 分钟'),
-  _model('base-q5_1', 56.9, '平衡', 'base 的量化版，体积小、速度快', cpuHint: '约 1.5 分钟'),
-  _model('base-q8_0', 78.0, '平衡', 'base 的轻量化版，精度损失比 q5 小', cpuHint: '约 1.5 分钟'),
-  _model('small', 465.0, '精确', '日常首选：精度与速度的平衡点，中文识别够用',
-      cpuHint: '约 4~5 分钟'),
-  _model('small-q5_1', 181.3, '精确', 'small 的量化版：体积不到四成，省空间的首选',
-      cpuHint: '约 3~4 分钟'),
-  _model('small-q8_0', 252.2, '精确', 'small 的轻量化版，精度损失比 q5 小', cpuHint: '约 3~4 分钟'),
-  _model('medium', 1462.7, '高精度', '精度明显提升，口音与专业词汇更稳；CPU 上耗时明显变长',
-      cpuHint: '约 13 分钟'),
-  _model('medium-q5_0', 514.2, '高精度', 'medium 的量化版，体积接近 small', cpuHint: '约 9 分钟'),
-  _model('medium-q8_0', 785.2, '高精度', 'medium 的轻量化版', cpuHint: '约 11 分钟'),
-  _model('large-v3-turbo', 1549.3, '旗舰·快速', '精度接近 large-v3 但快数倍；有 GPU 时的首选',
-      cpuHint: '约 6~8 分钟'),
-  _model('large-v3-turbo-q5_0', 547.4, '旗舰·快速',
-      '综合推荐：体积小、速度快，大模型里性价比最高', cpuHint: '约 5 分钟'),
-  _model('large-v3-turbo-q8_0', 833.7, '旗舰·快速', 'turbo 的轻量化版，精度损失更小',
-      cpuHint: '约 6 分钟'),
-  _model('large-v3', 2951.7, '旗舰', '官方最强多语言精度；纯 CPU 上很慢，建议配合 CUDA 引擎包',
-      cpuHint: '约 30 分钟'),
+  _model('tiny', 74.1, '极速', '最快的一档，精度最低',
+      detailHint: '低配机器、或只想快速看个大概时用'),
+  _model('tiny-q5_1', 30.7, '极速', 'tiny 的量化版，体积不到一半',
+      detailHint: '极致节省存储空间，精度再降一点'),
+  _model('tiny-q8_0', 41.5, '极速', 'tiny 的轻量化版',
+      detailHint: '比 q5 稍准、体积适中'),
+  _model('base', 141.1, '平衡', '入门档，比 tiny 明显准确',
+      detailHint: '手机端速度极快、日常对话推荐'),
+  _model('base-q5_1', 56.9, '平衡', 'base 的量化版，体积小、速度快',
+      detailHint: '手机端低存储空间推荐'),
+  _model('base-q8_0', 78.0, '平衡', 'base 的轻量化版',
+      detailHint: '精度损失比 q5 小，平衡之选'),
+  _model('small', 465.0, '精确', '日常推荐档，精度与速度平衡',
+      detailHint: '中文识别质量良好，通用性高'),
+  _model('small-q5_1', 181.3, '精确', 'small 的量化版，体积不到四成',
+      detailHint: '追求较高精度且省空间的首选'),
+  _model('small-q8_0', 252.2, '精确', 'small 的轻量化版',
+      detailHint: '精度损失比 q5 小，近无损紧凑版'),
+  _model('medium', 1462.7, '高精度', '高精度档，口音与专业词汇更稳',
+      detailHint: '计算量大，建议 PC 端或高性能设备使用'),
+  _model('medium-q5_0', 514.2, '高精度', 'medium 的量化版，体积接近 small',
+      detailHint: '中等体积下获得高精度体验'),
+  _model('medium-q8_0', 785.2, '高精度', 'medium 的轻量化版',
+      detailHint: '高精度微损压缩版，适合 PC 端日常'),
+  _model('large-v3-turbo', 1549.3, '旗舰·快速', '精度接近 large-v3 但快数倍',
+      detailHint: 'Windows 桌面端或有 GPU 时的首选'),
+  _model('large-v3-turbo-q5_0', 547.4, '旗舰·快速', '大模型综合推荐，性价比极高',
+      detailHint: '体积仅 547MB，兼备极高精度与快速推理'),
+  _model('large-v3-turbo-q8_0', 833.7, '旗舰·快速', 'turbo 的轻量化版',
+      detailHint: '接近无损精度的旗舰级快速模型'),
+  _model('large-v3', 2951.7, '旗舰', '官方最强多语言精度',
+      detailHint: '体积大且计算量大，建议配合 PC 端引擎包'),
   _model('large-v3-q5_0', 1031.1, '旗舰', 'large-v3 的量化版，体积约三分之一',
-      cpuHint: '约 20 分钟'),
-  _model('large-v2', 2951.3, '旗舰', '上一代 large，精度与 v3 接近，某些素材上更稳',
-      cpuHint: '约 30 分钟'),
-  _model('large-v2-q5_0', 1030.7, '旗舰', 'large-v2 的量化版', cpuHint: '约 20 分钟'),
-  _model('large-v2-q8_0', 1579.4, '旗舰', 'large-v2 的轻量化版', cpuHint: '约 24 分钟'),
-  _model('large-v1', 2951.3, '旗舰·旧版', '初代 large，已过时；仅作兼容，不推荐新用户使用',
-      cpuHint: '约 30 分钟', legacy: true),
+      detailHint: '适合想要最强模型但磁盘空间有限的用户'),
+  _model('large-v2', 2951.3, '旗舰', '上一代 large，某些特定素材上更稳',
+      detailHint: '经典旗舰模型，计算量较大'),
+  _model('large-v2-q5_0', 1030.7, '旗舰', 'large-v2 的量化版',
+      detailHint: '经典旗舰大模型的紧凑版本'),
+  _model('large-v2-q8_0', 1579.4, '旗舰', 'large-v2 的轻量化版',
+      detailHint: '经典旗舰大模型的近无损压缩版'),
+  _model('large-v1', 2951.3, '旗舰·旧版', '初代 large，已过时',
+      detailHint: '仅作历史兼容，不推荐新用户使用', legacy: true),
 
   // ---------------- 英语专用（.en：只识别英语，同档位更快更准） ----------------
-  _model('tiny.en', 74.1, '极速', '仅英语：同档位下更快更准；别拿去识别其它语言',
-      cpuHint: '约 1 分钟'),
-  _model('tiny.en-q5_1', 30.7, '极速', '仅英语，tiny.en 的量化版', cpuHint: '约 1 分钟'),
-  _model('tiny.en-q8_0', 41.5, '极速', '仅英语，tiny.en 的轻量化版', cpuHint: '约 1 分钟'),
-  _model('base.en', 141.1, '平衡', '仅英语：比 tiny.en 明显准确', cpuHint: '约 2 分钟'),
-  _model('base.en-q5_1', 57.0, '平衡', '仅英语，base.en 的量化版', cpuHint: '约 1.5 分钟'),
-  _model('base.en-q8_0', 78.0, '平衡', '仅英语，base.en 的轻量化版', cpuHint: '约 1.5 分钟'),
-  _model('small.en', 465.0, '精确', '仅英语：英语场景下精度与速度兼顾的首选',
-      cpuHint: '约 4~5 分钟'),
-  _model('small.en-q5_1', 181.3, '精确', '仅英语，small.en 的量化版', cpuHint: '约 3~4 分钟'),
-  _model('small.en-q8_0', 252.2, '精确', '仅英语，small.en 的轻量化版', cpuHint: '约 3~4 分钟'),
-  _model('medium.en', 1462.7, '高精度', '仅英语：英语精度很高，CPU 上耗时不短',
-      cpuHint: '约 13 分钟'),
-  _model('medium.en-q5_0', 514.2, '高精度', '仅英语，medium.en 的量化版', cpuHint: '约 9 分钟'),
-  _model('medium.en-q8_0', 785.2, '高精度', '仅英语，medium.en 的轻量化版', cpuHint: '约 11 分钟'),
+  _model('tiny.en', 74.1, '极速', '仅英语：同档位下更快更准',
+      detailHint: '只识别英语，别用于其它语言'),
+  _model('tiny.en-q5_1', 30.7, '极速', '仅英语，tiny.en 的量化版',
+      detailHint: '超轻量纯英文快速浏览'),
+  _model('tiny.en-q8_0', 41.5, '极速', '仅英语，tiny.en 的轻量化版',
+      detailHint: '超轻量纯英文基础识别'),
+  _model('base.en', 141.1, '平衡', '仅英语：比 tiny.en 明显准确',
+      detailHint: '英文视频生肉快速识别入门之选'),
+  _model('base.en-q5_1', 57.0, '平衡', '仅英语，base.en 的量化版',
+      detailHint: '轻量快速，适合手机看生肉视频'),
+  _model('base.en-q8_0', 78.0, '平衡', '仅英语，base.en 的轻量化版',
+      detailHint: '兼顾小体积与良好的英文准确率'),
+  _model('small.en', 465.0, '精确', '仅英语：英语场景速度与精度兼备',
+      detailHint: '看英文原声影视、公开课推荐首选'),
+  _model('small.en-q5_1', 181.3, '精确', '仅英语，small.en 的量化版',
+      detailHint: '英文原声影视省空间推荐'),
+  _model('small.en-q8_0', 252.2, '精确', '仅英语，small.en 的轻量化版',
+      detailHint: '英文原声影视近无损高质量压缩'),
+  _model('medium.en', 1462.7, '高精度', '仅英语：英语识别精度极高',
+      detailHint: '英语连读与杂音背景推荐，建议 PC 使用'),
+  _model('medium.en-q5_0', 514.2, '高精度', '仅英语，medium.en 的量化版',
+      detailHint: '高精度英文紧凑版本'),
+  _model('medium.en-q8_0', 785.2, '高精度', '仅英语，medium.en 的轻量化版',
+      detailHint: '高精度英文近无损版本'),
 ];
 
 /// 多语言模型（按体积升序）。

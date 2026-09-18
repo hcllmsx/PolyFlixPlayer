@@ -430,6 +430,8 @@ class AiTaskManager extends ChangeNotifier {
 
       if (task.isCancelled) {
         task.updateState(AsrState.idle, message: '任务已取消');
+      } else if (task.state == AsrState.error) {
+        // 内部已置为错误，保持错误状态，避免被识别完成覆盖
       } else {
         task.updateState(
           AsrState.completed,
@@ -445,10 +447,11 @@ class AiTaskManager extends ChangeNotifier {
         );
       }
     } catch (e) {
+      final errorMsg = e is StateError ? e.message : e.toString();
       task.updateState(
         AsrState.error,
-        errorMessage: e.toString(),
-        message: '识别失败: $e',
+        errorMessage: errorMsg,
+        message: '识别失败: $errorMsg',
       );
     } finally {
       notifyListeners();

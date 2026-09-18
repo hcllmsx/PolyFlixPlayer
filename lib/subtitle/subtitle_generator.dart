@@ -20,6 +20,9 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:ffi/ffi.dart';
+import 'package:ffmpeg_kit_flutter_new_min/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_min/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_min/return_code.dart';
 
 import '../settings/app_settings.dart';
 import '../utils/native_file_helper.dart';
@@ -305,7 +308,17 @@ class SubtitleGenerator {
 
     // ---- 路径 2：内置插件（FFI / 纯 CPU） ----
     lastEngineLabel = '内置 CPU 引擎';
-    final dllName = Platform.isWindows ? 'whisper_ggml.dll' : 'libwhisper_ggml.so';
+    final String dllName;
+    if (Platform.isAndroid) {
+      dllName = 'libwhisper.so';
+    } else if (Platform.isWindows) {
+      dllName = 'whisper_ggml.dll';
+    } else if (Platform.isLinux) {
+      dllName = 'libwhisper_ggml.so';
+    } else {
+      dllName = '';
+    }
+
     final rawJson = await Isolate.run(() => _safeNativeTranscribe(
           dllName: dllName,
           modelPath: modelPath,
@@ -370,9 +383,21 @@ class SubtitleGenerator {
     required int threads,
   }) {
     DynamicLibrary lib;
-    try {
-      lib = DynamicLibrary.open(dllName);
-    } catch (_) {
+    if (dllName.isNotEmpty) {
+      try {
+        lib = DynamicLibrary.open(dllName);
+      } catch (_) {
+        if (Platform.isAndroid) {
+          try {
+            lib = DynamicLibrary.open('libwhisper_ggml.so');
+          } catch (_) {
+            lib = DynamicLibrary.process();
+          }
+        } else {
+          lib = DynamicLibrary.process();
+        }
+      }
+    } else {
       lib = DynamicLibrary.process();
     }
 
@@ -415,6 +440,11 @@ class SubtitleGenerator {
   /// 停止当前 ASR 任务。
   void cancel() {
     _cancelled = true;
+    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+      try {
+        FFmpegKit.cancel();
+      } catch (_) {}
+    }
     _updateState(AsrState.idle, message: '已取消');
   }
 
@@ -469,40 +499,62 @@ class SubtitleGenerator {
     bool Function()? isCancelled,
   }) async {
     _cancelled = false;
-    _entries.clear();
-    _entriesVideoPath = videoPath;
-    _updateState(AsrState.preparing, message: '正在准备模型…');
+    // 动态归属检测：只有当单例当前确属本次识别的视频时，才允许向单例写入条目或广播状态。
+    // 识别流程通常耗时数十秒至数分钟，期间用户随时会切换并播放另一个视频，
+    // 因此绝不能用初始布尔快照，必须在每个阶段实时求值。
+    bool isCurrentVideo() => _entriesVideoPath == videoPath;
+
+    if (_entriesVideoPath == null || isCurrentVideo()) {
+      _entries.clear();
+      _entriesVideoPath = videoPath;
+      _updateState(AsrState.preparing, message: '正在准备模型…');
+    }
     onProgress?.call(AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在准备模型…');
 
     final modelPath = await ModelManager.instance.getModelPath(modelId);
     if (modelPath == null) {
-      _updateState(AsrState.error, message: '模型未就绪');
+      if (isCurrentVideo()) {
+        _updateState(AsrState.error, message: '模型未就绪');
+      }
       onProgress?.call(AsrState.error, Duration.zero, Duration.zero, 0.0, '模型未就绪');
-      return [];
+      throw StateError('模型未就绪，请先导入或下载 Whisper 模型');
     }
 
     if (isCancelled?.call() == true || _cancelled) return [];
 
-    _updateState(AsrState.preparing, message: '正在提取音频…');
+    if (isCurrentVideo()) {
+      _updateState(AsrState.preparing, message: '正在提取音频…');
+    }
     onProgress?.call(
         AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在提取音频…');
     final wavPath = await _extractAudioToWav(
       videoPath,
+      isCancelled: isCancelled,
       onProgress: (fraction, processed, total) {
         final overall = fraction * _kExtractProgressShare;
         final msg = '正在提取音频… ${(fraction * 100).toStringAsFixed(0)}%';
-        _updateState(
-          AsrState.preparing,
-          percent: (overall * 100).toInt(),
-          message: msg,
-        );
+        if (isCurrentVideo()) {
+          _updateState(
+            AsrState.preparing,
+            percent: (overall * 100).toInt(),
+            message: msg,
+          );
+        }
         onProgress?.call(AsrState.preparing, processed, total, overall, msg);
       },
     );
     if (wavPath == null) {
-      _updateState(AsrState.error, message: '音频提取失败');
+      if (isCancelled?.call() == true || _cancelled) {
+        if (isCurrentVideo()) {
+          _updateState(AsrState.idle, message: '已取消');
+        }
+        return [];
+      }
+      if (isCurrentVideo()) {
+        _updateState(AsrState.error, message: '音频提取失败');
+      }
       onProgress?.call(AsrState.error, Duration.zero, Duration.zero, 0.0, '音频提取失败');
-      return [];
+      throw StateError('音频提取失败，请检查视频是否有有效音轨或格式');
     }
 
     final wavFile = File(wavPath);
@@ -515,11 +567,15 @@ class SubtitleGenerator {
 
     if (totalSeconds <= 0) {
       _cleanupTempFile(wavPath);
-      _updateState(AsrState.error, message: '音频数据为空');
-      return [];
+      if (isCurrentVideo()) {
+        _updateState(AsrState.error, message: '音频数据为空');
+      }
+      throw StateError('音频数据为空');
     }
 
-    _updateState(AsrState.processing, message: '开始分析音频并生成字幕…');
+    if (isCurrentVideo()) {
+      _updateState(AsrState.processing, message: '开始分析音频并生成字幕…');
+    }
     _isModelInUse = true;
 
     // 分析音频能量（静音区间与人声发音点），用于消除前导静音漂移和长句按停顿智能拆分
@@ -533,11 +589,13 @@ class SubtitleGenerator {
     // 这样短视频保留全局上下文与最准确的时间戳，不受切片边界干扰。
     if (totalSeconds <= 120) {
       final processingBase = _kExtractProgressShare;
-      _updateState(
-        AsrState.processing,
-        percent: (processingBase * 100).toInt(),
-        message: '正在分析完整音频…',
-      );
+      if (isCurrentVideo()) {
+        _updateState(
+          AsrState.processing,
+          percent: (processingBase * 100).toInt(),
+          message: '正在分析完整音频…',
+        );
+      }
       onProgress?.call(AsrState.processing, Duration.zero, totalDuration,
           processingBase, '正在分析完整音频…');
 
@@ -549,21 +607,28 @@ class SubtitleGenerator {
       );
 
       if (isCancelled?.call() == true || _cancelled) {
-        _updateState(AsrState.idle, message: '已取消');
+        if (isCurrentVideo()) {
+          _updateState(AsrState.idle, message: '已取消');
+        }
         onProgress?.call(AsrState.idle, Duration.zero, totalDuration, 0.0, '已取消');
         return [];
       }
 
       final normalized = normalizeEntries(rawEntries, energyProfile: energyProfile);
-      _entries.addAll(normalized);
+      if (isCurrentVideo()) {
+        _entries.clear();
+        _entries.addAll(normalized);
+      }
       onNewEntries?.call(normalized);
 
-      final finalMsg = _entries.isNotEmpty
-          ? '识别完成 (共 ${_entries.length} 条字幕)'
+      final finalMsg = normalized.isNotEmpty
+          ? '识别完成 (共 ${normalized.length} 条字幕)'
           : '未检测到有效语音';
-      _updateState(AsrState.completed, percent: 100, message: finalMsg);
+      if (isCurrentVideo()) {
+        _updateState(AsrState.completed, percent: 100, message: finalMsg);
+      }
       onProgress?.call(AsrState.completed, totalDuration, totalDuration, 1.0, finalMsg);
-      return List.unmodifiable(_entries);
+      return List.unmodifiable(normalized);
     }
 
     // 长视频（> 120 秒）：分片时长 60 秒（60 * 32000 = 1,920,000 字节）
@@ -580,7 +645,9 @@ class SubtitleGenerator {
       raf = await wavFile.open(mode: FileMode.read);
       for (int i = 0; i < chunkCount; i++) {
         if (isCancelled?.call() == true || _cancelled) {
-          _updateState(AsrState.idle, message: '已取消');
+          if (isCurrentVideo()) {
+            _updateState(AsrState.idle, message: '已取消');
+          }
           break;
         }
 
@@ -598,7 +665,9 @@ class SubtitleGenerator {
         );
         final progressMsg = '已识别 ${_formatDuration(Duration(seconds: currentProcessedSec))} / ${_formatDuration(totalDuration)} (${(percent * 100).toStringAsFixed(1)}%) · 片段 ${i + 1}/$chunkCount';
 
-        _updateState(AsrState.processing, percent: (percent * 100).toInt(), message: progressMsg);
+        if (isCurrentVideo()) {
+          _updateState(AsrState.processing, percent: (percent * 100).toInt(), message: progressMsg);
+        }
         onProgress?.call(AsrState.processing, Duration(seconds: currentProcessedSec), totalDuration, percent, progressMsg);
 
         // 读取 PCM 片段并构造 WAV 文件
@@ -634,7 +703,9 @@ class SubtitleGenerator {
         if (chunkEntries.isNotEmpty) {
           final normalizedChunk = normalizeEntries(chunkEntries);
           rawAccumulated.addAll(chunkEntries);
-          _entries.addAll(normalizedChunk);
+          if (isCurrentVideo()) {
+            _entries.addAll(normalizedChunk);
+          }
           onNewEntries?.call(normalizedChunk);
         }
       }
@@ -644,23 +715,30 @@ class SubtitleGenerator {
     }
 
     if (isCancelled?.call() == true || _cancelled) {
-      _updateState(AsrState.idle, message: '已取消');
+      if (isCurrentVideo()) {
+        _updateState(AsrState.idle, message: '已取消');
+      }
       onProgress?.call(AsrState.idle, Duration.zero, totalDuration, 0.0, '已取消');
       return [];
     }
 
     // 全量整体再次执行一次平滑校准，确保分段接缝处的时长自然过渡与静音校准
     final fullyNormalized = normalizeEntries(rawAccumulated, energyProfile: energyProfile);
-    _entries.clear();
-    _entries.addAll(fullyNormalized);
+    if (isCurrentVideo()) {
+      _entries.clear();
+      _entries.addAll(fullyNormalized);
+      final finalMsg = _entries.isNotEmpty
+          ? '识别完成 (共 ${_entries.length} 条字幕)'
+          : '未检测到有效语音';
+      _updateState(AsrState.completed, percent: 100, message: finalMsg);
+    }
 
-    final finalMsg = _entries.isNotEmpty
-        ? '识别完成 (共 ${_entries.length} 条字幕)'
+    final finalMsg = fullyNormalized.isNotEmpty
+        ? '识别完成 (共 ${fullyNormalized.length} 条字幕)'
         : '未检测到有效语音';
-    _updateState(AsrState.completed, percent: 100, message: finalMsg);
     onProgress?.call(AsrState.completed, totalDuration, totalDuration, 1.0, finalMsg);
 
-    return List.unmodifiable(_entries);
+    return List.unmodifiable(fullyNormalized);
   }
 
   /// 对字幕条目的显示区间进行智能优化：
@@ -808,19 +886,18 @@ class SubtitleGenerator {
       final wordCount =
           text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
 
+      // 基于字数计算自然朗读与阅读时长
       final baseEstimateMs = (cjkCount * 240 + wordCount * 320 + 600);
-      // 估算值只作为"没有能量信息时"的兜底；上限放宽到 9 秒，
-      // 因为字幕多停留一会儿的代价，远小于说话中突然留白。
-      final idealMaxDurationMs = baseEstimateMs.clamp(1500, 9000);
+      // 允许的最大停留上限：朗读完后预留合理的理解视线停留（最多 5.5 秒），
+      // 避免因背景音乐（BGM）或环境底噪持续触发能量阈值，导致字幕在说完后跨越长段留白一直不退场。
+      final maxHoldMs = (baseEstimateMs * 1.4).clamp(1800, 5500).toInt();
+      final idealMaxDurationMs = baseEstimateMs.clamp(1400, maxHoldMs);
 
-      // 最后一条没有下一条可比，就用它自己的原始结束时间作为边界；
-      // 这里如果沿用"朗读时长估算"，会把按真实发声算出来的结束时间又压回去。
+      // 下一段台词的起始时间点（若为末句则以自身结尾为边界）
       final nextStartMs = (i + 1 < preprocessed.length)
           ? preprocessed[i + 1].start.inMilliseconds
           : cur.end.inMilliseconds;
 
-      // 结束时间优先以"真实发声结束"为准（能量剖面），这样长句不会因为
-      // 词数估算偏短而在还在说话时就消失；拿不到能量信息时才退回估算。
       final speechEndMs = energyProfile?.findLastSpeechEnd(
             cur.start.inMilliseconds,
             cur.end.inMilliseconds,
@@ -829,9 +906,12 @@ class SubtitleGenerator {
 
       int actualEndMs;
       if (speechEndMs > 0) {
-        actualEndMs = max(speechEndMs + 400, cur.start.inMilliseconds + 1200);
-        // 不能超出原始分段结束（那之后通常已是下一句的地盘）
+        // 说话结束后留出 350ms 的自然停顿与视线缓冲
+        actualEndMs = max(speechEndMs + 350, cur.start.inMilliseconds + 1000);
+        // 不能超出原始分段边界
         actualEndMs = min(actualEndMs, cur.end.inMilliseconds);
+        // 关键防御：不能超过字数所对应的最大合理停留时长，确保台词说完后能正常进入留白
+        actualEndMs = min(actualEndMs, cur.start.inMilliseconds + maxHoldMs);
       } else {
         actualEndMs = min(
           cur.end.inMilliseconds,
@@ -839,16 +919,17 @@ class SubtitleGenerator {
         );
       }
 
-      if (actualEndMs > nextStartMs) {
-        actualEndMs = nextStartMs > cur.start.inMilliseconds
-            ? nextStartMs
+      // 不能侵占下一句的开始时间（并在两句之间至少留出 80ms 视觉换句呼吸期）
+      if (actualEndMs > nextStartMs - 80) {
+        actualEndMs = nextStartMs > cur.start.inMilliseconds + 1000
+            ? nextStartMs - 80
             : cur.start.inMilliseconds + 1000;
       }
 
-      // 模型偶给出极短的时间戳时，字幕会一闪而过；在不侵占下一条的前提下补足可读停留
+      // 模型偶给出极短的时间戳时，字幕会一闪而过；在不侵占下一条的前提下补足最低可读停留
       if (actualEndMs - cur.start.inMilliseconds < 1200 &&
           nextStartMs - cur.start.inMilliseconds >= 1600) {
-        actualEndMs = cur.start.inMilliseconds + 1400;
+        actualEndMs = cur.start.inMilliseconds + 1300;
       }
 
       result.add(SubtitleEntry(
@@ -1045,12 +1126,13 @@ class SubtitleGenerator {
 
   /// 从视频文件中提取音频为 16kHz mono WAV。
   ///
-  /// 使用系统 FFmpeg（Windows PATH 上需有 ffmpeg.exe）。
+  /// Android / iOS / macOS 上使用内置原生 FFmpegKit，Windows 上使用系统 FFmpeg。
   /// 返回临时 WAV 文件路径，调用方负责清理。
   Future<String?> _extractAudioToWav(
     String videoPath, {
     void Function(double fraction, Duration processed, Duration total)?
         onProgress,
+    bool Function()? isCancelled,
   }) async {
     try {
       final audioDir = NativeFileHelper.desktopCacheAudioDir();
@@ -1072,6 +1154,19 @@ class SubtitleGenerator {
       final totalSeconds = await _probeDurationSeconds(videoPath);
       final totalDuration =
           totalSeconds > 0 ? Duration(seconds: totalSeconds.round()) : Duration.zero;
+
+      if (isCancelled?.call() == true || _cancelled) return null;
+
+      if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+        return await _extractAudioWithFFmpegKit(
+          videoPath: videoPath,
+          wavPath: wavPath,
+          totalSeconds: totalSeconds,
+          totalDuration: totalDuration,
+          onProgress: onProgress,
+          isCancelled: isCancelled,
+        );
+      }
 
       final ffmpegCmd = Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg';
       final process = await Process.start(
@@ -1103,6 +1198,10 @@ class SubtitleGenerator {
           .transform(const LineSplitter())
           .listen(
         (line) {
+          if (isCancelled?.call() == true || _cancelled) {
+            process.kill();
+            return;
+          }
           if (totalSeconds <= 0) return;
           final match = RegExp(r'^out_time_us=(\d+)').firstMatch(line.trim());
           if (match == null) return;
@@ -1142,10 +1241,102 @@ class SubtitleGenerator {
     }
   }
 
-  /// 用 ffprobe 读取媒体总时长（秒）；失败返回 0。
+  /// 使用 FFmpegKit 提取音频（适用于 Android / iOS / macOS 原生集成环境）
+  Future<String?> _extractAudioWithFFmpegKit({
+    required String videoPath,
+    required String wavPath,
+    required double totalSeconds,
+    required Duration totalDuration,
+    void Function(double fraction, Duration processed, Duration total)?
+        onProgress,
+    bool Function()? isCancelled,
+  }) async {
+    try {
+      final arguments = [
+        '-y',
+        '-i', videoPath,
+        '-map', '0:a:0?',
+        '-vn', '-sn', '-dn',
+        '-acodec', 'pcm_s16le',
+        '-ar', '16000',
+        '-ac', '1',
+        wavPath,
+      ];
+
+      var lastReportedPercent = -1;
+      final completer = Completer<bool>();
+      int? currentSessionId;
+
+      final session = await FFmpegKit.executeWithArgumentsAsync(
+        arguments,
+        (completedSession) async {
+          final returnCode = await completedSession.getReturnCode();
+          if (!completer.isCompleted) {
+            completer.complete(ReturnCode.isSuccess(returnCode));
+          }
+        },
+        (log) {
+          // 日志回调
+        },
+        (statistics) {
+          if (isCancelled?.call() == true || _cancelled) {
+            if (currentSessionId != null) {
+              FFmpegKit.cancel(currentSessionId);
+            }
+            if (!completer.isCompleted) {
+              completer.complete(false);
+            }
+            return;
+          }
+          final timeMs = statistics.getTime();
+          if (totalSeconds > 0 && timeMs > 0) {
+            final processed = Duration(milliseconds: timeMs);
+            final fraction = (timeMs / (totalSeconds * 1000)).clamp(0.0, 1.0);
+            final percent = (fraction * 100).round();
+            if (percent != lastReportedPercent) {
+              lastReportedPercent = percent;
+              onProgress?.call(fraction, processed, totalDuration);
+            }
+          }
+        },
+      );
+
+      currentSessionId = session.getSessionId();
+
+      final success = await completer.future;
+      if (!success) {
+        return null;
+      }
+
+      final wavFile = File(wavPath);
+      if (!await wavFile.exists() || await wavFile.length() < 1024) {
+        return null;
+      }
+
+      onProgress?.call(1.0, totalDuration, totalDuration);
+      return wavPath;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 用 ffprobe / FFprobeKit 读取媒体总时长（秒）；失败返回 0。
   ///
-  /// ffprobe 只读头部信息，毫秒级完成，不会像"猜一个进度"那样让进度条骗人。
+  /// 只读头部信息，毫秒级完成，不会像"猜一个进度"那样让进度条骗人。
   Future<double> _probeDurationSeconds(String videoPath) async {
+    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+      try {
+        final session = await FFprobeKit.getMediaInformation(videoPath);
+        final info = session.getMediaInformation();
+        final durationStr = info?.getDuration();
+        if (durationStr != null) {
+          final d = double.tryParse(durationStr);
+          if (d != null && d > 0) return d;
+        }
+      } catch (_) {}
+      return 0;
+    }
+
     final ffprobeCmd = Platform.isWindows ? 'ffprobe.exe' : 'ffprobe';
     try {
       final result = await Process.run(
@@ -1192,18 +1383,25 @@ class AudioEnergyProfile {
 
   /// 返回 [fromMs, toMs] 内最后一次真实发声的结束时刻（毫秒）。
   ///
-  /// 用于确定字幕应该停留到什么时候：以"最后一次发声 + 少量余量"为准，
-  /// 而不是用词数估算的朗读时长——估算偏短会让字幕在还在说话时就消失，
-  /// 表现为角色继续说了好几句、画面却空着。
+  /// 用于确定字幕应该停留到什么时候：以"最后一次发声 + 少量余量"为准。
+  /// 要求至少连续 2 帧（约 100ms）高于阈值，过滤孤立瞬态底噪。
   /// 区间内没有检测到发声时返回 -1。
   int findLastSpeechEnd(int fromMs, int toMs) {
     var last = -1;
+    int highCount = 0;
     for (final entry in timeline) {
       final t = entry.$1;
       final r = entry.$2;
       if (t < fromMs) continue;
       if (t > toMs) break;
-      if (r >= speechThreshold) last = t + 100; // 采样窗口长 100ms
+      if (r >= speechThreshold) {
+        highCount++;
+        if (highCount >= 2) {
+          last = t + 100; // 采样窗口长 100ms
+        }
+      } else {
+        highCount = 0;
+      }
     }
     return last;
   }
