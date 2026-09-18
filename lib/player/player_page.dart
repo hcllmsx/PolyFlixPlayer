@@ -1185,8 +1185,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     final deltaX = details.globalPosition.dx - _dragStartX;
     // 滑动整屏宽度对应 90 秒快进/快退，手感适中细腻
     final seekDeltaSeconds = (deltaX / screenWidth) * 90.0;
-    final deltaDuration =
-        Duration(milliseconds: (seekDeltaSeconds * 1000).round());
+    final deltaDuration = Duration(
+      milliseconds: (seekDeltaSeconds * 1000).round(),
+    );
     final target = _clampDuration(
       _seekDragStartPosition + deltaDuration,
       Duration.zero,
@@ -1464,7 +1465,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           onClose: _closePlayer,
         ),
         if (_noticeText != null) _PlayerTopNotice(text: _noticeText!),
-        // 画面中央的大号播放/进退按钮只服务触屏；桌面端点底部控制条即可。
+        // 画面中央的大号播放按钮只服务触屏；桌面端点底部控制条即可。
+        // 左右滑动已能快进快退，两侧的 ±10s 按钮不再需要。
         if (!isDesktopPlatform)
           Center(
             child: AnimatedOpacity(
@@ -1474,9 +1476,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
                 ignoring: !_controlsVisible,
                 child: _CenterControls(
                   playing: _playing,
-                  onReplay: () => _seekRelative(-_kSeekStepSeconds),
                   onPlayPause: _togglePlayback,
-                  onForward: () => _seekRelative(_kSeekStepSeconds),
                 ),
               ),
             ),
@@ -1517,10 +1517,14 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         if (_aiSubtitleRunning && _osdText == null)
           Positioned(
             top: 72,
+            left: MediaQuery.of(context).size.width * 0.35,
             right: 16,
-            child: _PlayerTaskBadge(
-              videoKey: _streamServer?.url ?? _sourcePath,
-              onTap: _showAiSubtitleSheet,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: _PlayerTaskBadge(
+                videoKey: _streamServer?.url ?? _sourcePath,
+                onTap: _showAiSubtitleSheet,
+              ),
             ),
           ),
         if (_osdText != null) _PlayerOsd(text: _osdText!, icon: _osdIcon),
@@ -1532,13 +1536,23 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       // 用 onTapUp 而不是 onTap：需要拿到点击位置来识别"双击画面"（桌面端切全屏）
       onTapUp: (details) => _handleSurfaceTap(details.globalPosition),
       onVerticalDragStart: !isDesktopPlatform ? _handleVerticalDragStart : null,
-      onVerticalDragUpdate: !isDesktopPlatform ? _handleVerticalDragUpdate : null,
+      onVerticalDragUpdate: !isDesktopPlatform
+          ? _handleVerticalDragUpdate
+          : null,
       onVerticalDragEnd: !isDesktopPlatform ? _handleVerticalDragEnd : null,
-      onVerticalDragCancel: !isDesktopPlatform ? _handleVerticalDragCancel : null,
-      onHorizontalDragStart: !isDesktopPlatform ? _handleHorizontalDragStart : null,
-      onHorizontalDragUpdate: !isDesktopPlatform ? _handleHorizontalDragUpdate : null,
+      onVerticalDragCancel: !isDesktopPlatform
+          ? _handleVerticalDragCancel
+          : null,
+      onHorizontalDragStart: !isDesktopPlatform
+          ? _handleHorizontalDragStart
+          : null,
+      onHorizontalDragUpdate: !isDesktopPlatform
+          ? _handleHorizontalDragUpdate
+          : null,
       onHorizontalDragEnd: !isDesktopPlatform ? _handleHorizontalDragEnd : null,
-      onHorizontalDragCancel: !isDesktopPlatform ? _handleHorizontalDragCancel : null,
+      onHorizontalDragCancel: !isDesktopPlatform
+          ? _handleHorizontalDragCancel
+          : null,
       child: isDesktopPlatform
           ? Focus(
               focusNode: _keyboardFocus,
@@ -1637,17 +1651,24 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       context: context,
       backgroundColor: const Color(0xFF202027),
       showDragHandle: true,
-      builder: (context) => _TrackSelectionSheet(
-        title: '音轨',
-        subtitle: '选择要使用的音频轨道。',
-        options: [
-          for (final t in _audioTracks)
-            _TrackOption(
-              id: t.id,
-              label: _audioLabel(t),
-              selected: t.id == _activeAudioId,
-            ),
-        ],
+      isScrollControlled: true,
+      constraints: const BoxConstraints(maxWidth: 480),
+      builder: (context) => ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.85,
+        ),
+        child: _TrackSelectionSheet(
+          title: '音轨',
+          subtitle: '选择要使用的音频轨道。',
+          options: [
+            for (final t in _audioTracks)
+              _TrackOption(
+                id: t.id,
+                label: _audioLabel(t),
+                selected: t.id == _activeAudioId,
+              ),
+          ],
+        ),
       ),
     );
     if (selected != null) await _selectAudio(selected);
@@ -1660,37 +1681,44 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       context: context,
       backgroundColor: const Color(0xFF202027),
       showDragHandle: true,
-      builder: (context) => _TrackSelectionSheet(
-        title: '字幕',
-        subtitle: '内置字幕与 AI 识别字幕可同时显示（内置在下，AI 在上）。',
-        options: [
-          _TrackOption(
-            id: _kSubtitlesOff,
-            label: '关闭字幕',
-            selected: _activeSubtitleId == null && !_aiSubtitleActive,
-          ),
-          for (final t in _subtitleTracks)
+      isScrollControlled: true,
+      constraints: const BoxConstraints(maxWidth: 480),
+      builder: (context) => ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.85,
+        ),
+        child: _TrackSelectionSheet(
+          title: '字幕',
+          subtitle: '内置字幕与 AI 识别字幕可同时显示（内置在下，AI 在上）。',
+          options: [
             _TrackOption(
-              id: t.id,
-              label: _subtitleLabel(t),
-              // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
-              selected: t.id == _activeSubtitleId,
+              id: _kSubtitlesOff,
+              label: '关闭字幕',
+              selected: _activeSubtitleId == null && !_aiSubtitleActive,
             ),
-          // AI 字幕总开关关闭时，整项从字幕列表里隐藏
-          if (aiSubtitleEnabled.value)
-            _TrackOption(
-              id: '__ai_subtitle__',
-              label: _aiSubtitleRunning
-                  ? 'AI 语音识别字幕 (识别中…)'
-                  : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）'),
-              selected: _aiSubtitleActive,
-            ),
-        ],
-        footerNote: _subtitleTracks.isEmpty
-            ? (aiSubtitleEnabled.value
-                  ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）'
-                  : '该视频没有内嵌字幕')
-            : null,
+            for (final t in _subtitleTracks)
+              _TrackOption(
+                id: t.id,
+                label: _subtitleLabel(t),
+                // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
+                selected: t.id == _activeSubtitleId,
+              ),
+            // AI 字幕总开关关闭时，整项从字幕列表里隐藏
+            if (aiSubtitleEnabled.value)
+              _TrackOption(
+                id: '__ai_subtitle__',
+                label: _aiSubtitleRunning
+                    ? 'AI 语音识别字幕 (识别中…)'
+                    : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）'),
+                selected: _aiSubtitleActive,
+              ),
+          ],
+          footerNote: _subtitleTracks.isEmpty
+              ? (aiSubtitleEnabled.value
+                    ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）'
+                    : '该视频没有内嵌字幕')
+              : null,
+        ),
       ),
     );
     if (selected != null) {
@@ -1975,32 +2003,40 @@ class _PlayerOsd extends StatelessWidget {
         child: SafeArea(
           child: Padding(
             padding: EdgeInsets.fromLTRB(0, isPortrait ? 76 : 16, 16, 0),
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: .72),
-                borderRadius: BorderRadius.circular(8),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.of(context).size.width * 0.6,
               ),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 9,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: .72),
+                  borderRadius: BorderRadius.circular(8),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (icon != null) ...[
-                      Icon(icon, color: Colors.white, size: 18),
-                      const SizedBox(width: 8),
-                    ],
-                    Text(
-                      text,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 9,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (icon != null) ...[
+                        Icon(icon, color: Colors.white, size: 18),
+                        const SizedBox(width: 8),
+                      ],
+                      Flexible(
+                        child: Text(
+                          text,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -2150,13 +2186,13 @@ class _PlayerTopNotice extends StatelessWidget {
               tween: Tween(begin: 0.0, end: 1.0),
               duration: const Duration(milliseconds: 220),
               builder: (context, opacity, child) {
-                return Opacity(
-                  opacity: opacity,
-                  child: child,
-                );
+                return Opacity(opacity: opacity, child: child);
               },
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 7,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.black.withValues(alpha: .78),
                   borderRadius: BorderRadius.circular(20),
@@ -2205,16 +2241,15 @@ class _RoundControl extends StatelessWidget {
     required this.tooltip,
     required this.icon,
     required this.onPressed,
-    this.size = 44,
   });
 
   final String tooltip;
   final IconData icon;
   final VoidCallback onPressed;
-  final double size;
 
   @override
   Widget build(BuildContext context) {
+    const size = 44.0;
     return Tooltip(
       message: tooltip,
       child: Material(
@@ -2235,60 +2270,35 @@ class _RoundControl extends StatelessWidget {
 }
 
 class _CenterControls extends StatelessWidget {
-  const _CenterControls({
-    required this.playing,
-    required this.onReplay,
-    required this.onPlayPause,
-    required this.onForward,
-  });
+  const _CenterControls({required this.playing, required this.onPlayPause});
 
   final bool playing;
-  final VoidCallback onReplay;
   final VoidCallback onPlayPause;
-  final VoidCallback onForward;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _RoundControl(
-          tooltip: '后退 $_kSeekStepSeconds 秒',
-          icon: Icons.replay_10_rounded,
-          onPressed: onReplay,
-          size: 54,
-        ),
-        const SizedBox(width: 22),
-        Tooltip(
-          message: playing ? '暂停' : '播放',
-          child: Material(
-            color: Colors.white,
-            elevation: 12,
-            shadowColor: Colors.black.withValues(alpha: .55),
-            shape: const CircleBorder(),
-            child: InkWell(
-              onTap: onPlayPause,
-              customBorder: const CircleBorder(),
-              child: SizedBox(
-                width: 74,
-                height: 74,
-                child: Icon(
-                  playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                  color: const Color(0xFF252432),
-                  size: 42,
-                ),
-              ),
+    // 只有中央一个大号播放/暂停按钮：快进快退交给屏幕左右滑动。
+    return Tooltip(
+      message: playing ? '暂停' : '播放',
+      child: Material(
+        color: Colors.white,
+        elevation: 12,
+        shadowColor: Colors.black.withValues(alpha: .55),
+        shape: const CircleBorder(),
+        child: InkWell(
+          onTap: onPlayPause,
+          customBorder: const CircleBorder(),
+          child: SizedBox(
+            width: 74,
+            height: 74,
+            child: Icon(
+              playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+              color: const Color(0xFF252432),
+              size: 42,
             ),
           ),
         ),
-        const SizedBox(width: 22),
-        _RoundControl(
-          tooltip: '前进 $_kSeekStepSeconds 秒',
-          icon: Icons.forward_10_rounded,
-          onPressed: onForward,
-          size: 54,
-        ),
-      ],
+      ),
     );
   }
 }
@@ -2690,18 +2700,28 @@ class _TrackSelectionSheet extends StatelessWidget {
             const SizedBox(height: 6),
             Text(subtitle, style: const TextStyle(color: Color(0xFFCBC7D2))),
             const SizedBox(height: 8),
-            for (final option in options)
-              _TrackOptionTile(
-                option: option,
-                onTap: () => Navigator.of(context).pop(option.id),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final option in options)
+                    _TrackOptionTile(
+                      option: option,
+                      onTap: () => Navigator.of(context).pop(option.id),
+                    ),
+                  if (footerNote != null) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      footerNote!,
+                      style: const TextStyle(
+                        color: Color(0xFF8D8A96),
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ],
               ),
-            if (footerNote != null) ...[
-              const SizedBox(height: 4),
-              Text(
-                footerNote!,
-                style: const TextStyle(color: Color(0xFF8D8A96), fontSize: 13),
-              ),
-            ],
+            ),
           ],
         ),
       ),
@@ -2843,12 +2863,15 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
                 ),
               ),
               const SizedBox(width: 8),
-              Text(
-                '$actionName$percentText · 已用 ${AiTask.formatDuration(task.elapsed)}',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
+              Flexible(
+                child: Text(
+                  '$actionName$percentText · 已用 ${AiTask.formatDuration(task.elapsed)}',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
             ],

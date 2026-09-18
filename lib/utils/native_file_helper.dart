@@ -79,10 +79,11 @@ abstract final class NativeFileHelper {
         if (path != null && path.isNotEmpty) {
           _cachedAppDataDirPath = path;
           _migrateOldCacheData(path);
-          return;
         }
       } catch (_) {}
     }
+    // 启动时自动清理历史孤儿切片与过期临时音频
+    cleanStaleTempAudio();
   }
 
   static void _migrateOldCacheData(String targetDirPath) {
@@ -94,11 +95,42 @@ abstract final class NativeFileHelper {
       final targetDir = Directory(targetDirPath);
       if (!targetDir.existsSync()) targetDir.createSync(recursive: true);
 
-      for (final fileName in ['settings.json', 'library.json']) {
+      for (final fileName in ['settings.json', 'library.json', 'ai_tasks.json']) {
         final oldFile = File('${oldDir.path}${Platform.pathSeparator}$fileName');
         final newFile = File('${targetDir.path}${Platform.pathSeparator}$fileName');
         if (oldFile.existsSync() && !newFile.existsSync()) {
           oldFile.copySync(newFile.path);
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// 自动清理过期的临时音频文件与孤儿切片文件。
+  ///
+  /// - 立即清理上一次转录未正常结束留下的 `chunk_*.wav`；
+  /// - 清理超过 3 天未被修改的 `pflx_asr_*.wav` 临时提取音频。
+  static Future<void> cleanStaleTempAudio() async {
+    try {
+      final audioDir = desktopCacheAudioDir();
+      if (!audioDir.existsSync()) return;
+      final now = DateTime.now();
+      final staleThreshold = now.subtract(const Duration(days: 3));
+
+      for (final entity in audioDir.listSync()) {
+        if (entity is File) {
+          final name = entity.uri.pathSegments.last;
+          if (name.startsWith('chunk_') && name.endsWith('.wav')) {
+            try {
+              entity.deleteSync();
+            } catch (_) {}
+          } else if (name.startsWith('pflx_asr_') && name.endsWith('.wav')) {
+            try {
+              final lastMod = entity.lastModifiedSync();
+              if (lastMod.isBefore(staleThreshold)) {
+                entity.deleteSync();
+              }
+            } catch (_) {}
+          }
         }
       }
     } catch (_) {}
@@ -153,11 +185,45 @@ abstract final class NativeFileHelper {
     return Directory('$base${sep}audio');
   }
 
-  /// 桌面端字幕缓存目录：%TEMP%\PolyFlixPlayer\cache\subtitles\
+  /// 字幕缓存目录：持久化存储，重装应用后不丢失。
+  ///
+  /// - 桌面端：%LOCALAPPDATA%\PolyFlixPlayer\subtitles\
+  /// - Android：应用 files 目录下 PolyFlixPlayer/subtitles/
+  ///
+  /// 旧版放在临时缓存目录（%TEMP% / cache），重装会丢。
+  /// 首次调用时自动把旧目录里的缓存搬过来。
   static Directory desktopSubtitleCacheDir() {
-    final base = desktopCacheDir().path;
+    final base = appDataDir().path;
     final sep = Platform.pathSeparator;
-    return Directory('$base${sep}subtitles');
+    final dir = Directory('$base${sep}subtitles');
+    // 懒迁移：旧临时目录如果还有字幕缓存文件，一次性搬到新目录
+    _migrateSubtitleCache(dir);
+    return dir;
+  }
+
+  static bool _subtitleCacheMigrated = false;
+
+  static void _migrateSubtitleCache(Directory newDir) {
+    if (_subtitleCacheMigrated) return;
+    _subtitleCacheMigrated = true;
+    try {
+      final oldBase = desktopCacheDir().path;
+      final sep = Platform.pathSeparator;
+      final oldDir = Directory('$oldBase${sep}subtitles');
+      if (!oldDir.existsSync()) return;
+      if (!newDir.existsSync()) newDir.createSync(recursive: true);
+      for (final entity in oldDir.listSync()) {
+        if (entity is File && entity.path.endsWith('.json')) {
+          final name = entity.uri.pathSegments.last;
+          final target = File('${newDir.path}$sep$name');
+          if (!target.existsSync()) {
+            entity.copySync(target.path);
+          }
+        }
+      }
+      // 搬完删旧目录
+      oldDir.deleteSync(recursive: true);
+    } catch (_) {}
   }
 
   /// 打开系统文件管理器并定位到指定目录（桌面端生效）。
@@ -252,10 +318,52 @@ abstract final class NativeFileHelper {
     return 0;
   }
 
-  /// 清理应用缓存，返回已释放的字节数。
+  /// 获取已缓存的 AI 字幕信息：字节数与文件数量。
+  static Future<({int bytes, int count})> getSubtitleCacheInfo() async {
+    try {
+      final dir = desktopSubtitleCacheDir();
+      if (!dir.existsSync()) return (bytes: 0, count: 0);
+      var totalBytes = 0;
+      var fileCount = 0;
+      for (final entity in dir.listSync()) {
+        if (entity is File && entity.path.endsWith('.json')) {
+          fileCount++;
+          try {
+            totalBytes += entity.lengthSync();
+          } catch (_) {}
+        }
+      }
+      return (bytes: totalBytes, count: fileCount);
+    } catch (_) {
+      return (bytes: 0, count: 0);
+    }
+  }
+
+  /// 清空所有已识别生成的字幕缓存，返回已释放的字节数。
+  static Future<int> clearSubtitleCache() async {
+    try {
+      final dir = desktopSubtitleCacheDir();
+      if (!dir.existsSync()) return 0;
+      var clearedBytes = 0;
+      for (final entity in dir.listSync()) {
+        if (entity is File && entity.path.endsWith('.json')) {
+          try {
+            clearedBytes += entity.lengthSync();
+            entity.deleteSync();
+          } catch (_) {}
+        }
+      }
+      return clearedBytes;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// 清理应用临时缓存，返回已释放的字节数。
   ///
-  /// 清理的是 `%TEMP%\PolyFlixPlayer\`（字幕缓存 + 临时音频）；
-  /// 模型与引擎包位于 `%LOCALAPPDATA%\PolyFlixPlayer\`，不受影响。
+  /// 清理的是系统的临时缓存目录（Android: cacheDir / 桌面端: %TEMP%\PolyFlixPlayer\），
+  /// 包括提取的临时音频 WAV、文件选择器临时文件等；
+  /// 模型位于 models 目录，已生成的字幕与应用设置位于持久化目录，均不受影响。
   static Future<int> clearCache() async {
     int cleared = 0;
     if (Platform.isAndroid) {

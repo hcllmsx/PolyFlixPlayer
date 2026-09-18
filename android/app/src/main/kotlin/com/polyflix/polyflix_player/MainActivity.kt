@@ -273,7 +273,8 @@ class MainActivity : FlutterActivity() {
         context.externalCacheDirs?.forEach { dir ->
             dir?.cleanDirectoryContents()
         }
-        return before
+        val after = calculateCacheSize(context)
+        return maxOf(0L, before - after)
     }
 
     private fun File.cleanDirectoryContents() {

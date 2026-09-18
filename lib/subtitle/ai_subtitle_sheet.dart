@@ -65,6 +65,7 @@ class AiSubtitleSheet extends StatefulWidget {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
+      constraints: const BoxConstraints(maxWidth: 560),
       builder: (context) => AiSubtitleSheet(
         videoPath: videoPath,
         videoTitle: videoTitle,

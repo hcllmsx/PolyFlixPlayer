@@ -36,6 +36,12 @@ class _SettingsPageState extends State<SettingsPage> {
   int _cacheBytes = 0;
   bool _loadingCache = true;
   bool _clearingCache = false;
+
+  int _subtitleBytes = 0;
+  int _subtitleCount = 0;
+  bool _loadingSubtitles = true;
+  bool _clearingSubtitles = false;
+
   String _currentVersion = '26.8.23';
 
   // AI 字幕模型状态
@@ -57,6 +63,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _refreshCacheSize();
+    _refreshSubtitleCacheSize();
     _loadLocalVersion();
     _refreshModels();
     detectGpuCapability().then((cap) {
@@ -151,11 +158,69 @@ class _SettingsPageState extends State<SettingsPage> {
         SnackBar(
           content: Text(
             cleared > 0
-                ? '已清理缓存，释放了 ${_formatBytes(cleared)} 存储空间。'
-                : '缓存已全部清理完毕。',
+                ? '已清理临时缓存，释放了 ${_formatBytes(cleared)} 存储空间。'
+                : '临时缓存已全部清理完毕。',
           ),
         ),
       );
+  }
+
+  Future<void> _refreshSubtitleCacheSize() async {
+    final info = await NativeFileHelper.getSubtitleCacheInfo();
+    if (mounted) {
+      setState(() {
+        _subtitleBytes = info.bytes;
+        _subtitleCount = info.count;
+        _loadingSubtitles = false;
+      });
+    }
+  }
+
+  Future<void> _clearSubtitleCache() async {
+    if (_clearingSubtitles || _subtitleCount == 0) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('清空 AI 字幕缓存'),
+        content: Text(
+          '确定要清空所有已识别生成的字幕缓存（共 $_subtitleCount 个视频）吗？\n\n'
+          '清空后，已识别的视频再次播放时需重新进行语音识别。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('确认清空'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      setState(() => _clearingSubtitles = true);
+      final cleared = await NativeFileHelper.clearSubtitleCache();
+      await _refreshSubtitleCacheSize();
+      if (!mounted) return;
+      setState(() => _clearingSubtitles = false);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              cleared > 0
+                  ? '已清空字幕缓存，释放了 ${_formatBytes(cleared)} 存储空间。'
+                  : '字幕缓存已全部清空。',
+            ),
+          ),
+        );
+    }
   }
 
   String _formatBytes(int bytes) {
@@ -461,7 +526,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text('清理应用缓存'),
+                          const Text('清理临时缓存'),
                           const SizedBox(height: 4),
                           Text(
                             _loadingCache
@@ -474,7 +539,7 @@ class _SettingsPageState extends State<SettingsPage> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '播放本地视频与流式传输采用内存直读，不产生冗余磁盘缓存；仅当使用 AI 识别字幕或临时转存时占用少量存储空间。',
+                            '主要清理 AI 识别产生的临时音频与临时转存文件。已生成的字幕、已下载的模型及播放记录将完整保留，不受影响。',
                             style: TextStyle(
                               fontSize: 11.5,
                               height: 1.4,
@@ -493,7 +558,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     if (isDesktopPlatform) ...[
                       OutlinedButton.icon(
                         icon: const Icon(Icons.folder_open_rounded, size: 16),
-                        label: const Text('打开目录'),
+                        label: const Text('打开缓存目录'),
                         style: OutlinedButton.styleFrom(
                           visualDensity: VisualDensity.compact,
                           padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -513,6 +578,74 @@ class _SettingsPageState extends State<SettingsPage> {
                         : FilledButton.tonal(
                             onPressed: _clearCache,
                             child: const Text('清理'),
+                          ),
+                  ],
+                ),
+                const Divider(height: 28),
+                Row(
+                  children: [
+                    Icon(
+                      Icons.subtitles_rounded,
+                      color: scheme.primary,
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('AI 识别字幕缓存'),
+                          const SizedBox(height: 4),
+                          Text(
+                            _loadingSubtitles
+                                ? '正在计算字幕缓存…'
+                                : '已缓存 $_subtitleCount 个视频的字幕，占用 ${_formatBytes(_subtitleBytes)}',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: scheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '已生成的字幕安全保存在应用持久存储中，可在脱机状态下长期复用，重装应用或清理临时缓存不会丢失。',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              height: 1.4,
+                              color: scheme.onSurfaceVariant.withValues(alpha: .75),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    if (isDesktopPlatform) ...[
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.folder_open_rounded, size: 16),
+                        label: const Text('打开字幕目录'),
+                        style: OutlinedButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                        ),
+                        onPressed: () => NativeFileHelper.openDirectory(
+                          NativeFileHelper.desktopSubtitleCacheDir(),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    _clearingSubtitles
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2.2),
+                          )
+                        : FilledButton.tonal(
+                            onPressed:
+                                _subtitleCount > 0 ? _clearSubtitleCache : null,
+                            child: const Text('清空'),
                           ),
                   ],
                 ),
