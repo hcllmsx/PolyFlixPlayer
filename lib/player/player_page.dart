@@ -28,7 +28,11 @@ import '../subtitle/ai_task_manager.dart';
 import '../subtitle/model_manager.dart';
 import '../subtitle/subtitle_generator.dart';
 import '../subtitle/subtitle_overlay.dart';
+import '../utils/platform_media_helper.dart';
 import '../utils/platform_utils.dart';
+
+/// 移动端手势调节类型（左侧亮度，右侧音量）。
+enum _VerticalDragType { brightness, volume }
 
 /// 桌面端单次调节音量的步进值（键盘 ↑/↓）。
 const double _kVolumeStep = 5;
@@ -114,11 +118,13 @@ class PlayerPage extends StatefulWidget {
     required this.sourcePath,
     this.info,
     required this.isPflx,
+    this.initialNotice,
   });
 
   final String sourcePath;
   final PflxInfo? info;
   final bool isPflx;
+  final String? initialNotice;
 
   @override
   State<PlayerPage> createState() => _PlayerPageState();
@@ -198,7 +204,20 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
 
   /// 操作反馈浮层文案（音量/静音/切轨等瞬时提示），null 表示不显示。
   String? _osdText;
+  IconData? _osdIcon;
   Timer? _osdTimer;
+
+  // ---------------- 移动端手势调节亮度与音量 ----------------
+  /// 当前屏幕亮度（0.01 ~ 1.0）。进入时为系统亮度。
+  double _brightness = 0.5;
+
+  /// 本次进入播放页期间是否通过手势调整过亮度。
+  bool _brightnessModified = false;
+
+  /// 垂直手势调节目标（左侧亮度，右侧音量）。
+  _VerticalDragType? _dragType;
+  double _dragStartY = 0.0;
+  double _dragStartValue = 0.0;
 
   // ---------------- 播放进度（续播） ----------------
   /// 读到续播位置后暂存，等媒体加载完再 seek（此时 seek 才生效）。
@@ -240,14 +259,30 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 键盘事件接收节点。配合 ExcludeFocus 保证焦点不会跑到按钮上。
   final FocusNode _keyboardFocus = FocusNode(debugLabel: 'player');
 
+  /// 顶部标题栏下方的临时轻量提示（如"已添加 1 个视频"），几秒后自动淡出
+  String? _noticeText;
+  Timer? _noticeTimer;
+
   @override
   void initState() {
     super.initState();
+    _noticeText = widget.initialNotice;
+    if (_noticeText != null) {
+      _noticeTimer = Timer(const Duration(milliseconds: 2600), () {
+        if (mounted) setState(() => _noticeText = null);
+      });
+    }
     _sourcePath = widget.sourcePath;
     _sourceInfo = widget.info;
     _sourceIsPflx = widget.isPflx;
     // SystemChrome 只在移动端有意义；桌面端调用是空操作，直接跳过更清晰。
     if (isMobilePlatform) {
+      PlatformMediaHelper.getBrightness().then((b) {
+        if (mounted) _brightness = b;
+      });
+      PlatformMediaHelper.getVolume().then((v) {
+        if (mounted) _volume = v * 100.0;
+      });
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       SystemChrome.setSystemUIOverlayStyle(
         const SystemUiOverlayStyle(
@@ -310,6 +345,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _restartHintTimer?.cancel();
     _keyboardFocus.dispose();
     if (isMobilePlatform) {
+      if (_brightnessModified) {
+        PlatformMediaHelper.resetBrightness();
+      }
       SystemChrome.setPreferredOrientations([
         DeviceOrientation.portraitUp,
         DeviceOrientation.portraitDown,
@@ -339,6 +377,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         player.dispose();
       } catch (_) {}
     });
+    _noticeTimer?.cancel();
     super.dispose();
   }
 
@@ -428,15 +467,16 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _pendingResume = null;
     _lastRecordedPosition = Duration.zero;
     // 续播位置：只有播放列表里的视频才有记录（拖进来的临时文件查不到），
-    // 先查出来存着，等媒体加载完（时长事件）再 seek —— 提前 seek 会被丢弃。
+    // 传入 Media(start: resumePos) 让底层 mpv 原生从目标点解封装，从源头避免从 0 播起
     _pendingResume = await PlaybackProgressStore.resumePositionOf(path);
+    final resumePos = _pendingResume;
     await _streamServer?.stop();
     _streamServer = null;
     if (info != null) {
       _streamServer = await PflxStreamServer.start(path, info);
-      await _player.open(Media(_streamServer!.url));
+      await _player.open(Media(_streamServer!.url, start: resumePos));
     } else {
-      await _player.open(Media(path));
+      await _player.open(Media(path, start: resumePos));
     }
   }
 
@@ -830,6 +870,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   Future<void> _closePlayer() async {
     if (_closing) return;
     _closing = true;
+    if (isMobilePlatform && _brightnessModified) {
+      PlatformMediaHelper.resetBrightness();
+    }
     // 1. 暂停播放，停止 mpv 的解码/渲染循环。
     try {
       await _player.pause();
@@ -1037,9 +1080,12 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   }
 
   /// 在画面右上角弹出一条瞬时提示（音量/静音/切轨反馈）。
-  void _showOsd(String text) {
+  void _showOsd(String text, {IconData? icon}) {
     _osdTimer?.cancel();
-    setState(() => _osdText = text);
+    setState(() {
+      _osdText = text;
+      _osdIcon = icon;
+    });
     _osdTimer = Timer(const Duration(milliseconds: 1600), _clearOsd);
   }
 
@@ -1047,24 +1093,93 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   void _clearOsd() {
     _osdTimer?.cancel();
     if (!mounted) return;
-    setState(() => _osdText = null);
+    setState(() {
+      _osdText = null;
+      _osdIcon = null;
+    });
+  }
+
+  void _handleVerticalDragStart(DragStartDetails details) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    _dragStartY = details.globalPosition.dy;
+    if (details.globalPosition.dx < screenWidth / 2) {
+      _dragType = _VerticalDragType.brightness;
+      _dragStartValue = _brightness;
+    } else {
+      _dragType = _VerticalDragType.volume;
+      _dragStartValue = _volume;
+    }
+  }
+
+  void _handleVerticalDragUpdate(DragUpdateDetails details) {
+    if (_dragType == null) return;
+    final screenHeight = MediaQuery.of(context).size.height;
+    // 向上滑动为正，向下滑动为负
+    final deltaY = _dragStartY - details.globalPosition.dy;
+    final ratio = deltaY / (screenHeight * 0.6);
+
+    if (_dragType == _VerticalDragType.brightness) {
+      final next = (_dragStartValue + ratio).clamp(0.01, 1.0);
+      _brightness = next;
+      _brightnessModified = true;
+      PlatformMediaHelper.setBrightness(next);
+      _showOsd(
+        '亮度 ${(next * 100).round()}%',
+        icon: next > 0.5
+            ? Icons.brightness_7_rounded
+            : Icons.brightness_medium_rounded,
+      );
+    } else if (_dragType == _VerticalDragType.volume) {
+      final next = (_dragStartValue + ratio * 100.0).clamp(0.0, 100.0);
+      _volume = next;
+      _muted = next == 0;
+      PlatformMediaHelper.setVolume(next / 100.0);
+      _player.setVolume(next);
+      _showOsd(
+        '音量 ${next.round()}%',
+        icon: next == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+      );
+    }
+  }
+
+  void _handleVerticalDragEnd(DragEndDetails details) {
+    _dragType = null;
+  }
+
+  void _handleVerticalDragCancel() {
+    _dragType = null;
   }
 
   // ------------------------------------------------------------ 播放进度（续播）
 
   /// 媒体加载完成后跳到上次的播放位置（每个播放源只做一次）。
   ///
-  /// 必须在时长事件里做：mpv 没读完文件头时 seek 会被直接丢弃，
-  /// 那样就成了"记录了却续不上"。
+  /// 执行续播定位：首选通过 Media(start: resumePosition) 原生起播。
+  /// 此处作为双重保障，并在界面上呈现"已从 xx 继续播放"和"从头播放"快捷按钮。
   Future<void> _maybeApplyResume() async {
     final target = _pendingResume;
     if (target == null) return;
     _pendingResume = null;
-    await _player.seek(target);
+    final current = _player.state.position;
+    // 如果当前播放位置距离目标位置明显过远（例如底层起播延迟或未直接定位），执行显式 seek
+    if ((current - target).abs() > const Duration(seconds: 2)) {
+      await _player.seek(target);
+    }
     _lastRecordedPosition = target;
     if (!mounted) return;
     _showOsd('已从 ${_formatDuration(target)} 继续播放');
     _showRestartHint();
+
+    // 防御性校准：针对 Android 某些机型 MediaCodec 异步就绪后将时间轴冲回 0 的问题
+    if (isMobilePlatform && target > const Duration(seconds: 3)) {
+      Future.delayed(const Duration(milliseconds: 380), () async {
+        if (!mounted) return;
+        final posNow = _player.state.position;
+        if (posNow < const Duration(seconds: 2)) {
+          await _player.seek(target);
+        }
+      });
+    }
   }
 
   /// 续播后在进度条上方浮出"从头播放"按钮，几秒后自动收起。
@@ -1080,7 +1195,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       _controlsVisible = true;
     });
     _cancelAutoHide();
-    _restartHintTimer = Timer(const Duration(seconds: 8), () {
+    _restartHintTimer = Timer(const Duration(milliseconds: 3500), () {
       if (!mounted) return;
       setState(() => _showRestartButton = false);
       _scheduleAutoHide();
@@ -1099,9 +1214,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 从头播放：回到片头并清掉续播记录。
   Future<void> _restartFromBeginning() async {
     _hideRestartHint();
-    await _player.seek(Duration.zero);
     _pendingResume = null;
     _lastRecordedPosition = Duration.zero;
+    await _player.seek(Duration.zero);
     await PlaybackProgressStore.clear(_sourcePath);
     if (mounted) _showOsd('已从头播放');
   }
@@ -1112,6 +1227,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// `state.position` 可能还是上一个视频的值，写下去就成了张冠李戴的续播点。
   void _maybeRecordProgress(Duration position) {
     if (!_durationKnown) return;
+    // 续播尚未完成或正处于起播定位期间，忽略过小的进度，避免误将 0 秒写盘覆盖历史续播点
+    if (_pendingResume != null) return;
     if ((position - _lastRecordedPosition).abs() < _kProgressSaveStep) return;
     _lastRecordedPosition = position;
     PlaybackProgressStore.record(
@@ -1124,6 +1241,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 立即记录当前进度（暂停、退出播放页时调用）。
   Future<void> _recordProgressNow() async {
     if (!_durationKnown) return;
+    // 续播还没生效时不要误把 0 秒记录下去
+    if (_pendingResume != null) return;
     final position = _player.state.position;
     _lastRecordedPosition = position;
     await PlaybackProgressStore.record(
@@ -1276,6 +1395,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           closeIcon: Icons.arrow_back_rounded,
           onClose: _closePlayer,
         ),
+        if (_noticeText != null) _PlayerTopNotice(text: _noticeText!),
         // 画面中央的大号播放/进退按钮只服务触屏；桌面端点底部控制条即可。
         if (!isDesktopPlatform)
           Center(
@@ -1335,7 +1455,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
               onTap: _showAiSubtitleSheet,
             ),
           ),
-        if (_osdText != null) _PlayerOsd(text: _osdText!),
+        if (_osdText != null) _PlayerOsd(text: _osdText!, icon: _osdIcon),
       ],
     );
 
@@ -1343,6 +1463,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       behavior: HitTestBehavior.opaque,
       // 用 onTapUp 而不是 onTap：需要拿到点击位置来识别"双击画面"（桌面端切全屏）
       onTapUp: (details) => _handleSurfaceTap(details.globalPosition),
+      onVerticalDragStart: !isDesktopPlatform ? _handleVerticalDragStart : null,
+      onVerticalDragUpdate: !isDesktopPlatform ? _handleVerticalDragUpdate : null,
+      onVerticalDragEnd: !isDesktopPlatform ? _handleVerticalDragEnd : null,
+      onVerticalDragCancel: !isDesktopPlatform ? _handleVerticalDragCancel : null,
       child: isDesktopPlatform
           ? Focus(
               focusNode: _keyboardFocus,
@@ -1827,20 +1951,23 @@ class _PlayerDropHint extends StatelessWidget {
   }
 }
 
-/// 画面右上角的瞬时提示浮层（音量/静音/切轨反馈）。
+/// 画面右上角的瞬时提示浮层（音量/亮度/静音/切轨反馈）。
 class _PlayerOsd extends StatelessWidget {
-  const _PlayerOsd({required this.text});
+  const _PlayerOsd({required this.text, this.icon});
 
   final String text;
+  final IconData? icon;
 
   @override
   Widget build(BuildContext context) {
+    final isPortrait =
+        MediaQuery.of(context).orientation == Orientation.portrait;
     return IgnorePointer(
       child: Align(
         alignment: Alignment.topRight,
         child: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(0, 16, 16, 0),
+            padding: EdgeInsets.fromLTRB(0, isPortrait ? 76 : 16, 16, 0),
             child: DecoratedBox(
               decoration: BoxDecoration(
                 color: Colors.black.withValues(alpha: .72),
@@ -1851,13 +1978,22 @@ class _PlayerOsd extends StatelessWidget {
                   horizontal: 16,
                   vertical: 9,
                 ),
-                child: Text(
-                  text,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                  ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (icon != null) ...[
+                      Icon(icon, color: Colors.white, size: 18),
+                      const SizedBox(width: 8),
+                    ],
+                    Text(
+                      text,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -1975,6 +2111,75 @@ class _PlayerTopBar extends StatelessWidget {
                             ],
                           ),
                         ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 位于标题栏下方的独立悬浮提示条（如"已添加 1 个视频"），相互独立，自动平滑淡出
+class _PlayerTopNotice extends StatelessWidget {
+  const _PlayerTopNotice({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.only(top: 72),
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0.0, end: 1.0),
+              duration: const Duration(milliseconds: 220),
+              builder: (context, opacity, child) {
+                return Opacity(
+                  opacity: opacity,
+                  child: child,
+                );
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: .78),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: .22),
+                    width: 0.6,
+                  ),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black45,
+                      blurRadius: 10,
+                      offset: Offset(0, 3),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.info_outline_rounded,
+                      color: Color(0xFFD5D1FF),
+                      size: 15,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      text,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ],
@@ -2240,17 +2445,22 @@ class _PlayerBottomControls extends StatelessWidget {
                     const SizedBox(height: 2),
                     Row(
                       children: [
-                        IconButton(
-                          onPressed: onPlayPause,
-                          tooltip: playing ? '暂停' : '播放',
-                          icon: Icon(
-                            playing
-                                ? Icons.pause_rounded
-                                : Icons.play_arrow_rounded,
-                            color: Colors.white,
+                        // 移动端竖屏时屏幕中央已有大号播放/进退按钮，底部最左侧播放按钮隐藏以防宽度不足溢出；
+                        // 横屏或桌面端保留底部播放按钮。
+                        if (isDesktopPlatform || isLandscape) ...[
+                          IconButton(
+                            onPressed: onPlayPause,
+                            tooltip: playing ? '暂停' : '播放',
+                            icon: Icon(
+                              playing
+                                  ? Icons.pause_rounded
+                                  : Icons.play_arrow_rounded,
+                              color: Colors.white,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 2),
+                          const SizedBox(width: 2),
+                        ] else
+                          const SizedBox(width: 4),
                         Text(
                           _formatDuration(position),
                           style: const TextStyle(

@@ -7,7 +7,9 @@ import 'package:window_manager/window_manager.dart';
 import 'home/home_page.dart';
 import 'settings/app_settings.dart';
 import 'subtitle/ai_task_manager.dart';
+import 'subtitle/device_capability.dart';
 import 'subtitle/whisper_server.dart';
+import 'utils/native_file_helper.dart';
 import 'utils/platform_utils.dart';
 
 Future<void> main() async {
@@ -15,6 +17,8 @@ Future<void> main() async {
   try {
     MediaKit.ensureInitialized();
   } catch (_) {}
+  // 初始化跨平台持久数据目录（Android 端映射到 filesDir，防止清理缓存误删播放列表与配置）
+  await NativeFileHelper.initializeDataDir();
   // 桌面端需要 window_manager 才能按视频比例调整窗口大小；移动端没有该实现。
   if (isDesktopPlatform) {
     try {
@@ -27,6 +31,12 @@ Future<void> main() async {
   await loadAppSettings();
   // 恢复持久化的 AI 识别任务记录（历史记录 + 上次异常退出时的中断标记）
   await AiTaskManager.instance.loadPersisted();
+  // 异步检查设备硬件能力：若不满足最低要求（如低配模拟器），强制将 AI 字幕总开关关闭
+  detectDeviceCapabilities().then((caps) {
+    if (!caps.meetsMinimumRequirements && aiSubtitleEnabled.value) {
+      setAiSubtitleEnabled(false);
+    }
+  });
   runApp(const PolyFlixApp());
 }
 

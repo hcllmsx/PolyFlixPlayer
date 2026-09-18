@@ -7,7 +7,7 @@ plugins {
 android {
     namespace = "com.polyflix.polyflix_player"
     compileSdk = 36
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "29.0.13113456"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

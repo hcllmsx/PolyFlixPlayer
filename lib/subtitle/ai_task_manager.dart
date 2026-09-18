@@ -323,13 +323,27 @@ class AiTaskManager extends ChangeNotifier {
   /// 是否有处于后台运行中的任务。
   bool get hasActiveTasks => activeTasks.isNotEmpty;
 
-  /// 获取指定视频最近一次的任务（如果存在）。
+  static bool _isSamePath(String a, String b) {
+    if (a == b) return true;
+    if (a.toLowerCase() == b.toLowerCase()) return true;
+    final normA = a.replaceAll('/', '\\').toLowerCase();
+    final normB = b.replaceAll('/', '\\').toLowerCase();
+    return normA == normB;
+  }
+
+  /// 获取指定视频最近一次的任务（如果存在，兼容本地路径与流地址）。
   AiTask? getTask(String videoPath) {
     for (final task in _tasks.reversed) {
-      if (task.videoPath == videoPath) return task;
+      if (_isSamePath(task.videoPath, videoPath) ||
+          _isSamePath(task.cacheKey, videoPath)) {
+        return task;
+      }
     }
     return null;
   }
+
+  /// 指定本地路径的视频是否有音频识别任务。
+  bool hasTaskForPath(String path) => getTask(path) != null;
 
   /// 启动某视频的语音识别任务。
   ///

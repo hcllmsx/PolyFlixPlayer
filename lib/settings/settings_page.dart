@@ -43,6 +43,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 本机 GPU 能力。
   GpuCapability? _gpu;
+  DeviceCapabilities? _deviceCaps;
 
   /// 已安装的识别引擎包（空表示只使用内置 CPU 插件）。
   List<EnginePack> _enginePacks = const [];
@@ -60,6 +61,12 @@ class _SettingsPageState extends State<SettingsPage> {
     _refreshModels();
     detectGpuCapability().then((cap) {
       if (mounted) setState(() => _gpu = cap);
+    });
+    detectDeviceCapabilities().then((caps) {
+      if (!caps.meetsMinimumRequirements && aiSubtitleEnabled.value) {
+        setAiSubtitleEnabled(false);
+      }
+      if (mounted) setState(() => _deviceCaps = caps);
     });
     _refreshEnginePacks();
   }
@@ -329,32 +336,42 @@ class _SettingsPageState extends State<SettingsPage> {
                 ]),
                 builder: (context, _) {
                   final hasActiveTask = AiTaskManager.instance.hasActiveTasks;
+                  final isUnsupported =
+                      _deviceCaps != null && !_deviceCaps!.meetsMinimumRequirements;
                   return SwitchListTile(
                     secondary: Icon(
                       Icons.auto_awesome_rounded,
-                      color: scheme.primary,
+                      color: isUnsupported
+                          ? scheme.onSurface.withValues(alpha: .38)
+                          : scheme.primary,
                     ),
                     title: const Text('启用 AI 字幕功能'),
                     subtitle: Text(
-                      hasActiveTask
-                          // 识别中途关掉总开关会让任务处于"完成了但功能已关"的
-                          // 半截状态，所以任务结束前不允许关闭。
-                          ? '有识别任务正在进行，任务结束前无法关闭。'
-                          : '自动识别音频并生成字幕。',
+                      isUnsupported
+                          ? '当前设备不支持此功能。'
+                          : (hasActiveTask
+                              // 识别中途关掉总开关会让任务处于"完成了但功能已关"的
+                              // 半截状态，所以任务结束前不允许关闭。
+                              ? '有识别任务正在进行，任务结束前无法关闭。'
+                              : '自动识别音频并生成字幕。'),
                     ),
-                    value: aiSubtitleEnabled.value,
-                    onChanged: hasActiveTask
+                    value: !isUnsupported && aiSubtitleEnabled.value,
+                    onChanged: (hasActiveTask || isUnsupported)
                         ? null
                         : (value) => setAiSubtitleEnabled(value),
                   );
                 },
               ),
-              // 总开关关掉后，模型与引擎这些关联设置一起收起来 ——
+              // 总开关关掉或设备不支持时，模型与引擎这些关联设置一起收起来 ——
               // 功能都关了还铺一屏设置，翻起来累。
               ListenableBuilder(
                 listenable: aiSubtitleEnabled,
                 builder: (context, _) {
-                  if (!aiSubtitleEnabled.value) return const SizedBox.shrink();
+                  final isUnsupported =
+                      _deviceCaps != null && !_deviceCaps!.meetsMinimumRequirements;
+                  if (isUnsupported || !aiSubtitleEnabled.value) {
+                    return const SizedBox.shrink();
+                  }
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -408,10 +425,11 @@ class _SettingsPageState extends State<SettingsPage> {
                           onPressed: _browseModels,
                         ),
                         _SectionAction(label: '导入模型', onPressed: _importModel),
-                        _SectionAction(
-                          label: '模型目录',
-                          onPressed: _openModelDirectory,
-                        ),
+                        if (isDesktopPlatform)
+                          _SectionAction(
+                            label: '模型目录',
+                            onPressed: _openModelDirectory,
+                          ),
                       ]),
                       const Divider(height: 1),
                       _buildAsrPerformanceRow(scheme),
@@ -454,6 +472,15 @@ class _SettingsPageState extends State<SettingsPage> {
                               color: scheme.onSurfaceVariant,
                             ),
                           ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '播放本地视频与流式传输采用内存直读，不产生冗余磁盘缓存；仅当使用 AI 识别字幕或临时转存时占用少量存储空间。',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              height: 1.4,
+                              color: scheme.onSurfaceVariant.withValues(alpha: .75),
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -484,7 +511,7 @@ class _SettingsPageState extends State<SettingsPage> {
                             child: CircularProgressIndicator(strokeWidth: 2.2),
                           )
                         : FilledButton.tonal(
-                            onPressed: _cacheBytes > 0 ? _clearCache : null,
+                            onPressed: _clearCache,
                             child: const Text('清理'),
                           ),
                   ],
@@ -670,26 +697,26 @@ class _SettingsPageState extends State<SettingsPage> {
                 ],
               ),
             ),
-            _sectionActionRow([
-              _SectionAction(
-                label: '浏览全部引擎',
-                onPressed: () async {
-                  await EngineCatalogSheet.show(context);
-                  await _refreshEnginePacks();
-                },
-              ),
-              if (isDesktopPlatform)
+            if (isDesktopPlatform)
+              _sectionActionRow([
+                _SectionAction(
+                  label: '浏览全部引擎',
+                  onPressed: () async {
+                    await EngineCatalogSheet.show(context);
+                    await _refreshEnginePacks();
+                  },
+                ),
                 _SectionAction(label: '导入引擎', onPressed: _importEngine),
-              _SectionAction(
-                label: '引擎目录',
-                onPressed: () async {
-                  await NativeFileHelper.openDirectory(
-                    EnginePackManager.instance.engineRootDir(),
-                  );
-                  await _refreshEnginePacks();
-                },
-              ),
-            ]),
+                _SectionAction(
+                  label: '引擎目录',
+                  onPressed: () async {
+                    await NativeFileHelper.openDirectory(
+                      EnginePackManager.instance.engineRootDir(),
+                    );
+                    await _refreshEnginePacks();
+                  },
+                ),
+              ]),
             if (hasGpuPack)
               SwitchListTile(
                 value: aiAsrForceCpu.value,
@@ -993,6 +1020,10 @@ class _SettingsPageState extends State<SettingsPage> {
   String _engineStatusText() {
     if (_checkingEngine) return '正在检测…';
 
+    if (!isDesktopPlatform) {
+      return '当前使用：内置 CPU 引擎';
+    }
+
     final preferred = _preferredEngine;
     if (preferred == null) {
       return _enginePacks.isEmpty
@@ -1010,6 +1041,9 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 引擎状态附加提示（没有则返回 null）。
   String? _engineHintText() {
     if (_checkingEngine) return null;
+    if (!isDesktopPlatform) {
+      return '移动端采用内置 CPU 识别引擎，无需额外导入引擎包；导入语音模型后即可使用。';
+    }
     if (_enginePacks.isEmpty) {
       return '点「浏览全部引擎」看对照表：按文件名去网盘下载官方 zip，'
           '再用「导入引擎」导入即可启用 GPU 加速。';

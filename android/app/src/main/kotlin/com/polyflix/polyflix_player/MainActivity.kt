@@ -92,6 +92,11 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "getAppDataDirPath" -> {
+                    val dataDir = File(filesDir, "PolyFlixPlayer")
+                    if (!dataDir.exists()) dataDir.mkdirs()
+                    result.success(dataDir.absolutePath)
+                }
                 "getCacheSize" -> {
                     val totalBytes = calculateCacheSize(this)
                     result.success(totalBytes)
@@ -129,6 +134,69 @@ class MainActivity : FlutterActivity() {
                         "systemRamMB" to systemRamMB,
                         "jvmMaxMemMB" to totalMemMB
                     ))
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.polyflix.player/media_control").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getBrightness" -> {
+                    try {
+                        val lp = window.attributes
+                        if (lp.screenBrightness >= 0f) {
+                            result.success(lp.screenBrightness.toDouble())
+                        } else {
+                            val sysVal = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
+                            result.success((sysVal / 255.0).coerceIn(0.01, 1.0))
+                        }
+                    } catch (_: Exception) {
+                        result.success(0.5)
+                    }
+                }
+                "setBrightness" -> {
+                    val value = call.argument<Double>("brightness") ?: 0.5
+                    val lp = window.attributes
+                    lp.screenBrightness = value.toFloat().coerceIn(0.01f, 1.0f)
+                    window.attributes = lp
+                    result.success(true)
+                }
+                "resetBrightness" -> {
+                    val lp = window.attributes
+                    lp.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                    window.attributes = lp
+                    result.success(true)
+                }
+                "getVolume" -> {
+                    try {
+                        val am = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                        if (am != null) {
+                            val current = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                            val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                            val percent = if (max > 0) current.toDouble() / max else 0.5
+                            result.success(percent)
+                        } else {
+                            result.success(0.5)
+                        }
+                    } catch (_: Exception) {
+                        result.success(0.5)
+                    }
+                }
+                "setVolume" -> {
+                    try {
+                        val volume = call.argument<Double>("volume") ?: 0.5
+                        val am = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                        if (am != null) {
+                            val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                            val target = Math.round(volume * max).toInt().coerceIn(0, max)
+                            am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, target, 0)
+                            result.success(true)
+                        } else {
+                            result.success(false)
+                        }
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
                 }
                 else -> result.notImplemented()
             }
@@ -177,8 +245,10 @@ class MainActivity : FlutterActivity() {
     private fun calculateCacheSize(context: Context): Long {
         var size: Long = 0
         context.cacheDir?.let { size += getFolderSize(it) }
-        context.externalCacheDir?.let { size += getFolderSize(it) }
         context.codeCacheDir?.let { size += getFolderSize(it) }
+        context.externalCacheDirs?.forEach { dir ->
+            if (dir != null) size += getFolderSize(dir)
+        }
         return size
     }
 
@@ -198,9 +268,20 @@ class MainActivity : FlutterActivity() {
 
     private fun clearAppCache(context: Context): Long {
         val before = calculateCacheSize(context)
-        context.cacheDir?.deleteRecursivelySafe()
-        context.externalCacheDir?.deleteRecursivelySafe()
+        context.cacheDir?.cleanDirectoryContents()
+        context.codeCacheDir?.cleanDirectoryContents()
+        context.externalCacheDirs?.forEach { dir ->
+            dir?.cleanDirectoryContents()
+        }
         return before
+    }
+
+    private fun File.cleanDirectoryContents() {
+        try {
+            if (isDirectory) {
+                listFiles()?.forEach { it.deleteRecursivelySafe() }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun File.deleteRecursivelySafe() {

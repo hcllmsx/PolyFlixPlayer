@@ -115,6 +115,45 @@ class _HomePageState extends State<HomePage> {
   /// 实际生效的选项卡：AI 字幕总开关关闭时强制回到播放列表。
   int get _activeHomeTab => aiSubtitleEnabled.value ? _homeTab : 0;
 
+  double _dragStartX = 0.0;
+  double _dragStartY = 0.0;
+  DateTime _dragStartTime = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _cardTouchActive = false;
+
+  void _handleNarrowPointerDown(PointerDownEvent e) {
+    _dragStartX = e.position.dx;
+    _dragStartY = e.position.dy;
+    _dragStartTime = DateTime.now();
+  }
+
+  void _handleNarrowPointerUp(PointerUpEvent e) {
+    if (!_cardTouchActive) {
+      final dx = e.position.dx - _dragStartX;
+      final dy = e.position.dy - _dragStartY;
+      final absDx = dx.abs();
+      final absDy = dy.abs();
+      final ms = DateTime.now().difference(_dragStartTime).inMilliseconds;
+      // 轻扫（350ms 内横移 >= 36px）或拖动（>= 48px），且水平位移大于垂直位移
+      final isFling = ms < 350 && absDx >= 36 && absDx > absDy * 1.35;
+      final isSwipe = absDx >= 48 && absDx > absDy * 1.35;
+      if (isFling || isSwipe) {
+        if (dx < 0 && _activeHomeTab == 0) {
+          _switchHomeTab(1);
+        } else if (dx > 0 && _activeHomeTab == 1) {
+          _switchHomeTab(0);
+        }
+      }
+    }
+    _cardTouchActive = false;
+  }
+
+  void _switchHomeTab(int target) {
+    if (!aiSubtitleEnabled.value) return;
+    if (_homeTab != target) {
+      setState(() => _homeTab = target);
+    }
+  }
+
   Future<void> _silentCheckUpdate() async {
     try {
       final current = await UpdateChecker.getLocalVersion();
@@ -211,12 +250,17 @@ class _HomePageState extends State<HomePage> {
       setState(() => _items.insertAll(0, freshItems));
       await _LibraryStorage.save(_items);
 
-      if (skippedNonVideo > 0) {
-        _showTip('已跳过非视频文件，添加了 ${freshItems.length} 个视频。');
+      final notice = skippedNonVideo > 0
+          ? '已跳过非视频文件，添加了 ${freshItems.length} 个视频。'
+          : '已添加 ${freshItems.length} 个视频。';
+
+      if (autoOpen) {
+        // 自动直接打开播放时不在首页弹底部 SnackBar（避免飘到播放页底部遮挡控制按钮），
+        // 改为传给播放页在顶部标题文字下方轻量展示
+        _open(selections.first, initialNotice: notice.replaceAll('。', ''));
       } else {
-        _showTip('已添加 ${freshItems.length} 个视频。');
+        _showTip(notice);
       }
-      if (autoOpen) _open(selections.first);
     } catch (_) {
       if (mounted) _showTip('无法读取所选文件，请检查文件访问权限后重试。');
     } finally {
@@ -332,7 +376,7 @@ class _HomePageState extends State<HomePage> {
     return result ?? _ExportResult.failure('导出被中断');
   }
 
-  Future<void> _open(_LibraryItem item) async {
+  Future<void> _open(_LibraryItem item, {String? initialNotice}) async {
     // 播放页也有拖放目标，进入前先关掉首页的，避免两者同时接收拖放事件。
     setState(() => _dropEnabled = false);
 
@@ -357,6 +401,7 @@ class _HomePageState extends State<HomePage> {
           sourcePath: item.path,
           info: item.info,
           isPflx: item.isPflx,
+          initialNotice: initialNotice,
         ),
       ),
     );
@@ -384,6 +429,15 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _removeItem(_LibraryItem item) {
+    final task = AiTaskManager.instance.getTask(item.path);
+    if (task != null) {
+      if (task.isRunning) {
+        _showTip('「${item.name}」正在进行音频识别，不允许移出播放列表');
+      } else {
+        _showTip('「${item.name}」有音频识别任务，不允许移出播放列表');
+      }
+      return;
+    }
     final index = _items.indexWhere((e) => e.path == item.path);
     if (index < 0) return;
     setState(() {
@@ -478,18 +532,40 @@ class _HomePageState extends State<HomePage> {
                     _export(item);
                   },
                 ),
-              ListTile(
-                leading: Icon(
-                  Icons.delete_outline_rounded,
-                  color: Theme.of(ctx).colorScheme.error,
-                ),
-                title: Text(
-                  '从列表中移除',
-                  style: TextStyle(color: Theme.of(ctx).colorScheme.error),
-                ),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _removeItem(item);
+              Builder(
+                builder: (context) {
+                  final task = AiTaskManager.instance.getTask(item.path);
+                  final hasTask = task != null;
+                  final errorColor = Theme.of(ctx).colorScheme.error;
+                  final disabledColor =
+                      Theme.of(ctx).colorScheme.onSurface.withValues(alpha: .38);
+                  return ListTile(
+                    leading: Icon(
+                      Icons.delete_outline_rounded,
+                      color: hasTask ? disabledColor : errorColor,
+                    ),
+                    title: Text(
+                      '从列表中移除',
+                      style: TextStyle(
+                        color: hasTask ? disabledColor : errorColor,
+                      ),
+                    ),
+                    subtitle: hasTask
+                        ? Text(
+                            task.isRunning
+                                ? '该视频正在进行音频识别，无法移除'
+                                : '该视频有音频识别任务，无法移除',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: disabledColor,
+                            ),
+                          )
+                        : null,
+                    onTap: () {
+                      Navigator.of(ctx).pop();
+                      _removeItem(item);
+                    },
+                  );
                 },
               ),
             ],
@@ -543,111 +619,130 @@ class _HomePageState extends State<HomePage> {
 
   /// 窄屏（手机竖屏或小窗口）单栏布局。
   Widget _buildNarrowLayout(BuildContext context) {
-    return Stack(
-      children: [
-        CustomScrollView(
-          physics: const BouncingScrollPhysics(),
-          slivers: [
-            SliverAppBar(
-              pinned: true,
-              titleSpacing: 24,
-              title: const _BrandLockup(compact: true),
-              actions: [
-                const ThemeToggleButton(),
-                IconButton(
-                  tooltip: '设置',
-                  icon: const Icon(Icons.settings_outlined),
-                  onPressed: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => const SettingsPage()),
-                    );
-                  },
-                ),
-                const SizedBox(width: 8),
-              ],
-            ),
-            SliverToBoxAdapter(
-              child: Column(
-                children: [
-                  Padding(
-                    // 左右各减掉选项卡自身的留白，文字起点与列表内容（20）对齐
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 20 - _HomeTabBar.paddingX,
-                    ),
-                    child: _HomeTabBar(
-                      current: _activeHomeTab,
-                      playlistCount: _items.length,
-                      onChanged: (value) => setState(() => _homeTab = value),
-                    ),
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: _handleNarrowPointerDown,
+      onPointerUp: _handleNarrowPointerUp,
+      onPointerCancel: (_) => _cardTouchActive = false,
+      child: Stack(
+        children: [
+          CustomScrollView(
+            physics: const BouncingScrollPhysics(),
+            slivers: [
+              SliverAppBar(
+                pinned: true,
+                titleSpacing: 24,
+                title: const _BrandLockup(compact: true),
+                actions: [
+                  const ThemeToggleButton(),
+                  IconButton(
+                    tooltip: '设置',
+                    icon: const Icon(Icons.settings_outlined),
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const SettingsPage()),
+                      );
+                    },
                   ),
-                  // 与宽屏一致：下划线落在分割线上，和下方列表连成一体
-                  const Divider(height: 1, thickness: 1),
+                  const SizedBox(width: 8),
                 ],
               ),
-            ),
-            if (_activeHomeTab == 1)
               SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(0, 4, 0, 120),
-                  child: AiTaskPanel(onOpenVideo: _playPath, shrinkWrap: true),
-                ),
-              )
-            else
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(20, 18, 20, 120),
-                sliver: SliverList.list(
+                child: Column(
                   children: [
-                    if (_scanning) ...[
-                      const LinearProgressIndicator(),
-                      const SizedBox(height: 16),
-                    ],
-                    if (_items.isEmpty)
-                      _EmptyLibrary(
-                        onPickFiles: () => _pickFiles(autoOpen: true),
-                      )
-                    else ...[
-                      _SectionHeading(
-                        title: '最近添加',
-                        trailing: '${_items.length} 个视频',
+                    Padding(
+                      // 左右各减掉选项卡自身的留白，文字起点与列表内容（20）对齐
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20 - _HomeTabBar.paddingX,
                       ),
-                      const SizedBox(height: 12),
-                      ..._items.map(
-                        (item) => Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: _VideoLibraryCard(
-                            item: item,
-                            resumeAt: _resumeAt[item.path],
-                            onOpen: () => _open(item),
-                            onExport: () => _export(item),
-                            onDelete: () => _removeItem(item),
-                            onLongPress: () => _showItemOptions(item),
-                          ),
-                        ),
+                      child: _HomeTabBar(
+                        current: _activeHomeTab,
+                        playlistCount: _items.length,
+                        onChanged: (value) => setState(() => _homeTab = value),
                       ),
-                    ],
+                    ),
+                    // 与宽屏一致：下划线落在分割线上，和下方列表连成一体
+                    const Divider(height: 1, thickness: 1),
                   ],
                 ),
               ),
-          ],
-        ),
-        Positioned(
-          right: 20,
-          bottom: 24,
-          child: FloatingActionButton.extended(
-            onPressed: _scanning ? null : () => _pickFiles(),
-            icon: _scanning
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2.4),
-                  )
-                : const Icon(Icons.add_rounded),
-            label: Text(
-              _scanning ? '正在识别' : (isDesktopPlatform ? '添加到列表' : '添加文件'),
+              if (_activeHomeTab == 1)
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(0, 4, 0, 120),
+                    child: AiTaskPanel(
+                      onOpenVideo: _playPath,
+                      shrinkWrap: true,
+                      onCardTouch: () => _cardTouchActive = true,
+                    ),
+                  ),
+                )
+              else
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 120),
+                  sliver: SliverList.list(
+                    children: [
+                      if (_scanning) ...[
+                        const LinearProgressIndicator(),
+                        const SizedBox(height: 16),
+                      ],
+                      if (_items.isEmpty)
+                        _EmptyLibrary(
+                          onPickFiles: () => _pickFiles(autoOpen: true),
+                        )
+                      else
+                        ..._items.map(
+                          (item) => Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: _VideoLibraryCard(
+                              item: item,
+                              resumeAt: _resumeAt[item.path],
+                              onTouchDown: () => _cardTouchActive = true,
+                              onOpen: () => _open(item),
+                              onExport: () => _export(item),
+                              onDelete: () => _removeItem(item),
+                              onLongPress: () => _showItemOptions(item),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+          Positioned(
+            right: 20,
+            bottom: 24,
+            child: AnimatedScale(
+              scale: _activeHomeTab == 0 ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeInOut,
+              child: AnimatedOpacity(
+                opacity: _activeHomeTab == 0 ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 160),
+                child: IgnorePointer(
+                  ignoring: _activeHomeTab != 0,
+                  child: FloatingActionButton.extended(
+                    onPressed: _scanning ? null : () => _pickFiles(),
+                    icon: _scanning
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2.4),
+                          )
+                        : const Icon(Icons.add_rounded),
+                    label: Text(
+                      _scanning
+                          ? '正在识别'
+                          : (isDesktopPlatform ? '添加到列表' : '添加文件'),
+                    ),
+                  ),
+                ),
+              ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -1225,45 +1320,6 @@ class _EmptyLibrary extends StatelessWidget {
   }
 }
 
-class _SectionHeading extends StatelessWidget {
-  const _SectionHeading({required this.title, this.trailing});
-
-  final String title;
-  final String? trailing;
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        // 标题与右侧计数都用弹性布局：Spacer 只能吸收多余空间，
-        // 窗口挤到不够宽时救不了溢出，这里让文字各自压缩/省略。
-        Flexible(
-          child: Text(
-            title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(context).textTheme.titleLarge
-                ?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.4),
-          ),
-        ),
-        const SizedBox(width: 12),
-        if (trailing != null)
-          Expanded(
-            child: Text(
-              trailing!,
-              textAlign: TextAlign.end,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
 class _VideoLibraryCard extends StatelessWidget {
   const _VideoLibraryCard({
     required this.item,
@@ -1271,6 +1327,7 @@ class _VideoLibraryCard extends StatelessWidget {
     required this.onExport,
     required this.onDelete,
     required this.onLongPress,
+    this.onTouchDown,
     this.resumeAt,
   });
 
@@ -1283,6 +1340,7 @@ class _VideoLibraryCard extends StatelessWidget {
   final VoidCallback onExport;
   final VoidCallback onDelete;
   final VoidCallback onLongPress;
+  final VoidCallback? onTouchDown;
 
   @override
   Widget build(BuildContext context) {
@@ -1334,7 +1392,9 @@ class _VideoLibraryCard extends StatelessWidget {
       ),
     );
 
-    return Dismissible(
+    return Listener(
+      onPointerDown: (_) => onTouchDown?.call(),
+      child: Dismissible(
       key: ValueKey(item.path),
       direction: isPflx
           ? DismissDirection.horizontal
@@ -1349,6 +1409,11 @@ class _VideoLibraryCard extends StatelessWidget {
           }
           return false;
         } else if (direction == DismissDirection.endToStart) {
+          final hasTask = AiTaskManager.instance.hasTaskForPath(item.path);
+          if (hasTask) {
+            onDelete();
+            return false;
+          }
           onDelete();
           return true;
         }
@@ -1470,7 +1535,8 @@ class _VideoLibraryCard extends StatelessWidget {
           ),
         ),
       ),
-    );
+    ),
+  );
   }
 }
 

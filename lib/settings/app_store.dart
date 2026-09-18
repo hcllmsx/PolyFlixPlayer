@@ -37,12 +37,11 @@ class AppStore {
   Map<String, dynamic> _data = {};
   bool _loaded = false;
 
-  /// 存储文件路径，桌面端为 `%LOCALAPPDATA%\PolyFlixPlayer\<文件名>`。
-  ///
-  /// Android 上 [NativeFileHelper.desktopDataDir] 会退到临时目录（系统可能清理），
-  /// 功能可用；将来正式支持 Android 时再换成应用私有 files 目录。
+  /// 存储文件路径：
+  /// - 桌面端为 `%LOCALAPPDATA%\PolyFlixPlayer\<文件名>`；
+  /// - Android 端为 `/data/user/0/<pkg>/files/PolyFlixPlayer/<文件名>`。
   File _file() {
-    final dir = NativeFileHelper.desktopDataDir();
+    final dir = NativeFileHelper.appDataDir();
     if (!dir.existsSync()) dir.createSync(recursive: true);
     return File('${dir.path}${Platform.pathSeparator}$_fileName');
   }

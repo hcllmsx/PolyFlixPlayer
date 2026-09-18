@@ -19,6 +19,7 @@ class AiTaskPanel extends StatefulWidget {
     super.key,
     required this.onOpenVideo,
     this.shrinkWrap = false,
+    this.onCardTouch,
   });
 
   /// 点「播放」时用视频路径 + 标题打开播放页。
@@ -26,6 +27,9 @@ class AiTaskPanel extends StatefulWidget {
 
   /// 嵌在外层滚动视图里时置 true：内容用 Column 排布，自己不滚动。
   final bool shrinkWrap;
+
+  /// 点在任务卡片上时的回调（供外层手势识别排除卡片区域）。
+  final VoidCallback? onCardTouch;
 
   @override
   State<AiTaskPanel> createState() => _AiTaskPanelState();
@@ -66,13 +70,13 @@ class _AiTaskPanelState extends State<AiTaskPanel> {
     }
   }
 
-  Future<void> _confirmRemove(AiTask task) async {
+  Future<void> _confirmClearFinished() async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('删除任务记录'),
-        content: Text(
-          '确定要删除「${task.videoTitle}」的这条识别记录吗？\n'
+        title: const Text('清空任务记录'),
+        content: const Text(
+          '确定要清空所有已结束的任务记录吗？\n'
           '（已生成的字幕缓存不受影响）',
         ),
         actions: [
@@ -82,13 +86,13 @@ class _AiTaskPanelState extends State<AiTaskPanel> {
           ),
           FilledButton(
             onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('删除'),
+            child: const Text('清空'),
           ),
         ],
       ),
     );
     if (confirmed == true) {
-      AiTaskManager.instance.removeTask(task.id);
+      AiTaskManager.instance.clearFinishedTasks();
     }
   }
 
@@ -144,17 +148,20 @@ class _AiTaskPanelState extends State<AiTaskPanel> {
               ),
               icon: const Icon(Icons.cleaning_services_outlined, size: 16),
               label: const Text('清空已完成', style: TextStyle(fontSize: 12)),
-              onPressed: () => AiTaskManager.instance.clearFinishedTasks(),
+              onPressed: _confirmClearFinished,
             ),
           ),
         ),
       for (final task in tasks)
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-          child: _AiTaskTile(
-            task: task,
-            onOpenVideo: widget.onOpenVideo,
-            onRemove: () => _confirmRemove(task),
+          child: Listener(
+            onPointerDown: (_) => widget.onCardTouch?.call(),
+            child: _AiTaskTile(
+              task: task,
+              onOpenVideo: widget.onOpenVideo,
+              onRemove: () => AiTaskManager.instance.removeTask(task.id),
+            ),
           ),
         ),
       const SizedBox(height: 24),

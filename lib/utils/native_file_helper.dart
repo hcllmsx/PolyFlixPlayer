@@ -65,6 +65,45 @@ abstract final class NativeFileHelper {
   // 不必再多套一层 cache\。
   // ─────────────────────────────────────────────────
 
+  static String? _cachedAppDataDirPath;
+
+  /// 初始化持久化数据目录（在 main() 启动时调用）。
+  ///
+  /// Android 端使用应用私有 files 目录（/data/user/0/package_name/files/PolyFlixPlayer），
+  /// 确保应用设置与播放列表永久独立于临时缓存目录，不受清理缓存与系统回收影响。
+  /// 首次运行还会自动从旧临时缓存目录迁移历史数据。
+  static Future<void> initializeDataDir() async {
+    if (Platform.isAndroid) {
+      try {
+        final path = await _channel.invokeMethod<String>('getAppDataDirPath');
+        if (path != null && path.isNotEmpty) {
+          _cachedAppDataDirPath = path;
+          _migrateOldCacheData(path);
+          return;
+        }
+      } catch (_) {}
+    }
+  }
+
+  static void _migrateOldCacheData(String targetDirPath) {
+    try {
+      final oldDir = Directory(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}PolyFlixPlayer',
+      );
+      if (!oldDir.existsSync()) return;
+      final targetDir = Directory(targetDirPath);
+      if (!targetDir.existsSync()) targetDir.createSync(recursive: true);
+
+      for (final fileName in ['settings.json', 'library.json']) {
+        final oldFile = File('${oldDir.path}${Platform.pathSeparator}$fileName');
+        final newFile = File('${targetDir.path}${Platform.pathSeparator}$fileName');
+        if (oldFile.existsSync() && !newFile.existsSync()) {
+          oldFile.copySync(newFile.path);
+        }
+      }
+    } catch (_) {}
+  }
+
   /// 桌面端缓存目录：%TEMP%\PolyFlixPlayer\
   ///
   /// 该目录下只有可再生的缓存（字幕缓存、临时音频），"清理应用缓存"会整个删除。
@@ -74,20 +113,30 @@ abstract final class NativeFileHelper {
     return Directory('$base${sep}PolyFlixPlayer');
   }
 
-  /// 桌面端持久数据目录：%LOCALAPPDATA%\PolyFlixPlayer\
-  ///
-  /// 取不到 LOCALAPPDATA 时（非 Windows 或异常环境）退回 %TEMP%。
-  static Directory desktopDataDir() {
+  /// 跨平台持久数据目录：
+  /// - 桌面端：%LOCALAPPDATA%\PolyFlixPlayer\
+  /// - Android 端：应用持久 files 目录下的 PolyFlixPlayer/
+  static Directory appDataDir() {
+    if (_cachedAppDataDirPath != null && _cachedAppDataDirPath!.isNotEmpty) {
+      return Directory(_cachedAppDataDirPath!);
+    }
     final localAppData = Platform.environment['LOCALAPPDATA'];
     if (localAppData != null && localAppData.trim().isNotEmpty) {
       return Directory(
         '${localAppData.trim()}${Platform.pathSeparator}PolyFlixPlayer',
       );
     }
+    if (Platform.isAndroid) {
+      const fallback = '/data/data/com.polyflix.polyflix_player/files/PolyFlixPlayer';
+      return Directory(fallback);
+    }
     final base = Directory.systemTemp.path;
     final sep = Platform.pathSeparator;
     return Directory('$base${sep}PolyFlixPlayer');
   }
+
+  /// 兼容旧方法名
+  static Directory desktopDataDir() => appDataDir();
 
   /// 桌面端模型目录：%LOCALAPPDATA%\PolyFlixPlayer\models\
   static Directory _desktopModelsDir() {
