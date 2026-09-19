@@ -38,6 +38,7 @@ class TranslationService {
         return BaiduTranslationEngine(
           appId: aiBaiduAppId.value,
           secretKey: aiBaiduSecretKey.value,
+          modelType: aiBaiduModelType.value,
         );
     }
   }
@@ -61,6 +62,7 @@ class TranslationService {
   ///
   /// [entries]: 待翻译字幕列表。
   /// [targetLanguage]: 目标语言（如 zh-Hans）。
+  /// [contextTitle]: 可选的视频标题/文件名（用于大模型提取语境背景）。
   /// [onProgress]: 进度回调 (已翻译条数, 总条数)。
   /// [isCancelled]: 取消检查函数。
   ///
@@ -69,6 +71,7 @@ class TranslationService {
     required List<SubtitleEntry> entries,
     required String targetLanguage,
     String sourceLanguage = 'auto',
+    String? contextTitle,
     void Function(int translated, int total)? onProgress,
     bool Function()? isCancelled,
   }) async {
@@ -103,6 +106,7 @@ class TranslationService {
             texts: rawTexts,
             targetLanguage: targetLanguage,
             sourceLanguage: sourceLanguage,
+            contextTitle: contextTitle,
           );
           break;
         } catch (e) {

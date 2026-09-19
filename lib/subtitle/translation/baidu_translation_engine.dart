@@ -14,23 +14,28 @@ class BaiduTranslationEngine implements TranslationEngine {
   BaiduTranslationEngine({
     required String appId,
     required String secretKey,
+    this.modelType = 'llm',
   })  : appId = _cleanCredential(appId),
         secretKey = _cleanCredential(secretKey);
 
   final String appId;
   final String secretKey;
 
+  /// 翻译模型模式：'llm' 为大模型翻译（默认），'nmt' 为经典通用机器翻译。
+  final String modelType;
+
   static String _cleanCredential(String s) {
     return s.replaceAll(RegExp(r'[\s\u200B-\u200D\uFEFF]'), '');
   }
 
-  static const String _endpoint = 'https://fanyi-api.baidu.com/api/trans/vip/translate';
+  static const String _nmtEndpoint = 'https://fanyi-api.baidu.com/api/trans/vip/translate';
+  static const String _llmEndpoint = 'https://fanyi-api.baidu.com/ait/api/aiTextTranslate';
 
   @override
   String get id => 'baidu';
 
   @override
-  String get displayName => '百度翻译';
+  String get displayName => modelType == 'llm' ? '百度翻译 (大模型)' : '百度翻译 (通用)';
 
   @override
   bool get isConfigured => appId.isNotEmpty && secretKey.isNotEmpty;
@@ -39,6 +44,86 @@ class BaiduTranslationEngine implements TranslationEngine {
   String? get configurationError => isConfigured
       ? null
       : '未配置百度翻译 APP ID 或密钥 (Secret Key)';
+
+  /// 智能清洗视频文件名/标题，剔除压制组信息、分辨率编码等技术标签。
+  /// 若判定为纯哈希/纯数字/无意义临时文件名/乱码，则返回 null，避免带偏大模型。
+  static String? sanitizeVideoTitle(String? rawTitle) {
+    if (rawTitle == null) return null;
+    var title = rawTitle.trim();
+    if (title.isEmpty) return null;
+
+    // 1. 剥离可能存在的路径
+    if (title.contains('/') || title.contains('\\')) {
+      final sep = title.contains('/') ? '/' : '\\';
+      title = title.split(sep).last.trim();
+    }
+
+    // 2. 剥离常见视频后缀扩展名
+    title = title.replaceAll(
+      RegExp(r'\.(mp4|mkv|avi|mov|wmv|flv|webm|ts|m2ts|rmvb|iso|vob|m4v)$', caseSensitive: false),
+      '',
+    ).trim();
+
+    // 3. 剔除常见包含 Raws/字幕组/Fansub 的发布组标签
+    title = title.replaceAll(
+      RegExp(r'\[[A-Za-z0-9_.\s-]+-(Raws?|sub|fansub|rip)\]', caseSensitive: false),
+      ' ',
+    );
+    title = title.replaceAll(
+      RegExp(r'【.*?字幕组.*?】', caseSensitive: false),
+      ' ',
+    );
+
+    // 4. 正则剔除常见的压制规格词、音频编码、分辨率、色彩格式等杂质
+    final techPattern = RegExp(
+      r'\b(2160p|1080p|1080i|720p|480p|360p|4k|8k|uhd|fhd|hd|'
+      r'bluray|bdrip|brrip|web-?dl|web-?rip|hdtv|dvdrip|remux|'
+      r'hdr10\+?|hdr|dolby|vision|atmos|dts-?hd(\.ma)?|dts|truehd|ac3|eac3|aac|flac|mp3|'
+      r'x264|x265|h264|h265|hevc|avc|10bit|8bit|12bit|'
+      r'complete|proper|repack|internal|unrated|extended|directors\.cut)\b',
+      caseSensitive: false,
+    );
+    title = title.replaceAll(techPattern, ' ');
+
+    // 5. 将各种括号、标点、连字符和下划线替换为空格，保留括号内真实的影视剧名
+    title = title.replaceAll(RegExp(r'[\[\]【】()（）._+\-–—]'), ' ');
+    // 合并多余空白
+    title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+    // 6. 质量门禁校验：判断是否为乱码或无意义文件名
+    if (title.length < 2) return null;
+    if (RegExp(r'^\d+$').hasMatch(title)) return null;
+    if (RegExp(r'^(vid|img|dsc|mov|record|temp|untitled|screenrecording|screenshot)\b', caseSensitive: false).hasMatch(title)) {
+      return null;
+    }
+    // 32 位 MD5、SHA 或十六进制哈希
+    if (RegExp(r'^[0-9a-fA-F]{16,}$').hasMatch(title.replaceAll(' ', ''))) {
+      return null;
+    }
+
+    // 字符有效性：若含有过多特殊乱码，非有效语言文字
+    final validChars = RegExp(r'[\u4e00-\u9fa5a-zA-Z0-9\u3040-\u30ff\uac00-\ud7af]');
+    final validMatches = validChars.allMatches(title).length;
+    if (validMatches < 2 || (validMatches / title.length) < 0.4) {
+      return null;
+    }
+
+    // 长度截断，避免异常长标题注入
+    if (title.length > 50) {
+      title = title.substring(0, 50).trim();
+    }
+
+    return title;
+  }
+
+  /// 构造针对大模型的翻译指令（Prompt / reference）。
+  static String buildLlmReference({String? rawTitle}) {
+    final cleanTitle = sanitizeVideoTitle(rawTitle);
+    if (cleanTitle != null && cleanTitle.isNotEmpty) {
+      return '当前对白出自影视作品《$cleanTitle》。请结合该作品的背景、角色关系与剧情口语语境，将以下对白台词翻译为通顺、地道的中文字幕，保持口语化。';
+    }
+    return '请将以下影视对白台词翻译为通顺、地道的中文字幕，保持口语化。';
+  }
 
   @override
   Future<String> testConnection({String testText = 'Hello'}) async {
@@ -58,12 +143,14 @@ class BaiduTranslationEngine implements TranslationEngine {
     required List<String> texts,
     required String targetLanguage,
     String sourceLanguage = 'auto',
+    String? contextTitle,
   }) async {
     if (texts.isEmpty) return const [];
     if (appId.isEmpty || secretKey.isEmpty) {
       throw const TranslationException('未配置百度翻译 APP ID 或密钥 (Secret Key)。');
     }
 
+    final isLlm = modelType == 'llm';
     final lang = TranslationLanguage.findByCode(targetLanguage);
     final toLang = lang.baiduCode;
     final fromLang = sourceLanguage == 'auto' ? 'auto' : TranslationLanguage.findByCode(sourceLanguage).baiduCode;
@@ -83,12 +170,23 @@ class BaiduTranslationEngine implements TranslationEngine {
     http.Response? response;
     dynamic lastError;
 
+    // 根据模式决定请求端点
+    final endpoints = isLlm
+        ? [
+            _llmEndpoint,
+            'http://fanyi-api.baidu.com/ait/api/aiTextTranslate',
+          ]
+        : [
+            _nmtEndpoint,
+            'http://fanyi-api.baidu.com/api/trans/vip/translate',
+          ];
+
     for (final currentKey in candidateKeys) {
       final salt = (DateTime.now().millisecondsSinceEpoch + Random().nextInt(10000)).toString();
       final signStr = '$appId$query$salt$currentKey';
       final sign = md5.convert(utf8.encode(signStr)).toString().toLowerCase();
 
-      final bodyData = {
+      final bodyData = <String, String>{
         'q': query,
         'from': fromLang,
         'to': toLang,
@@ -97,14 +195,19 @@ class BaiduTranslationEngine implements TranslationEngine {
         'sign': sign,
       };
 
-      // 优先尝试 HTTPS，若遇到网络代理拦截或 HandshakeException，自动回退到官方 HTTP 接口
-      for (final endpoint in [_endpoint, 'http://fanyi-api.baidu.com/api/trans/vip/translate']) {
+      if (isLlm) {
+        bodyData['model_type'] = 'llm';
+        bodyData['reference'] = buildLlmReference(rawTitle: contextTitle);
+      }
+
+      // 优先尝试 HTTPS，若遇到网络代理拦截或 HandshakeException，自动回退到 HTTP 接口
+      for (final endpoint in endpoints) {
         try {
           final res = await AdaptiveHttpClient.post(
             Uri.parse(endpoint),
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
             body: bodyData,
-            timeout: const Duration(seconds: 12),
+            timeout: Duration(seconds: isLlm ? 18 : 12),
           );
 
           if (res.statusCode == 200) {
@@ -145,11 +248,21 @@ class BaiduTranslationEngine implements TranslationEngine {
       final Map<String, dynamic> data = jsonDecode(utf8.decode(response.bodyBytes));
       if (data.containsKey('error_code')) {
         final code = data['error_code'].toString();
-        final msg = data['error_msg']?.toString() ?? '未知错误';
-        throw TranslationException(_getFriendlyErrorMessage(code, msg), code: code);
+        // 百度大模型成功返回 error_code 为 "52000"
+        if (code != '52000') {
+          final msg = data['error_msg']?.toString() ?? '未知错误';
+          throw TranslationException(_getFriendlyErrorMessage(code, msg), code: code);
+        }
       }
 
-      final transList = data['trans_result'] as List<dynamic>?;
+      // 兼容大模型格式 data['result']['trans_result'] 与通用翻译格式 data['trans_result']
+      List<dynamic>? transList;
+      if (data['result'] is Map && data['result']['trans_result'] is List) {
+        transList = data['result']['trans_result'] as List<dynamic>;
+      } else if (data['trans_result'] is List) {
+        transList = data['trans_result'] as List<dynamic>;
+      }
+
       if (transList == null || transList.isEmpty) {
         return List.filled(texts.length, '');
       }

@@ -37,6 +37,7 @@ class LocalTranslationEngine implements TranslationEngine {
     required List<String> texts,
     required String targetLanguage,
     String sourceLanguage = 'auto',
+    String? contextTitle,
   }) async {
     throw const TranslationException(
       '本地离线翻译功能暂未就绪，请前往设置切换为在线翻译 API。',

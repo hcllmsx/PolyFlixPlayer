@@ -159,6 +159,7 @@ abstract class TranslationEngine {
     required List<String> texts,
     required String targetLanguage,
     String sourceLanguage = 'auto',
+    String? contextTitle,
   });
 
   /// 当前引擎是否已完成必要的凭据/地址配置。

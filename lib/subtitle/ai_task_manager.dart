@@ -356,7 +356,10 @@ class AiTaskManager extends ChangeNotifier {
       for (final item in list) {
         if (item is Map<String, dynamic>) {
           final task = AiTask.fromJson(item);
-          if (task != null) loaded.add(task);
+          if (task != null) {
+            task.addListener(_onTaskChanged);
+            loaded.add(task);
+          }
         }
       }
       if (loaded.isEmpty) return;
@@ -368,6 +371,16 @@ class AiTaskManager extends ChangeNotifier {
     } catch (_) {
       // 文件损坏时等同于没有历史记录，不影响启动
     }
+  }
+
+  void _onTaskChanged() {
+    notifyListeners();
+  }
+
+  void _addTask(AiTask task) {
+    task.addListener(_onTaskChanged);
+    _tasks.add(task);
+    notifyListeners();
   }
 
   @override
@@ -500,8 +513,7 @@ class AiTaskManager extends ChangeNotifier {
       language: language,
     );
 
-    _tasks.add(task);
-    notifyListeners();
+    _addTask(task);
 
     // 触发执行
     _runTask(task);
@@ -538,8 +550,7 @@ class AiTaskManager extends ChangeNotifier {
       engineId: engine.id,
     );
 
-    _tasks.add(task);
-    notifyListeners();
+    _addTask(task);
 
     _runTranslationTask(
       task: task,
@@ -600,6 +611,7 @@ class AiTaskManager extends ChangeNotifier {
       final translatedEntries = await TranslationService.instance.translateEntries(
         entries: entries,
         targetLanguage: targetLang,
+        contextTitle: task.videoTitle,
         onProgress: (cur, total) {
           if (!task.isCancelled) {
             task.updateTranslationProgress(
@@ -648,6 +660,8 @@ class AiTaskManager extends ChangeNotifier {
           message: '翻译失败: $e',
         );
       }
+    } finally {
+      notifyListeners();
     }
   }
 

@@ -75,6 +75,7 @@ class AzureTranslationEngine implements TranslationEngine {
     required List<String> texts,
     required String targetLanguage,
     String sourceLanguage = 'auto',
+    String? contextTitle,
   }) async {
     if (texts.isEmpty) return const [];
     if (key.isEmpty) {

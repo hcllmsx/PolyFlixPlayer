@@ -256,20 +256,34 @@ class _AiTaskTile extends StatelessWidget {
               ),
               const Spacer(),
               if (task.hasPendingTranslation) ...[
-                Container(
-                  margin: const EdgeInsets.only(right: 6),
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.teal.withValues(alpha: .2),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: const Text(
-                    '已预约翻译',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: Colors.tealAccent,
-                    ),
-                  ),
+                Builder(
+                  builder: (context) {
+                    final isDark = Theme.of(context).brightness == Brightness.dark;
+                    return Container(
+                      margin: const EdgeInsets.only(right: 6),
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                      decoration: BoxDecoration(
+                        color: isDark
+                            ? Colors.teal.shade900.withValues(alpha: 0.65)
+                            : Colors.teal.shade100,
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: isDark
+                              ? Colors.teal.shade300.withValues(alpha: 0.6)
+                              : Colors.teal.shade600.withValues(alpha: 0.6),
+                          width: 0.8,
+                        ),
+                      ),
+                      child: Text(
+                        '已预约翻译',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: isDark ? const Color(0xFF64FFDA) : const Color(0xFF004D40),
+                        ),
+                      ),
+                    );
+                  },
                 ),
               ],
               Container(

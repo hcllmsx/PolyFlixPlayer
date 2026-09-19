@@ -27,6 +27,24 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
   bool _obscureAzureKey = true;
 
   bool _testingConnection = false;
+  bool _isInUse = false;
+
+  String _currentConfigFingerprint() {
+    final provider = aiTranslationProvider.value;
+    if (provider == 'baidu') {
+      return 'baidu:${aiBaiduModelType.value}:${_baiduAppIdCtrl.text.trim()}:${_baiduSecretKeyCtrl.text.trim()}';
+    } else if (provider == 'azure') {
+      return 'azure:${_azureKeyCtrl.text.trim()}:${_azureRegionCtrl.text.trim()}:${aiAzureEndpoint.value.trim()}';
+    } else {
+      return 'local:${_localEndpointCtrl.text.trim()}';
+    }
+  }
+
+  bool _checkIfInUse() {
+    final fp = _currentConfigFingerprint();
+    final verified = aiTranslationVerifiedEngineKey.value;
+    return fp.isNotEmpty && verified.isNotEmpty && fp == verified;
+  }
 
   @override
   void initState() {
@@ -40,6 +58,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
     );
 
     _localEndpointCtrl = TextEditingController(text: aiLocalEndpoint.value);
+    _isInUse = _checkIfInUse();
   }
 
   @override
@@ -53,6 +72,8 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
   }
 
   void _saveBaidu() {
+    final newInUse = _checkIfInUse();
+    if (_isInUse != newInUse) setState(() => _isInUse = newInUse);
     setAiBaiduCredentials(
       appId: _baiduAppIdCtrl.text.trim(),
       secretKey: _baiduSecretKeyCtrl.text.trim(),
@@ -60,6 +81,8 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
   }
 
   void _saveAzure() {
+    final newInUse = _checkIfInUse();
+    if (_isInUse != newInUse) setState(() => _isInUse = newInUse);
     setAiAzureCredentials(
       key: _azureKeyCtrl.text.trim(),
       region: _azureRegionCtrl.text.trim().isNotEmpty
@@ -70,6 +93,8 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
   }
 
   void _saveLocal() {
+    final newInUse = _checkIfInUse();
+    if (_isInUse != newInUse) setState(() => _isInUse = newInUse);
     setAiLocalEndpoint(_localEndpointCtrl.text.trim());
   }
 
@@ -85,7 +110,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
     try {
       final result = await engine.testConnection();
       if (!mounted) return;
-      showDialog(
+      await showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Row(
@@ -114,9 +139,18 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
           ],
         ),
       );
+      final currentFp = _currentConfigFingerprint();
+      await setAiTranslationVerifiedEngineKey(currentFp);
+      if (mounted) {
+        setState(() => _isInUse = true);
+      }
     } catch (e) {
+      await setAiTranslationVerifiedEngineKey('');
+      if (mounted) {
+        setState(() => _isInUse = false);
+      }
       if (!mounted) return;
-      showDialog(
+      await showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Row(
@@ -152,7 +186,9 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
                 const SizedBox(height: 4),
                 Text(
                   engine.id == 'baidu'
-                      ? '1. 请确认填写的是【开发者信息】页面的 APP ID 和密钥，不要使用“API Key 管理”里的大模型 Key。\n2. 请确认在百度翻译开放平台已成功开通【通用文本翻译】服务。\n3. 请检查本地网络连接。'
+                      ? (aiBaiduModelType.value == 'llm'
+                          ? '1. 请确认在百度翻译开放平台已开通【大模型文本翻译】服务（每月赠送 100 万字符）。\n2. 请确认填写的是【开发者信息】页面的 APP ID 和 密钥。\n3. 请检查本地网络连接。'
+                          : '1. 请确认在百度翻译开放平台已开通【通用文本翻译】服务。\n2. 请确认填写的是【开发者信息】页面的 APP ID 和 密钥。\n3. 请检查本地网络连接。')
                       : '1. 请确认【位置/区域】与 Azure 控制台一致（如 eastasia）。\n2. 请确认密钥正确复制完整。\n3. 请检查本地网络连接。',
                   style: const TextStyle(fontSize: 12, height: 1.45),
                 ),
@@ -182,6 +218,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
         aiTranslationTargetLang,
         aiTranslationMode,
         aiTranslationProvider,
+        aiBaiduModelType,
       ]),
       builder: (context, _) {
         final isEnabled = aiTranslationEnabled.value;
@@ -211,25 +248,13 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     // 1. 目标语言优先配置
-                    Row(
-                      children: [
-                        Text(
-                          '翻译目标语言',
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: scheme.onSurface,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          '(首要设置)',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: scheme.primary,
-                          ),
-                        ),
-                      ],
+                    Text(
+                      '翻译目标语言',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: scheme.onSurface,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Container(
@@ -245,6 +270,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
                         child: DropdownButton<String>(
                           isExpanded: true,
                           value: targetLang,
+                          focusColor: Colors.transparent,
                           borderRadius: BorderRadius.circular(8),
                           items: TranslationLanguage.supportedLanguages.map((lang) {
                             return DropdownMenuItem<String>(
@@ -395,15 +421,21 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
             ChoiceChip(
               label: const Text('百度翻译'),
               selected: provider == 'baidu',
-              onSelected: (sel) {
-                if (sel) setAiTranslationProvider('baidu');
+              onSelected: (sel) async {
+                if (sel) {
+                  await setAiTranslationProvider('baidu');
+                  if (mounted) setState(() => _isInUse = _checkIfInUse());
+                }
               },
             ),
             ChoiceChip(
               label: const Text('微软 Azure 翻译'),
               selected: provider == 'azure',
-              onSelected: (sel) {
-                if (sel) setAiTranslationProvider('azure');
+              onSelected: (sel) async {
+                if (sel) {
+                  await setAiTranslationProvider('azure');
+                  if (mounted) setState(() => _isInUse = _checkIfInUse());
+                }
               },
             ),
           ],
@@ -427,31 +459,44 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
                 _buildAzureForm(scheme),
               ],
               const SizedBox(height: 14),
-              // 测试连接按钮
-              Row(
-                children: [
-                  FilledButton.tonalIcon(
-                    onPressed: _testingConnection ? null : _testConnection,
-                    icon: _testingConnection
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
+              // 测试并使用按钮
+              Builder(
+                builder: (context) {
+                  final isDark = Theme.of(context).brightness == Brightness.dark;
+                  return FilledButton.tonal(
+                    style: _isInUse
+                        ? FilledButton.styleFrom(
+                            backgroundColor: isDark
+                                ? const Color(0xFF1B382B)
+                                : const Color(0xFFE8F5E9),
+                            foregroundColor: isDark
+                                ? const Color(0xFF81C784)
+                                : const Color(0xFF2E7D32),
+                            side: BorderSide(
+                              color: isDark
+                                  ? const Color(0xFF388E3C).withValues(alpha: 0.6)
+                                  : const Color(0xFF81C784),
+                              width: 1,
+                            ),
                           )
-                        : const Icon(Icons.network_check_rounded, size: 18),
-                    label: Text(_testingConnection ? '正在测试...' : '测试连接'),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      '输入凭据后点测试，立即验证 API 有效性。',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
-                ],
+                        : null,
+                    onPressed: _testingConnection ? null : _testConnection,
+                    child: _testingConnection
+                        ? const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                              SizedBox(width: 8),
+                              Text('正在测试...'),
+                            ],
+                          )
+                        : Text(_isInUse ? '使用中...' : '测试并使用'),
+                  );
+                },
               ),
             ],
           ),
@@ -461,6 +506,9 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
   }
 
   Widget _buildBaiduForm(ColorScheme scheme) {
+    final currentModelType = aiBaiduModelType.value;
+    final isLlm = currentModelType == 'llm';
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -469,7 +517,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
             const Icon(Icons.vpn_key_outlined, size: 16),
             const SizedBox(width: 6),
             Text(
-              '百度通用翻译 API 配置',
+              '百度翻译 API 配置',
               style: TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
@@ -478,14 +526,53 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
             ),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 10),
+        // 模式切换：大模型翻译 (LLM) vs 通用翻译 (NMT)
+        Text(
+          '翻译模式',
+          style: TextStyle(
+            fontSize: 12.5,
+            fontWeight: FontWeight.w500,
+            color: scheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            ChoiceChip(
+              showCheckmark: false,
+              label: const Text('大模型'),
+              selected: isLlm,
+              onSelected: (sel) {
+                if (sel) {
+                  setAiBaiduModelType('llm');
+                  setState(() => _isInUse = _checkIfInUse());
+                }
+              },
+            ),
+            ChoiceChip(
+              showCheckmark: false,
+              label: const Text('传统'),
+              selected: !isLlm,
+              onSelected: (sel) {
+                if (sel) {
+                  setAiBaiduModelType('nmt');
+                  setState(() => _isInUse = _checkIfInUse());
+                }
+              },
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
         TextField(
           controller: _baiduAppIdCtrl,
           style: const TextStyle(fontSize: 13),
           decoration: const InputDecoration(
             isDense: true,
             labelText: 'APP ID',
-            hintText: '百度翻译开放平台控制台的 APP ID',
+            hintText: '百度翻译开放平台「开发者信息」中的 APP ID',
             border: OutlineInputBorder(),
           ),
           onChanged: (_) => _saveBaidu(),
@@ -498,7 +585,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
           decoration: InputDecoration(
             isDense: true,
             labelText: '密钥',
-            hintText: '输入百度翻译密钥',
+            hintText: '百度翻译开放平台「开发者信息」中的密钥',
             border: const OutlineInputBorder(),
             suffixIcon: IconButton(
               icon: Icon(
@@ -512,10 +599,37 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
           ),
           onChanged: (_) => _saveBaidu(),
         ),
-        const SizedBox(height: 6),
-        Text(
-          '提示：请填写百度翻译开放平台「开发者信息」页面的 APP ID 与 密钥；切勿填写大模型或“API Key 管理”中的 Key。',
-          style: TextStyle(fontSize: 11.5, color: scheme.onSurfaceVariant),
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.35),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                isLlm ? Icons.tips_and_updates_outlined : Icons.info_outline,
+                size: 14,
+                color: scheme.primary,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  isLlm
+                      ? '大模型模式：每月赠送 100 万字符免费额度，能结合视频片名推断语境翻译出更生动口语化的字幕。\n请在开放平台开通「大模型文本翻译」，并填写「开发者信息」中的 APP ID 与 密钥即可。'
+                      : '通用模式：百度传统机器翻译接口。请确保在开放平台已开通「通用文本翻译」，并填写「开发者信息」中的 APP ID 与 密钥。',
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    height: 1.45,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ],
     );

@@ -302,4 +302,85 @@ Second subtitle entry.
       expect(asrTask.hasPendingTranslation, isFalse);
     });
   });
+
+  group('Baidu LLM & Video Title Sanitization Tests', () {
+    test('BaiduTranslationEngine default modelType is llm', () {
+      final defaultEngine = BaiduTranslationEngine(appId: 'testApp', secretKey: 'testKey');
+      expect(defaultEngine.modelType, 'llm');
+      expect(defaultEngine.displayName, contains('大模型'));
+
+      final nmtEngine = BaiduTranslationEngine(appId: 'testApp', secretKey: 'testKey', modelType: 'nmt');
+      expect(nmtEngine.modelType, 'nmt');
+      expect(nmtEngine.displayName, contains('通用'));
+    });
+
+    test('sanitizeVideoTitle extracts clean title from typical video filenames', () {
+      // 英文电影带年份、清晰度、压制标签
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('Inception.2010.1080p.BluRay.x265.DTS-HD.mkv'),
+        'Inception 2010',
+      );
+
+      // 中文动漫带字幕组与压制参数
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('[DBD-Raws][秒速5厘米][BDRip][1080P][HEVC-10bit][FLAC].mp4'),
+        '秒速5厘米',
+      );
+
+      // 电视剧季度集数
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('Game.of.Thrones.S08E06.2160p.UHD.HDR.mkv'),
+        'Game of Thrones S08E06',
+      );
+
+      // 带有本地路径的文件名
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle(r'D:\Downloads\Movies\Oppenheimer.2023.WEB-DL.mkv'),
+        'Oppenheimer 2023',
+      );
+    });
+
+    test('sanitizeVideoTitle rejects hashes, device recordings, numbers and invalid names', () {
+      // 32 位 MD5 哈希
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('d41d8cd98f00b204e9800998ecf8427e.mp4'),
+        isNull,
+      );
+
+      // 相机/手机自动命名
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('VID_20230501_143022.mp4'),
+        isNull,
+      );
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('IMG_8923.MOV'),
+        isNull,
+      );
+      expect(
+        BaiduTranslationEngine.sanitizeVideoTitle('ScreenRecording_2024.mp4'),
+        isNull,
+      );
+
+      // 纯数字或单字符
+      expect(BaiduTranslationEngine.sanitizeVideoTitle('123456.mkv'), isNull);
+      expect(BaiduTranslationEngine.sanitizeVideoTitle('a.mp4'), isNull);
+      expect(BaiduTranslationEngine.sanitizeVideoTitle(null), isNull);
+      expect(BaiduTranslationEngine.sanitizeVideoTitle('   '), isNull);
+    });
+
+    test('buildLlmReference generates context prompt for valid titles and fallback for invalid', () {
+      final promptWithTitle = BaiduTranslationEngine.buildLlmReference(
+        rawTitle: 'Interstellar.2014.1080p.mkv',
+      );
+      expect(promptWithTitle, contains('《Interstellar 2014》'));
+      expect(promptWithTitle, contains('结合该作品的背景'));
+
+      final fallbackPrompt = BaiduTranslationEngine.buildLlmReference(
+        rawTitle: 'VID_20231010.mp4',
+      );
+      expect(fallbackPrompt, isNot(contains('《')));
+      expect(fallbackPrompt, contains('请将以下影视对白台词翻译为通顺、地道的中文字幕'));
+    });
+  });
 }
+

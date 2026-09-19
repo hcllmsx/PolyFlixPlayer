@@ -1077,17 +1077,6 @@ class _HomeTabBar extends StatelessWidget {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (showSpinner) ...[
-                SizedBox(
-                  width: 13,
-                  height: 13,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: scheme.primary,
-                  ),
-                ),
-                const SizedBox(width: 7),
-              ],
               Text(
                 label,
                 style: TextStyle(
@@ -1108,6 +1097,17 @@ class _HomeTabBar extends StatelessWidget {
                     color: scheme.onSurfaceVariant.withValues(
                       alpha: selected ? .7 : .5,
                     ),
+                  ),
+                ),
+              ],
+              if (showSpinner) ...[
+                const SizedBox(width: 7),
+                SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: scheme.primary,
                   ),
                 ),
               ],

@@ -30,12 +30,14 @@ const String _kAiTranslationMode = 'aiTranslationMode';
 const String _kAiTranslationProvider = 'aiTranslationProvider';
 const String _kAiBaiduAppId = 'aiBaiduAppId';
 const String _kAiBaiduSecretKey = 'aiBaiduSecretKey';
+const String _kAiBaiduModelType = 'aiBaiduModelType';
 const String _kAiAzureKey = 'aiAzureKey';
 const String _kAiAzureRegion = 'aiAzureRegion';
 const String _kAiAzureEndpoint = 'aiAzureEndpoint';
 const String _kAiLocalEndpoint = 'aiLocalEndpoint';
 const String _kAiTranslationProxyMode = 'aiTranslationProxyMode';
 const String _kAiTranslationCustomProxy = 'aiTranslationCustomProxy';
+const String _kAiTranslationVerifiedEngineKey = 'aiTranslationVerifiedEngineKey';
 
 /// "短片不记进度"可选档位（秒）。0 = 不限制。
 ///
@@ -72,6 +74,9 @@ final ValueNotifier<String> aiBaiduAppId = ValueNotifier<String>('');
 /// 百度翻译 Secret Key。
 final ValueNotifier<String> aiBaiduSecretKey = ValueNotifier<String>('');
 
+/// 百度翻译模型模式（llm: 大模型翻译，默认 | nmt: 通用机器翻译）。
+final ValueNotifier<String> aiBaiduModelType = ValueNotifier<String>('llm');
+
 /// 微软 Azure 翻译 Key。
 final ValueNotifier<String> aiAzureKey = ValueNotifier<String>('');
 
@@ -89,6 +94,9 @@ final ValueNotifier<String> aiTranslationCustomProxy = ValueNotifier<String>('')
 
 /// 本地翻译端点地址预留。
 final ValueNotifier<String> aiLocalEndpoint = ValueNotifier<String>('');
+
+/// 最近一次测试通过并在用状态的翻译引擎配置特征键（指纹）。
+final ValueNotifier<String> aiTranslationVerifiedEngineKey = ValueNotifier<String>('');
 
 /// AI 语音识别上次使用的模型 ID（tiny / base / small）。
 ///
@@ -151,6 +159,7 @@ Future<void> loadAppSettings() async {
   aiTranslationProvider.value = (savedProvider == 'tencent') ? 'baidu' : savedProvider;
   aiBaiduAppId.value = store.getString(_kAiBaiduAppId) ?? '';
   aiBaiduSecretKey.value = store.getString(_kAiBaiduSecretKey) ?? '';
+  aiBaiduModelType.value = store.getString(_kAiBaiduModelType) ?? 'llm';
   aiAzureKey.value = store.getString(_kAiAzureKey) ?? '';
   final savedRegion = store.getString(_kAiAzureRegion) ?? 'eastasia';
   aiAzureRegion.value = (savedRegion.isEmpty || savedRegion == 'global') ? 'eastasia' : savedRegion;
@@ -158,6 +167,7 @@ Future<void> loadAppSettings() async {
   aiLocalEndpoint.value = store.getString(_kAiLocalEndpoint) ?? '';
   aiTranslationProxyMode.value = store.getString(_kAiTranslationProxyMode) ?? 'auto';
   aiTranslationCustomProxy.value = store.getString(_kAiTranslationCustomProxy) ?? '';
+  aiTranslationVerifiedEngineKey.value = store.getString(_kAiTranslationVerifiedEngineKey) ?? '';
 }
 
 /// 写入"窗口适应视频比例"开关。
@@ -204,6 +214,12 @@ Future<void> setAiBaiduCredentials({required String appId, required String secre
   await AppStore.instance.setString(_kAiBaiduSecretKey, secretKey);
 }
 
+/// 写入百度翻译模型模式（llm / nmt）。
+Future<void> setAiBaiduModelType(String value) async {
+  aiBaiduModelType.value = value;
+  await AppStore.instance.setString(_kAiBaiduModelType, value);
+}
+
 /// 写入微软 Azure 翻译凭据。
 Future<void> setAiAzureCredentials({
   required String key,
@@ -234,6 +250,12 @@ Future<void> setAiTranslationProxy({
   aiTranslationCustomProxy.value = customProxy;
   await AppStore.instance.setString(_kAiTranslationProxyMode, mode);
   await AppStore.instance.setString(_kAiTranslationCustomProxy, customProxy);
+}
+
+/// 写入当前已测试通过并在用状态的翻译引擎配置指纹。
+Future<void> setAiTranslationVerifiedEngineKey(String value) async {
+  aiTranslationVerifiedEngineKey.value = value;
+  await AppStore.instance.setString(_kAiTranslationVerifiedEngineKey, value);
 }
 
 /// 写入"AI 语音识别模型"选择，下次打开面板时恢复。

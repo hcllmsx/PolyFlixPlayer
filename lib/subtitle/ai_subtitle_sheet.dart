@@ -410,9 +410,15 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       }
     }
 
-    // 选中的模型没导入时，回落到第一个已导入的模型；一个都没导入则保持原选择，
-    // 由界面提示去设置页导入。
-    if (!imported.contains(activeId)) {
+    // 只有在当前既没有承载有效字幕、当前选中的模型也没有历史缓存时，
+    // 若当前选中的模型未导入，才回落到第一个已导入的模型，方便用户发起全新识别。
+    // 如果当前选中的模型已产出字幕缓存（哪怕模型文件后续已被用户删除），
+    // 必须忠实锁定为该模型，让用户明确知晓字幕来源并支持正常查看与删除。
+    final hasLoadedEntries = _localEntries.isNotEmpty ||
+        (_generator.holdsEntriesFor(widget.videoPath) && _generator.entries.isNotEmpty);
+    final hasCacheForActive = cachedList.contains(activeId);
+
+    if (!hasLoadedEntries && !hasCacheForActive && !imported.contains(activeId)) {
       final fallback = availableModels
           .where((m) => imported.contains(m.id))
           .toList();
@@ -424,9 +430,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _modelAvailability = {
         for (final m in availableModels) m.id: imported.contains(m.id),
       };
-      // 选中的模型确实已导入时才落位。正在识别时 _selectedModel 已经是任务用的
-      // 那个模型（同样已导入），所以这里无条件同步是安全的，也不会打断识别。
-      if (imported.contains(activeId)) _selectedModel = activeId;
+      _selectedModel = activeId;
       _checkingModels = false;
     });
     _syncEnglishOnlyLanguage();
@@ -576,7 +580,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     if (confirm != true) return;
 
-    // 1. 删除当前选定模型的磁盘物理缓存文件（主缓存 + 关联翻译缓存全量扫盘清理）
+    // 1. 删除磁盘物理缓存文件（优先当前选定模型，若内存单例或历史缓存来自其他模型也一并清理）
     await AiTaskManager.instance.deleteCachedSubtitles(
       _cacheKey,
       modelId: _selectedModel,
@@ -586,6 +590,21 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         widget.videoPath,
         modelId: _selectedModel,
       );
+    }
+    final genModelId = _generator.entriesModelId;
+    if (genModelId != null &&
+        genModelId.isNotEmpty &&
+        genModelId.toLowerCase() != _selectedModel.toLowerCase()) {
+      await AiTaskManager.instance.deleteCachedSubtitles(
+        _cacheKey,
+        modelId: genModelId,
+      );
+      if (widget.videoPath != _cacheKey) {
+        await AiTaskManager.instance.deleteCachedSubtitles(
+          widget.videoPath,
+          modelId: genModelId,
+        );
+      }
     }
 
     // 2. 清理任务管理器中该模型的历史任务记录（解除 completed 状态死锁）
@@ -599,15 +618,19 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         modelId: _selectedModel,
       );
     }
-
-    // 3. 清空内存字幕（若当前内存中的字幕归属是被删除的模型，清空并关闭画面显示）
-    final isCurrentGenModel = _generator.entriesModelId == null ||
-        _generator.entriesModelId!.toLowerCase() == _selectedModel.toLowerCase();
-    if (isCurrentGenModel) {
-      _localEntries = [];
-      _generator.clear();
-      widget.onToggleSubtitleActive(false);
+    if (genModelId != null && genModelId.isNotEmpty) {
+      AiTaskManager.instance.clearTaskFor(_cacheKey, modelId: genModelId);
+      if (widget.videoPath != _cacheKey) {
+        AiTaskManager.instance.clearTaskFor(widget.videoPath, modelId: genModelId);
+      }
     }
+
+    // 3. 彻底清空内存字幕与播放器字幕显示（无条件执行）
+    _localEntries = [];
+    if (_generator.holdsEntriesFor(widget.videoPath)) {
+      _generator.clear();
+    }
+    widget.onToggleSubtitleActive(false);
 
     // 4. 重新扫描磁盘缓存与可用模型（不自动回填其他模型缓存）
     await _checkModels(autoLoadCached: false);
@@ -615,15 +638,13 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     // 5. 立即刷新界面状态：回到就绪状态，确保「开始识别」按钮恢复可点击
     if (mounted) {
       setState(() {
-        if (isCurrentGenModel) {
-          _localEntries = [];
-          _isAiSubtitleActive = false;
-        }
+        _localEntries = [];
+        _isAiSubtitleActive = false;
         _currentState = AsrState.idle;
         _statusMessage = null;
         _previewExpanded = false;
       });
-      AppToast.show(context, '已成功删除 $modelName 模型字幕缓存，可重新识别');
+      AppToast.show(context, '已成功删除字幕缓存，可重新识别');
     }
   }
 
@@ -1732,7 +1753,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     required bool hasCache,
   }) {
     if (isRunning) return '识别进行中，暂不能切换模型';
-    if (!isAvailable) return '尚未导入模型，点击右侧选择（需先在设置页导入）';
+    if (!isAvailable) {
+      if (hasCache) return '已生成字幕缓存（本地模型文件已移除，可正常显示或删除）';
+      return '尚未导入模型，点击右侧选择（需先在设置页导入）';
+    }
 
     final buffer = StringBuffer(info?.sizeLabel ?? '');
     if (hasCache) buffer.write(' · 已生成该模型字幕缓存');
@@ -1972,35 +1996,50 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               OutlinedButton.icon(
                 style: OutlinedButton.styleFrom(
                   visualDensity: VisualDensity.compact,
+                  backgroundColor: Colors.redAccent.withValues(alpha: .08),
                   side: BorderSide(
-                    color: Colors.redAccent.withValues(alpha: .3),
+                    color: Colors.redAccent.withValues(alpha: .5),
                   ),
                   foregroundColor: Colors.redAccent.shade100,
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 ),
                 onPressed: _deleteBuiltinTranslationWithConfirm,
-                icon: const Icon(Icons.delete_outline_rounded, size: 15),
-                label: const Text('删除翻译缓存', style: TextStyle(fontSize: 12)),
+                icon: Icon(Icons.delete_outline_rounded, size: 15, color: Colors.redAccent.shade100),
+                label: Text(
+                  '删除翻译缓存',
+                  style: TextStyle(fontSize: 12, color: Colors.redAccent.shade100),
+                ),
               ),
           ] else ...[
-            OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                side: BorderSide(
-                  color: _cachedModels.contains(_selectedModel)
-                      ? Colors.redAccent.withValues(alpha: .3)
-                      : Colors.white12,
-                ),
-                foregroundColor: _cachedModels.contains(_selectedModel)
-                    ? Colors.redAccent.shade100
-                    : Colors.white30,
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              ),
-              onPressed: _cachedModels.contains(_selectedModel)
-                  ? _deleteSubtitlesWithConfirm
-                  : null,
-              icon: const Icon(Icons.delete_outline_rounded, size: 15),
-              label: const Text('删除字幕缓存', style: TextStyle(fontSize: 12)),
+            Builder(
+              builder: (context) {
+                final isCached = _cachedModels.contains(_selectedModel) ||
+                    _currentDisplayEntries.isNotEmpty ||
+                    _cachedModels.isNotEmpty;
+                final btnColor = isCached ? Colors.redAccent.shade100 : Colors.white38;
+                return OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor: isCached
+                        ? Colors.redAccent.withValues(alpha: .08)
+                        : Colors.transparent,
+                    side: BorderSide(
+                      color: isCached
+                          ? Colors.redAccent.withValues(alpha: .5)
+                          : Colors.white12,
+                    ),
+                    foregroundColor: btnColor,
+                    disabledForegroundColor: Colors.white38,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  ),
+                  onPressed: isCached ? _deleteSubtitlesWithConfirm : null,
+                  icon: Icon(Icons.delete_outline_rounded, size: 15, color: btnColor),
+                  label: Text(
+                    '删除字幕缓存',
+                    style: TextStyle(fontSize: 12, color: btnColor),
+                  ),
+                );
+              },
             ),
           ],
         ],

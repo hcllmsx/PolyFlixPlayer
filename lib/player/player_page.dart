@@ -1641,6 +1641,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   }
 
   Widget _buildPlayer() {
+    final screenSize = MediaQuery.sizeOf(context);
+    final isEffectiveLandscape = _isLandscape && (screenSize.width > screenSize.height);
+    final isPortraitMobile = isMobilePlatform && !isEffectiveLandscape;
     final currentPosition = _scrubbing ? _scrubPosition : _position;
     final content = Stack(
       fit: StackFit.expand,
@@ -1697,7 +1700,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
               ? _buildDesktopTrackControls()
               : null,
           mobileTrackControls: isMobilePlatform
-              ? _buildMobileTrackControls()
+              ? _buildMobileTrackControls(isCompact: isPortraitMobile)
               : null,
           onPlayPause: _togglePlayback,
           onSpeedTap: () => _showSpeedSheet(),
@@ -1800,12 +1803,25 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   ///
   /// 移动端没有鼠标悬停，PopupMenuButton 在触屏上的命中区域与观感都不理想，
   /// 所以不复用桌面端的弹出菜单，改走与倍速一致的 bottom sheet。
-  Widget _buildMobileTrackControls() {
+  Widget _buildMobileTrackControls({bool isCompact = false}) {
     final audioTracks = _audioTracks;
+    final iconConstraints = isCompact
+        ? const BoxConstraints(minWidth: 34, minHeight: 34)
+        : null;
+    final iconPadding = isCompact
+        ? const EdgeInsets.all(5)
+        : const EdgeInsets.all(8);
+    final iconSize = isCompact ? 20.0 : 24.0;
+    final visualDensity = isCompact ? VisualDensity.compact : null;
+
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         IconButton(
+          constraints: iconConstraints,
+          padding: iconPadding,
+          visualDensity: visualDensity,
+          iconSize: iconSize,
           onPressed: audioTracks.isEmpty ? null : _showAudioSheet,
           tooltip: audioTracks.isEmpty ? '该视频没有可选音轨' : '音轨',
           icon: Icon(
@@ -1816,6 +1832,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           ),
         ),
         IconButton(
+          constraints: iconConstraints,
+          padding: iconPadding,
+          visualDensity: visualDensity,
+          iconSize: iconSize,
           onPressed: _showSubtitleSettingsSheet,
           tooltip: '字幕设置',
           icon: Icon(
@@ -1826,14 +1846,18 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         // AI 字幕按钮（总开关打开时常驻可见，点击弹出控制面板）
         if (_aiFeatureEnabled)
           IconButton(
+            constraints: iconConstraints,
+            padding: iconPadding,
+            visualDensity: visualDensity,
+            iconSize: iconSize,
             onPressed: _showAiSubtitleSheet,
             tooltip: _aiButtonTooltip,
             icon: _aiSubtitleRunning
                 ? SizedBox(
-                    width: 20,
-                    height: 20,
+                    width: isCompact ? 17 : 20,
+                    height: isCompact ? 17 : 20,
                     child: CircularProgressIndicator(
-                      strokeWidth: 2,
+                      strokeWidth: isCompact ? 1.8 : 2,
                       color: Theme.of(context).colorScheme.primary,
                     ),
                   )
@@ -1885,16 +1909,21 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       showDragHandle: true,
       isScrollControlled: true,
       constraints: const BoxConstraints(maxWidth: 520),
-      builder: (context) => _SubtitleSettingsSheet(
-        primarySubId: _primarySubId,
-        secondarySubId: _secondarySubId,
-        hasTranslation: _hasTranslation,
-        hasAiOriginal: _hasAiOriginal,
-        subtitleTracks: _subtitleTracks,
-        onSelectPrimary: (id) => _selectPrimarySubtitle(id),
-        onSelectSecondary: (id) => _selectSecondarySubtitle(id),
-        onCloseAll: _closeAllSubtitles,
-        formatTrackLabel: _subtitleLabel,
+      builder: (context) => ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.9,
+        ),
+        child: _SubtitleSettingsSheet(
+          primarySubId: _primarySubId,
+          secondarySubId: _secondarySubId,
+          hasTranslation: _hasTranslation,
+          hasAiOriginal: _hasAiOriginal,
+          subtitleTracks: _subtitleTracks,
+          onSelectPrimary: (id) => _selectPrimarySubtitle(id),
+          onSelectSecondary: (id) => _selectSecondarySubtitle(id),
+          onCloseAll: _closeAllSubtitles,
+          formatTrackLabel: _subtitleLabel,
+        ),
       ),
     );
   }
@@ -2526,6 +2555,10 @@ class _PlayerBottomControls extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenSize = MediaQuery.sizeOf(context);
+    final isEffectiveLandscape = isLandscape && (screenSize.width > screenSize.height);
+    final isPortraitMobile = isMobilePlatform && !isEffectiveLandscape;
+
     final total = duration.inMilliseconds.toDouble();
     final current = position.inMilliseconds.toDouble().clamp(
       0.0,
@@ -2588,8 +2621,8 @@ class _PlayerBottomControls extends StatelessWidget {
                     Row(
                       children: [
                         // 移动端竖屏时屏幕中央已有大号播放/进退按钮，底部最左侧播放按钮隐藏以防宽度不足溢出；
-                        // 横屏或桌面端保留底部播放按钮。
-                        if (isDesktopPlatform || isLandscape) ...[
+                        // 仅在横屏真正就绪或桌面端保留底部播放按钮（防止旋转瞬间宽度未变导致溢出）。
+                        if (isDesktopPlatform || isEffectiveLandscape) ...[
                           IconButton(
                             onPressed: onPlayPause,
                             tooltip: playing ? '暂停' : '播放',
@@ -2605,18 +2638,18 @@ class _PlayerBottomControls extends StatelessWidget {
                           const SizedBox(width: 4),
                         Text(
                           _formatDuration(position),
-                          style: const TextStyle(
+                          style: TextStyle(
                             color: Colors.white,
-                            fontSize: 13,
-                            fontFeatures: [FontFeature.tabularFigures()],
+                            fontSize: isPortraitMobile ? 11.5 : 13,
+                            fontFeatures: const [FontFeature.tabularFigures()],
                           ),
                         ),
                         Text(
                           ' / ${_formatDuration(duration)}',
-                          style: const TextStyle(
-                            color: Color(0xFFCAC7D0),
-                            fontSize: 13,
-                            fontFeatures: [FontFeature.tabularFigures()],
+                          style: TextStyle(
+                            color: const Color(0xFFCAC7D0),
+                            fontSize: isPortraitMobile ? 11.5 : 13,
+                            fontFeatures: const [FontFeature.tabularFigures()],
                           ),
                         ),
                         const Spacer(),
@@ -2629,21 +2662,34 @@ class _PlayerBottomControls extends StatelessWidget {
                             backgroundColor: Colors.white.withValues(
                               alpha: .16,
                             ),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
+                            padding: EdgeInsets.symmetric(
+                              horizontal: isPortraitMobile ? 7 : 12,
+                              vertical: isPortraitMobile ? 4 : 8,
                             ),
                             minimumSize: Size.zero,
                             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                           ),
                           child: Text(
                             '${speed.toStringAsFixed(speed % 1 == 0 ? 0 : 2)}x',
-                            style: const TextStyle(fontWeight: FontWeight.w700),
+                            style: TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: isPortraitMobile ? 11.5 : 14,
+                            ),
                           ),
                         ),
                         if (showOrientationToggle) ...[
-                          const SizedBox(width: 4),
+                          SizedBox(width: isPortraitMobile ? 2 : 4),
                           IconButton(
+                            constraints: isPortraitMobile
+                                ? const BoxConstraints(minWidth: 34, minHeight: 34)
+                                : null,
+                            padding: isPortraitMobile
+                                ? const EdgeInsets.all(5)
+                                : const EdgeInsets.all(8),
+                            visualDensity: isPortraitMobile
+                                ? VisualDensity.compact
+                                : null,
+                            iconSize: isPortraitMobile ? 20.0 : 24.0,
                             onPressed: onToggleOrientation,
                             tooltip: isLandscape ? '切换竖屏' : '切换横屏',
                             icon: Icon(
@@ -2689,6 +2735,10 @@ class _SpeedSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SafeArea(
+      top: false,
+      left: false,
+      right: false,
+      bottom: true,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
         child: Column(
@@ -2804,6 +2854,10 @@ class _TrackSelectionSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SafeArea(
+      top: false,
+      left: false,
+      right: false,
+      bottom: true,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
         child: Column(
@@ -3152,9 +3206,20 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
         ? _currentSecondary
         : 'none';
 
+    final isMobile = isMobilePlatform;
+
     return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 6, 20, 20),
+      top: false,
+      left: false,
+      right: false,
+      bottom: true,
+      child: SingleChildScrollView(
+        padding: EdgeInsets.fromLTRB(
+          isMobile ? 16 : 20,
+          isMobile ? 0 : 6,
+          isMobile ? 16 : 20,
+          isMobile ? 12 : 16,
+        ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3163,23 +3228,23 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
             Row(
               children: [
                 Container(
-                  padding: const EdgeInsets.all(6),
+                  padding: EdgeInsets.all(isMobile ? 5 : 6),
                   decoration: BoxDecoration(
                     color: theme.colorScheme.primary.withValues(alpha: .15),
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(isMobile ? 6 : 8),
                   ),
                   child: Icon(
                     Icons.subtitles_rounded,
                     color: theme.colorScheme.primary,
-                    size: 20,
+                    size: isMobile ? 17 : 20,
                   ),
                 ),
-                const SizedBox(width: 10),
-                const Text(
+                SizedBox(width: isMobile ? 8 : 10),
+                Text(
                   '字幕设置',
                   style: TextStyle(
                     color: Colors.white,
-                    fontSize: 18,
+                    fontSize: isMobile ? 15.5 : 18,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -3191,14 +3256,17 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
                       visualDensity: VisualDensity.compact,
                     ),
                     onPressed: _closeAll,
-                    icon: const Icon(Icons.subtitles_off_outlined, size: 16),
-                    label: const Text('关闭全部字幕', style: TextStyle(fontSize: 12.5)),
+                    icon: Icon(Icons.subtitles_off_outlined, size: isMobile ? 14 : 16),
+                    label: Text(
+                      '关闭全部字幕',
+                      style: TextStyle(fontSize: isMobile ? 11.5 : 12.5),
+                    ),
                   ),
               ],
             ),
-            const SizedBox(height: 12),
+            SizedBox(height: isMobile ? 8 : 12),
             const Divider(color: Colors.white10, height: 1),
-            const SizedBox(height: 16),
+            SizedBox(height: isMobile ? 10 : 14),
 
             // 1. 主字幕板块（上层 · 大号）
             _buildSectionHeader(
@@ -3206,16 +3274,18 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
               title: '主字幕',
               subTitle: '显示在上方 · 主要阅读',
               theme: theme,
+              isMobile: isMobile,
             ),
-            const SizedBox(height: 8),
+            SizedBox(height: isMobile ? 6 : 8),
             _buildDropdown(
               selectedValue: effectivePrimary,
               items: primaryItems,
               onChanged: _choosePrimary,
               theme: theme,
+              isMobile: isMobile,
             ),
 
-            const SizedBox(height: 18),
+            SizedBox(height: isMobile ? 10 : 14),
 
             // 2. 副字幕板块（下层 · 对照辅助）
             _buildSectionHeader(
@@ -3223,20 +3293,25 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
               title: '副字幕',
               subTitle: '显示在下方 · 对照辅助',
               theme: theme,
+              isMobile: isMobile,
             ),
-            const SizedBox(height: 8),
+            SizedBox(height: isMobile ? 6 : 8),
             _buildDropdown(
               selectedValue: effectiveSecondary,
               items: secondaryItems,
               onChanged: _chooseSecondary,
               theme: theme,
+              isMobile: isMobile,
             ),
 
-            const SizedBox(height: 16),
-            const Center(
+            SizedBox(height: isMobile ? 10 : 14),
+            Center(
               child: Text(
                 '提示：主字幕在上方、副字幕在下方。图形类字幕仅能在主字幕中由底层硬件直接渲染。',
-                style: TextStyle(color: Colors.white38, fontSize: 11.5),
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: isMobile ? 10.5 : 11.5,
+                ),
               ),
             ),
           ],
@@ -3250,23 +3325,27 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
     required String title,
     required String subTitle,
     required ThemeData theme,
+    required bool isMobile,
   }) {
     return Row(
       children: [
-        Icon(icon, size: 16, color: theme.colorScheme.primary),
-        const SizedBox(width: 6),
+        Icon(icon, size: isMobile ? 14.5 : 16, color: theme.colorScheme.primary),
+        SizedBox(width: isMobile ? 5 : 6),
         Text(
           title,
-          style: const TextStyle(
+          style: TextStyle(
             color: Colors.white,
-            fontSize: 14,
+            fontSize: isMobile ? 13 : 14,
             fontWeight: FontWeight.w600,
           ),
         ),
-        const SizedBox(width: 8),
+        SizedBox(width: isMobile ? 6 : 8),
         Text(
           subTitle,
-          style: const TextStyle(color: Colors.white54, fontSize: 12),
+          style: TextStyle(
+            color: Colors.white54,
+            fontSize: isMobile ? 11 : 12,
+          ),
         ),
       ],
     );
@@ -3277,22 +3356,31 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
     required List<_SubDropdownItem> items,
     required ValueChanged<String> onChanged,
     required ThemeData theme,
+    required bool isMobile,
   }) {
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF262630),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(isMobile ? 10 : 12),
         border: Border.all(color: Colors.white12),
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 12 : 14,
+        vertical: isMobile ? 0 : 2,
+      ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
           isExpanded: true,
           value: selectedValue,
+          focusColor: Colors.transparent,
           dropdownColor: const Color(0xFF262630),
-          borderRadius: BorderRadius.circular(12),
-          menuMaxHeight: 320,
-          icon: const Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white70),
+          borderRadius: BorderRadius.circular(isMobile ? 10 : 12),
+          menuMaxHeight: isMobile ? 240 : 320,
+          icon: Icon(
+            Icons.keyboard_arrow_down_rounded,
+            color: Colors.white70,
+            size: isMobile ? 20 : 24,
+          ),
           items: items.map((item) {
             final isSelected = item.id == selectedValue;
             return DropdownMenuItem<String>(
@@ -3300,40 +3388,43 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
               child: Row(
                 children: [
                   SizedBox(
-                    width: 22,
+                    width: isMobile ? 19 : 22,
                     child: isSelected
                         ? Icon(
                             Icons.check_rounded,
-                            size: 17,
+                            size: isMobile ? 15 : 17,
                             color: theme.colorScheme.primary,
                           )
                         : null,
                   ),
-                  const SizedBox(width: 6),
+                  SizedBox(width: isMobile ? 5 : 6),
                   Expanded(
                     child: Text(
                       item.label,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 13,
+                        fontSize: isMobile ? 12 : 13,
                         color: isSelected ? Colors.white : Colors.white70,
                         fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
                       ),
                     ),
                   ),
                   if (item.badge != null) ...[
-                    const SizedBox(width: 8),
+                    SizedBox(width: isMobile ? 6 : 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                      padding: EdgeInsets.symmetric(
+                        horizontal: isMobile ? 4.5 : 5,
+                        vertical: isMobile ? 1 : 1.5,
+                      ),
                       decoration: BoxDecoration(
                         color: item.badgeColor ?? Colors.white24,
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
                         item.badge!,
-                        style: const TextStyle(
-                          fontSize: 9.5,
+                        style: TextStyle(
+                          fontSize: isMobile ? 8.5 : 9.5,
                           color: Colors.white,
                           fontWeight: FontWeight.w600,
                         ),
