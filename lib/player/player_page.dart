@@ -2,7 +2,9 @@
 ///
 /// 移动端与桌面端的差异集中在这几处：
 /// - 移动端用 SystemChrome 做沉浸式全屏、屏幕方向旋转，并靠点击画面显隐控件；
-///   桌面端没有这些概念，改为鼠标移动显隐 + 键盘快捷键，控制条常驻。
+///   桌面端没有这些概念，改为鼠标移动显隐 + 键盘快捷键。两端在播放中都会于
+///   4 秒无操作后自动隐藏控件（桌面端移动鼠标唤回，门槛见
+///   [_kPointerWakeDistance]；移动端点击画面唤回）。
 /// - 桌面端去掉画面中央的大号播放/进退按钮，改为底部控制条上的音量、
 ///   音轨、字幕按钮，并提供拖放换片。
 /// - 音轨/字幕的选择入口两端不同：桌面端用控制条上的弹出菜单，移动端
@@ -43,15 +45,15 @@ const double _kVolumeStep = 5;
 /// 桌面端键盘快进/快退的秒数（←/→），与界面按钮的 ±10s 保持一致。
 const int _kSeekStepSeconds = 10;
 
-/// 桌面端控制条隐藏后，鼠标需要移动这么多逻辑像素才会重新唤出。
+/// 桌面端控制条隐藏后，要"短时间内快速划动"这么多逻辑像素才会重新唤出。
 ///
-/// 原先是任何 1 像素的 hover 就立刻弹出来 —— 手搭在鼠标上、桌面轻微震动都会
-/// 把控制条和光标"晃"出来，看片时很打断。改成以「隐藏那一刻的光标位置」为基准，
-/// 移动超过这个距离才算一次有意的动作（缓慢移动同样会累积距离）。
-///
-/// 取 100 而不是更小的值：点画面隐藏控制条时，手在点完之后往往还有一个自然的
-/// 收尾动作，光标会跟着挪一截，阈值太小就会出现"刚点了隐藏、立刻又弹回来"。
-const double _kPointerWakeDistance = 100;
+/// 只在 [_kPointerWakeWindow] 这个时间窗内累计：慢慢挪动时，每个窗口只有
+/// 一点点位移，窗口到期就清零重来，永远攒不够，因此不会唤出；而左右快速
+/// 晃动几下（每一下的位移都落在同一个 2 秒窗口内）会累加，攒够即唤出。
+const double _kPointerWakeDistance = 1680;
+
+/// 鼠标位移累计的时间窗：超过这么久就清零重开，避免缓慢移动被慢慢累加。
+const Duration _kPointerWakeWindow = Duration(seconds: 2);
 
 /// 播放进度落盘步长：位置每前进 5 秒写一次。
 ///
@@ -259,8 +261,13 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 最近一次鼠标位置（全局逻辑坐标），每次 hover 都更新。
   Offset? _lastPointerPos;
 
-  /// 控制条隐藏那一刻的光标位置，作为"移动了多远"的判断基准。
-  Offset? _pointerAnchor;
+  /// 控制条隐藏后，当前这一轮鼠标位移累计窗口的起始时刻。
+  ///
+  /// 为 null 表示尚未开窗（刚隐藏 / 刚唤出），下一次 hover 会重新开窗。
+  DateTime? _pointerWakeWindowStart;
+
+  /// 当前 [_kPointerWakeWindow] 窗口内已累计的鼠标位移（逻辑像素）。
+  double _pointerWakeAccum = 0;
 
   /// 上一次点画面的时间与位置，用于识别双击（桌面端双击 = 全屏切换）。
   ///
@@ -584,8 +591,6 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   }
 
   void _scheduleAutoHide() {
-    // 桌面端控制条常驻，不自动隐藏（与常见桌面播放器一致）。
-    if (isDesktopPlatform) return;
     _cancelAutoHide();
     if (!_playing || !_controlsVisible || _scrubbing) return;
     // "从头播放"提示还在时先别隐藏：它跟着控制条一起显示
@@ -1254,22 +1259,39 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 带 250ms 节流——onHover 在鼠标移动时触发极其频繁，无节流会导致
   /// 移动鼠标时疯狂重建整棵组件树。
   ///
-  /// 控制条处于隐藏状态时还有一道"移动距离"门槛（见 [_kPointerWakeDistance]）：
-  /// 以隐藏那一刻的光标位置为基准，移动不够远就不唤出，免得轻微抖动就弹出来。
+  /// 控制条处于隐藏状态时还有一道"快速划动"门槛（见 [_kPointerWakeDistance]）：
+  /// 只有 [_kPointerWakeWindow]（2 秒）之内累计划够距离才唤出；慢慢挪动的话
+  /// 每个窗口到期就被清零，攒不够，于是不会被轻微晃动/手抖唤出来。
+  /// 直接点一下画面同样可以唤出（走 [_handleSurfaceTap]）。
   void _onPointerActivity(PointerHoverEvent event) {
     final pos = event.position;
+    final prev = _lastPointerPos;
     // 每次都记：这样"隐藏瞬间的位置"始终是最新的
     _lastPointerPos = pos;
 
     if (!_controlsVisible) {
-      final anchor = _pointerAnchor;
-      if (anchor == null) {
-        // 还没有基准点（例如隐藏后第一次收到 hover）：先记下来，不唤出
-        _pointerAnchor = pos;
+      final now = DateTime.now();
+      final windowStart = _pointerWakeWindowStart;
+      if (windowStart == null) {
+        // 刚隐藏后的第一帧：开窗，从 0 开始累计
+        _pointerWakeWindowStart = now;
+        _pointerWakeAccum = 0;
         return;
       }
-      if ((pos - anchor).distance < _kPointerWakeDistance) return;
-      _pointerAnchor = null;
+      if (now.difference(windowStart) > _kPointerWakeWindow) {
+        // 窗口到期（说明移动得慢，中间有大段停顿或位移很小）：清零重开
+        _pointerWakeWindowStart = now;
+        _pointerWakeAccum = 0;
+        return;
+      }
+      // 窗口内继续累加这一小段的位移
+      if (prev != null) {
+        _pointerWakeAccum += (pos - prev).distance;
+      }
+      if (_pointerWakeAccum < _kPointerWakeDistance) return;
+      // 攒够了：唤出，并把窗口清零（下次隐藏后重新累计）
+      _pointerWakeWindowStart = null;
+      _pointerWakeAccum = 0;
     }
 
     final now = DateTime.now();
@@ -1281,12 +1303,13 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _scheduleAutoHide();
   }
 
-  /// 隐藏控制条（同时记下光标位置，作为"要移动多远才唤回"的基准）。
+  /// 隐藏控制条（同时把"快速划动唤回"的累计窗口清零）。
   void _hideControls() {
     _cancelAutoHide();
     if (!_controlsVisible) return;
     setState(() => _controlsVisible = false);
-    _pointerAnchor = _lastPointerPos;
+    _pointerWakeWindowStart = null;
+    _pointerWakeAccum = 0;
   }
 
   /// 在画面右上角弹出一条瞬时提示（音量/静音/切轨反馈）。
