@@ -334,9 +334,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         }
       });
     });
-    // AI 字幕总开关：设置页关掉后播放页要立刻同步，因此监听它触发重建。
-    // （设置页与播放页是两条独立路由，不会自动互相刷新。）
+    // AI 字幕与翻译开关：设置页变化后播放页要立刻同步，因此监听触发重建。
     aiSubtitleEnabled.addListener(_onAiSubtitleSettingChanged);
+    aiTranslationEnabled.addListener(_onAiSubtitleSettingChanged);
     _initPlayer();
   }
 
@@ -355,7 +355,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _syncAiSubtitleRunningState();
   }
 
-  /// AI 字幕总开关变化：重建界面，让 AI 入口与叠层同步显隐。
+  /// AI 字幕与翻译开关变化：重建界面，让 AI 入口与叠层同步显隐。
   void _onAiSubtitleSettingChanged() {
     if (mounted) setState(() {});
   }
@@ -380,6 +380,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   void dispose() {
     if (isDesktopPlatform) windowManager.removeListener(this);
     aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
+    aiTranslationEnabled.removeListener(_onAiSubtitleSettingChanged);
     AiTaskManager.instance.removeListener(_onAiTaskManagerUpdated);
     _asrProgressSub?.cancel();
     _aiRestoreDebounce?.cancel();
@@ -691,8 +692,29 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
 
   /// 当前是否存在"翻译字幕"。
   ///
-  /// 预留位：翻译功能上线后改为真实状态即可，主/副槽位的取舍逻辑无需改动。
-  bool get _hasTranslation => false;
+  /// 若字幕条目中已产生有效的译文，则标记为存在翻译字幕。
+  bool get _hasTranslation {
+    if (!_aiSubtitleActive) return false;
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    if (!SubtitleGenerator.instance.holdsEntriesFor(activeKey)) return false;
+    return SubtitleGenerator.instance.entries.any(
+      (e) => e.translatedText != null && e.translatedText!.isNotEmpty,
+    );
+  }
+
+  /// AI 识别或翻译总开关是否至少有一个启用。
+  bool get _aiFeatureEnabled => aiSubtitleEnabled.value || aiTranslationEnabled.value;
+
+  /// AI 按钮的提示文本。
+  String get _aiButtonTooltip {
+    if (aiSubtitleEnabled.value && aiTranslationEnabled.value) {
+      return 'AI 语音字幕 · 识别与翻译';
+    } else if (aiTranslationEnabled.value) {
+      return 'AI 字幕翻译';
+    } else {
+      return 'AI 语音识别字幕';
+    }
+  }
 
   /// 主字幕来源优先级：翻译字幕 > 内置字幕 > AI 识别字幕。
   ///
@@ -1662,10 +1684,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           icon: const Icon(Icons.subtitles_outlined, color: Colors.white),
         ),
         // AI 字幕按钮（总开关打开时常驻可见，点击弹出控制面板）
-        if (aiSubtitleEnabled.value)
+        if (_aiFeatureEnabled)
           IconButton(
             onPressed: _showAiSubtitleSheet,
-            tooltip: 'AI 语音识别字幕',
+            tooltip: _aiButtonTooltip,
             icon: _aiSubtitleRunning
                 ? SizedBox(
                     width: 20,
@@ -1731,7 +1753,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         ),
         child: _TrackSelectionSheet(
           title: '字幕',
-          subtitle: '内置字幕与 AI 识别字幕可同时显示（内置在下，AI 在上）。',
+          subtitle: '内置字幕与 AI 字幕可同时显示（内置在下，AI 在上）。',
           options: [
             _TrackOption(
               id: _kSubtitlesOff,
@@ -1746,18 +1768,20 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
                 selected: t.id == _activeSubtitleId,
               ),
             // AI 字幕总开关关闭时，整项从字幕列表里隐藏
-            if (aiSubtitleEnabled.value)
+            if (_aiFeatureEnabled)
               _TrackOption(
                 id: '__ai_subtitle__',
                 label: _aiSubtitleRunning
                     ? 'AI 语音识别字幕 (识别中…)'
-                    : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）'),
+                    : (_hasTranslation
+                        ? (_aiIsPrimary ? 'AI 双语字幕（主字幕）' : 'AI 双语字幕（副字幕）')
+                        : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）')),
                 selected: _aiSubtitleActive,
               ),
           ],
           footerNote: _subtitleTracks.isEmpty
-              ? (aiSubtitleEnabled.value
-                    ? '该视频没有内嵌字幕（可直接选择 AI 语音识别字幕）'
+              ? (_aiFeatureEnabled
+                    ? '该视频没有内嵌字幕（可直接选择 AI 语音字幕）'
                     : '该视频没有内嵌字幕')
               : null,
         ),
@@ -1866,11 +1890,11 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
             ],
           ],
         ),
-        // 桌面端独立的 AI 语音字幕快捷按钮（总开关打开时才显示）
-        if (aiSubtitleEnabled.value)
+        // 桌面端独立的 AI 字幕与翻译快捷按钮（只要启用了识别或翻译就显示）
+        if (_aiFeatureEnabled)
           IconButton(
             onPressed: _showAiSubtitleSheet,
-            tooltip: 'AI 语音识别字幕',
+            tooltip: _aiButtonTooltip,
             icon: _aiSubtitleRunning
                 ? SizedBox(
                     width: 18,
@@ -1973,7 +1997,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
 
   // ------------------------------------------------------------ AI 字幕
 
-  /// 打开 AI 语音识别字幕设置与控制面板。
+  /// 打开 AI 字幕与翻译控制面板。
   Future<void> _showAiSubtitleSheet() async {
     setState(() => _controlsVisible = true);
 
@@ -1991,6 +2015,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       onSeekTo: (position) {
         _player.seek(position);
       },
+      subtitleTracks: _subtitleTracks,
+      activeSubtitleId: _activeSubtitleId,
     );
   }
 }

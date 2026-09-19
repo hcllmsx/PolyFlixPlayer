@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/material.dart';
@@ -12,8 +13,20 @@ import 'subtitle/whisper_server.dart';
 import 'utils/native_file_helper.dart';
 import 'utils/platform_utils.dart';
 
+/// 跨平台网络策略重写：支持系统代理并容错本地代理握手异常。
+class _AppHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    client.badCertificateCallback = (X509Certificate cert, String host, int port) => true;
+    client.findProxy = (uri) => HttpClient.findProxyFromEnvironment(uri);
+    return client;
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  HttpOverrides.global = _AppHttpOverrides();
   try {
     MediaKit.ensureInitialized();
   } catch (_) {}

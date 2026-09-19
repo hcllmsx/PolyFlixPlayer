@@ -23,6 +23,20 @@ const String _kAiAsrForceCpu = 'aiAsrForceCpu';
 const String _kResumePlayback = 'resumePlayback';
 const String _kResumeMinVideoSeconds = 'resumeMinVideoSeconds';
 
+// 翻译相关存储键
+const String _kAiTranslationEnabled = 'aiTranslationEnabled';
+const String _kAiTranslationTargetLang = 'aiTranslationTargetLang';
+const String _kAiTranslationMode = 'aiTranslationMode';
+const String _kAiTranslationProvider = 'aiTranslationProvider';
+const String _kAiBaiduAppId = 'aiBaiduAppId';
+const String _kAiBaiduSecretKey = 'aiBaiduSecretKey';
+const String _kAiAzureKey = 'aiAzureKey';
+const String _kAiAzureRegion = 'aiAzureRegion';
+const String _kAiAzureEndpoint = 'aiAzureEndpoint';
+const String _kAiLocalEndpoint = 'aiLocalEndpoint';
+const String _kAiTranslationProxyMode = 'aiTranslationProxyMode';
+const String _kAiTranslationCustomProxy = 'aiTranslationCustomProxy';
+
 /// "短片不记进度"可选档位（秒）。0 = 不限制。
 ///
 /// 放在这里而不是设置页里：读取时要用它校验存储值，避免脏数据落到界面上。
@@ -33,11 +47,48 @@ const List<int> resumeMinVideoOptions = [0, 30, 60, 120, 300];
 /// 默认关闭：窗口大小随视频变化会打断用户的观看节奏，交给用户自己决定。
 final ValueNotifier<bool> fitWindowToVideo = ValueNotifier<bool>(false);
 
-/// AI 字幕功能总开关。
+/// AI 语音识别功能开关（原名 AI 字幕功能总开关）。
 ///
-/// 开启后，在播放页会出现 AI 字幕按钮，用户可以选择使用 ASR 语音识别
-/// 生成字幕。此开关独立于视频是否有内置字幕——即使有内置字幕也可开启。
+/// 开启后，在播放页可使用 ASR 语音识别生成字幕。
 final ValueNotifier<bool> aiSubtitleEnabled = ValueNotifier<bool>(true);
+
+/// AI 字幕翻译功能开关。
+///
+/// 开启后，支持将视频内置字幕或 AI 识别字幕翻译为目标语言。
+final ValueNotifier<bool> aiTranslationEnabled = ValueNotifier<bool>(true);
+
+/// 翻译目标语言（默认简体中文 zh-Hans）。
+final ValueNotifier<String> aiTranslationTargetLang = ValueNotifier<String>('zh-Hans');
+
+/// 翻译方式（online / local）。
+final ValueNotifier<String> aiTranslationMode = ValueNotifier<String>('online');
+
+/// 在线翻译服务提供商（baidu / azure）。
+final ValueNotifier<String> aiTranslationProvider = ValueNotifier<String>('baidu');
+
+/// 百度翻译 APP ID。
+final ValueNotifier<String> aiBaiduAppId = ValueNotifier<String>('');
+
+/// 百度翻译 Secret Key。
+final ValueNotifier<String> aiBaiduSecretKey = ValueNotifier<String>('');
+
+/// 微软 Azure 翻译 Key。
+final ValueNotifier<String> aiAzureKey = ValueNotifier<String>('');
+
+/// 微软 Azure 翻译 Region（默认 eastasia）。
+final ValueNotifier<String> aiAzureRegion = ValueNotifier<String>('eastasia');
+
+/// 微软 Azure 翻译自定义终结点（默认空，走标准全局端点）。
+final ValueNotifier<String> aiAzureEndpoint = ValueNotifier<String>('');
+
+/// 在线翻译网络通道策略：'auto' (自适应/自动检测，默认) | 'direct' (直连) | 'custom' (指定代理)
+final ValueNotifier<String> aiTranslationProxyMode = ValueNotifier<String>('auto');
+
+/// 用户自定义代理地址（如 127.0.0.1:10808）
+final ValueNotifier<String> aiTranslationCustomProxy = ValueNotifier<String>('');
+
+/// 本地翻译端点地址预留。
+final ValueNotifier<String> aiLocalEndpoint = ValueNotifier<String>('');
 
 /// AI 语音识别上次使用的模型 ID（tiny / base / small）。
 ///
@@ -91,6 +142,22 @@ Future<void> loadAppSettings() async {
   resumeMinVideoSeconds.value = resumeMinVideoOptions.contains(resumeMin)
       ? resumeMin
       : 60;
+
+  // 翻译设置读取
+  aiTranslationEnabled.value = store.getBool(_kAiTranslationEnabled, true);
+  aiTranslationTargetLang.value = store.getString(_kAiTranslationTargetLang) ?? 'zh-Hans';
+  aiTranslationMode.value = store.getString(_kAiTranslationMode) ?? 'online';
+  final savedProvider = store.getString(_kAiTranslationProvider) ?? 'baidu';
+  aiTranslationProvider.value = (savedProvider == 'tencent') ? 'baidu' : savedProvider;
+  aiBaiduAppId.value = store.getString(_kAiBaiduAppId) ?? '';
+  aiBaiduSecretKey.value = store.getString(_kAiBaiduSecretKey) ?? '';
+  aiAzureKey.value = store.getString(_kAiAzureKey) ?? '';
+  final savedRegion = store.getString(_kAiAzureRegion) ?? 'eastasia';
+  aiAzureRegion.value = (savedRegion.isEmpty || savedRegion == 'global') ? 'eastasia' : savedRegion;
+  aiAzureEndpoint.value = store.getString(_kAiAzureEndpoint) ?? '';
+  aiLocalEndpoint.value = store.getString(_kAiLocalEndpoint) ?? '';
+  aiTranslationProxyMode.value = store.getString(_kAiTranslationProxyMode) ?? 'auto';
+  aiTranslationCustomProxy.value = store.getString(_kAiTranslationCustomProxy) ?? '';
 }
 
 /// 写入"窗口适应视频比例"开关。
@@ -99,10 +166,74 @@ Future<void> setFitWindowToVideo(bool value) async {
   await AppStore.instance.setBool(_kFitWindowToVideo, value);
 }
 
-/// 写入"AI 字幕"开关。
+/// 写入"AI 字幕识别"开关。
 Future<void> setAiSubtitleEnabled(bool value) async {
   aiSubtitleEnabled.value = value;
   await AppStore.instance.setBool(_kAiSubtitleEnabled, value);
+}
+
+/// 写入"AI 字幕翻译"开关。
+Future<void> setAiTranslationEnabled(bool value) async {
+  aiTranslationEnabled.value = value;
+  await AppStore.instance.setBool(_kAiTranslationEnabled, value);
+}
+
+/// 写入目标翻译语言。
+Future<void> setAiTranslationTargetLang(String value) async {
+  aiTranslationTargetLang.value = value;
+  await AppStore.instance.setString(_kAiTranslationTargetLang, value);
+}
+
+/// 写入翻译方式（online / local）。
+Future<void> setAiTranslationMode(String value) async {
+  aiTranslationMode.value = value;
+  await AppStore.instance.setString(_kAiTranslationMode, value);
+}
+
+/// 写入在线翻译服务商（baidu / azure）。
+Future<void> setAiTranslationProvider(String value) async {
+  aiTranslationProvider.value = value;
+  await AppStore.instance.setString(_kAiTranslationProvider, value);
+}
+
+/// 写入百度翻译凭据。
+Future<void> setAiBaiduCredentials({required String appId, required String secretKey}) async {
+  aiBaiduAppId.value = appId;
+  aiBaiduSecretKey.value = secretKey;
+  await AppStore.instance.setString(_kAiBaiduAppId, appId);
+  await AppStore.instance.setString(_kAiBaiduSecretKey, secretKey);
+}
+
+/// 写入微软 Azure 翻译凭据。
+Future<void> setAiAzureCredentials({
+  required String key,
+  String region = 'eastasia',
+  String endpoint = '',
+}) async {
+  final cleanRegion = region.trim().isEmpty ? 'eastasia' : region.trim();
+  aiAzureKey.value = key;
+  aiAzureRegion.value = cleanRegion;
+  aiAzureEndpoint.value = endpoint;
+  await AppStore.instance.setString(_kAiAzureKey, key);
+  await AppStore.instance.setString(_kAiAzureRegion, cleanRegion);
+  await AppStore.instance.setString(_kAiAzureEndpoint, endpoint);
+}
+
+/// 写入本地端点地址。
+Future<void> setAiLocalEndpoint(String value) async {
+  aiLocalEndpoint.value = value;
+  await AppStore.instance.setString(_kAiLocalEndpoint, value);
+}
+
+/// 写入在线翻译网络通道策略及自定义代理。
+Future<void> setAiTranslationProxy({
+  required String mode,
+  String customProxy = '',
+}) async {
+  aiTranslationProxyMode.value = mode;
+  aiTranslationCustomProxy.value = customProxy;
+  await AppStore.instance.setString(_kAiTranslationProxyMode, mode);
+  await AppStore.instance.setString(_kAiTranslationCustomProxy, customProxy);
 }
 
 /// 写入"AI 语音识别模型"选择，下次打开面板时恢复。
@@ -138,3 +269,4 @@ Future<void> setResumeMinVideoSeconds(int value) async {
   resumeMinVideoSeconds.value = value;
   await AppStore.instance.setInt(_kResumeMinVideoSeconds, value);
 }
+

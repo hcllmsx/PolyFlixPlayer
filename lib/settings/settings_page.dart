@@ -17,6 +17,7 @@ import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'about_page.dart';
 import 'app_settings.dart';
+import 'translation_settings_card.dart';
 import 'update_service.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -322,7 +323,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
         const SizedBox(height: 18),
-        const _SectionTitle(title: 'AI 语音字幕 (实验性)'),
+        const _SectionTitle(title: 'AI 语音字幕 · 识别与翻译'),
         Card(
           clipBehavior: Clip.antiAlias,
           child: Column(
@@ -345,7 +346,7 @@ class _SettingsPageState extends State<SettingsPage> {
                           ? scheme.onSurface.withValues(alpha: .38)
                           : scheme.primary,
                     ),
-                    title: const Text('启用 AI 字幕功能'),
+                    title: const Text('启用 AI 字幕识别'),
                     subtitle: Text(
                       isUnsupported
                           ? '当前设备不支持此功能。'
@@ -438,6 +439,9 @@ class _SettingsPageState extends State<SettingsPage> {
                   );
                 },
               ),
+              // AI 字幕翻译设置模块
+              const Divider(height: 1),
+              const TranslationSettingsCard(),
             ],
           ),
         ),

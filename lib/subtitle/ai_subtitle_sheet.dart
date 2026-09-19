@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:media_kit/media_kit.dart';
 
 import 'ai_task_manager.dart';
 import '../main.dart';
@@ -15,10 +16,14 @@ import 'engine_pack.dart';
 import 'model_catalog_sheet.dart';
 import 'model_manager.dart';
 import 'subtitle_generator.dart';
+import 'translation/builtin_subtitle_extractor.dart';
+import 'translation/srt_parser.dart';
+import 'translation/translation_engine.dart';
+import 'translation/translation_service.dart';
 
-/// AI 语音识别字幕控制面板。
+/// AI 语音识别与字幕翻译控制面板。
 ///
-/// 支持配置识别模型、源语言选择、启动/停止识别、清空字幕与实时状态监控。
+/// 支持配置识别模型、源语言选择、视频内置字幕提取、目标语言翻译及双语字幕导出。
 class AiSubtitleSheet extends StatefulWidget {
   const AiSubtitleSheet({
     super.key,
@@ -28,15 +33,14 @@ class AiSubtitleSheet extends StatefulWidget {
     required this.isAiSubtitleActive,
     required this.onToggleSubtitleActive,
     this.onSeekTo,
+    this.subtitleTracks,
+    this.activeSubtitleId,
   });
 
-  /// 当前视频源路径（本地文件或 PFLX 流式地址），用于提取音频。
+  /// 当前视频源路径（本地文件或 PFLX 流式地址），用于提取音频或字幕。
   final String videoPath;
 
   /// 字幕缓存的稳定身份键（本地文件路径 / .pflx 文件路径）。
-  ///
-  /// PFLX 的 [videoPath] 是本次会话的随机端口流地址，不能当缓存键 ——
-  /// 否则下次打开同一条视频会找不到上次的缓存。为空时退回 [videoPath]。
   final String? cacheKey;
 
   /// 视频标题（可选，用于任务展示）。
@@ -51,6 +55,12 @@ class AiSubtitleSheet extends StatefulWidget {
   /// 点击字幕跳转播放进度的回调（可选）。
   final ValueChanged<Duration>? onSeekTo;
 
+  /// 视频内置的字幕轨列表（用于内置字幕翻译）。
+  final List<SubtitleTrack>? subtitleTracks;
+
+  /// 当前激活的内置字幕轨 ID。
+  final String? activeSubtitleId;
+
   /// 弹出展示面板的标准便捷方法。
   static Future<void> show({
     required BuildContext context,
@@ -60,6 +70,8 @@ class AiSubtitleSheet extends StatefulWidget {
     required bool isAiSubtitleActive,
     required ValueChanged<bool> onToggleSubtitleActive,
     ValueChanged<Duration>? onSeekTo,
+    List<SubtitleTrack>? subtitleTracks,
+    String? activeSubtitleId,
   }) {
     return showModalBottomSheet<void>(
       context: context,
@@ -73,6 +85,8 @@ class AiSubtitleSheet extends StatefulWidget {
         isAiSubtitleActive: isAiSubtitleActive,
         onToggleSubtitleActive: onToggleSubtitleActive,
         onSeekTo: onSeekTo,
+        subtitleTracks: subtitleTracks,
+        activeSubtitleId: activeSubtitleId,
       ),
     );
   }
@@ -104,6 +118,17 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   String? _statusMessage;
   AsrState _currentState = AsrState.idle;
   Set<String> _cachedModels = {};
+
+  // 翻译与内置字幕提取状态
+  bool _isTranslating = false;
+  int _translatedCount = 0;
+  int _totalTranslateCount = 0;
+  bool _cancelTranslation = false;
+  String _selectedSource = 'asr'; // 'asr' 或 'builtin'
+  int _selectedBuiltinTrackIndex = 0;
+
+  bool get _hasAnyTranslation =>
+      _currentDisplayEntries.any((e) => e.translatedText != null && e.translatedText!.isNotEmpty);
 
   /// 本地面板自身维护的当前视频字幕缓存列表，防止被后台其他视频的识别任务污染。
   List<SubtitleEntry> _localEntries = [];
@@ -144,6 +169,15 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   void initState() {
     super.initState();
     _isAiSubtitleActive = widget.isAiSubtitleActive;
+
+    // 若识别关闭但翻译开启，或当前视频有内置字幕轨，智能初始化来源
+    if (!aiSubtitleEnabled.value && aiTranslationEnabled.value) {
+      _selectedSource = 'builtin';
+    }
+    if (widget.subtitleTracks != null && widget.activeSubtitleId != null) {
+      final idx = widget.subtitleTracks!.indexWhere((t) => t.id == widget.activeSubtitleId);
+      if (idx >= 0) _selectedBuiltinTrackIndex = idx;
+    }
 
     // 单例里可能还留着"上一个视频"的字幕：先清掉，否则面板会显示别的视频的
     // 状态与条数（表现为"串台"），甚至把上一个视频的字幕当成当前视频的缓存。
@@ -467,30 +501,34 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     if (entries.isEmpty) return;
 
     try {
-      final srtContent = SubtitleGenerator.convertToSrt(entries);
+      final hasTrans = entries.any((e) => e.translatedText != null && e.translatedText!.isNotEmpty);
+      final srtContent = hasTrans
+          ? SrtParser.serialize(entries, bilingual: true)
+          : SubtitleGenerator.convertToSrt(entries);
       final srtBytes = Uint8List.fromList(utf8.encode(srtContent));
 
       // 提取建议的导出文件名
-      String defaultName = 'subtitle.srt';
+      String defaultName = hasTrans ? 'subtitle_bilingual.srt' : 'subtitle.srt';
       if (widget.videoTitle != null && widget.videoTitle!.trim().isNotEmpty) {
         final sanitized = widget.videoTitle!
             .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
             .trim();
-        defaultName = '$sanitized.srt';
+        defaultName = hasTrans ? '${sanitized}_bilingual.srt' : '$sanitized.srt';
       } else {
         final base = widget.videoPath
             .split(Platform.isWindows ? r'\' : '/')
             .last;
         final dotIdx = base.lastIndexOf('.');
         if (dotIdx > 0) {
-          defaultName = '${base.substring(0, dotIdx)}.srt';
+          final prefix = base.substring(0, dotIdx);
+          defaultName = hasTrans ? '${prefix}_bilingual.srt' : '$prefix.srt';
         } else {
-          defaultName = '$base.srt';
+          defaultName = hasTrans ? '${base}_bilingual.srt' : '$base.srt';
         }
       }
 
       final savedUri = await FilePicker.saveFile(
-        dialogTitle: '导出 SRT 字幕文件',
+        dialogTitle: hasTrans ? '导出双语 SRT 字幕文件' : '导出 SRT 字幕文件',
         fileName: defaultName,
         bytes: srtBytes,
         type: FileType.custom,
@@ -507,7 +545,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       }
 
       if (mounted) {
-        AppToast.show(context, '已成功导出 SRT 字幕至：$displayPath');
+        AppToast.show(context, '已成功导出字幕至：$displayPath');
       }
     } catch (e) {
       if (mounted) {
@@ -516,12 +554,203 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     }
   }
 
+  String _trackDisplayLabel(SubtitleTrack t) {
+    final parts = <String>[];
+    if (t.title != null && t.title!.isNotEmpty) parts.add(t.title!);
+    if (t.language != null && t.language!.isNotEmpty) parts.add('[${t.language}]');
+    if (t.codec != null && t.codec!.isNotEmpty) parts.add(t.codec!);
+    return parts.isEmpty ? '轨道 ${t.id}' : parts.join(' · ');
+  }
+
+  /// 提取并翻译选中的内置字幕轨
+  Future<void> _extractAndTranslateBuiltin() async {
+    if (_isTranslating) return;
+    final tracks = widget.subtitleTracks;
+    if (tracks == null || tracks.isEmpty) {
+      AppToast.show(context, '当前视频未检测到内置字幕轨', isError: true);
+      return;
+    }
+
+    final targetLang = aiTranslationTargetLang.value;
+    final langInfo = TranslationLanguage.findByCode(targetLang);
+
+    setState(() {
+      _isTranslating = true;
+      _cancelTranslation = false;
+      _translatedCount = 0;
+      _totalTranslateCount = 0;
+      _statusMessage = '正在从视频提取内置字幕文本...';
+    });
+
+    try {
+      final rawEntries = await BuiltInSubtitleExtractor.extractSubtitles(
+        videoPath: widget.videoPath,
+        subtitleIndex: _selectedBuiltinTrackIndex,
+      );
+
+      if (!mounted || _cancelTranslation) return;
+
+      setState(() {
+        _statusMessage = '已提取 ${rawEntries.length} 条字幕，正在翻译为 ${langInfo.name}...';
+        _totalTranslateCount = rawEntries.length;
+      });
+
+      final translatedEntries = await TranslationService.instance.translateEntries(
+        entries: rawEntries,
+        targetLanguage: targetLang,
+        onProgress: (cur, total) {
+          if (mounted) {
+            setState(() {
+              _translatedCount = cur;
+              _totalTranslateCount = total;
+            });
+          }
+        },
+        isCancelled: () => _cancelTranslation,
+      );
+
+      if (!mounted || _cancelTranslation) return;
+
+      setState(() {
+        _localEntries = translatedEntries;
+        _currentState = AsrState.completed;
+        _statusMessage = '内置字幕已成功翻译为 ${langInfo.name} (共 ${translatedEntries.length} 条)';
+        _isAiSubtitleActive = true;
+      });
+
+      _generator.setEntries(
+        translatedEntries,
+        videoPath: widget.videoPath,
+        markCompleted: true,
+      );
+      widget.onToggleSubtitleActive(true);
+
+      await TranslationService.instance.saveTranslationCache(
+        sourceKey: _cacheKey,
+        sourceType: 'builtin_$_selectedBuiltinTrackIndex',
+        targetLang: targetLang,
+        engineId: TranslationService.instance.getActiveEngine().id,
+        entries: translatedEntries,
+      );
+
+      if (mounted) {
+        AppToast.show(context, '内置字幕已成功翻译，已在画面叠加呈现');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = '翻译失败: $e';
+        });
+        AppToast.show(context, '翻译失败: $e', isError: true);
+      }
+    } finally {
+      if (mounted) setState(() => _isTranslating = false);
+    }
+  }
+
+  /// 翻译当前已识别生成的字幕条目
+  Future<void> _translateCurrentEntries() async {
+    final entries = _currentDisplayEntries;
+    if (entries.isEmpty || _isTranslating) return;
+
+    final targetLang = aiTranslationTargetLang.value;
+    final langInfo = TranslationLanguage.findByCode(targetLang);
+
+    setState(() {
+      _isTranslating = true;
+      _cancelTranslation = false;
+      _translatedCount = 0;
+      _totalTranslateCount = entries.length;
+      _statusMessage = '正在将字幕翻译为 ${langInfo.name}...';
+    });
+
+    try {
+      final translatedEntries = await TranslationService.instance.translateEntries(
+        entries: entries,
+        targetLanguage: targetLang,
+        onProgress: (cur, total) {
+          if (mounted) {
+            setState(() {
+              _translatedCount = cur;
+              _totalTranslateCount = total;
+            });
+          }
+        },
+        isCancelled: () => _cancelTranslation,
+      );
+
+      if (!mounted || _cancelTranslation) return;
+
+      setState(() {
+        _localEntries = translatedEntries;
+        _statusMessage = '字幕已成功翻译为 ${langInfo.name} (共 ${translatedEntries.length} 条)';
+        _isAiSubtitleActive = true;
+      });
+
+      _generator.setEntries(
+        translatedEntries,
+        videoPath: widget.videoPath,
+        markCompleted: true,
+      );
+      widget.onToggleSubtitleActive(true);
+
+      // 持久化到 ASR 缓存与翻译缓存
+      await AiTaskManager.instance.saveCachedSubtitles(
+        _cacheKey,
+        translatedEntries,
+        modelId: _selectedModel,
+      );
+      await TranslationService.instance.saveTranslationCache(
+        sourceKey: _cacheKey,
+        sourceType: 'asr_$_selectedModel',
+        targetLang: targetLang,
+        engineId: TranslationService.instance.getActiveEngine().id,
+        entries: translatedEntries,
+      );
+
+      if (mounted) {
+        AppToast.show(context, '字幕翻译完成，画面已开启双语显示');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = '翻译失败: $e';
+        });
+        AppToast.show(context, '翻译失败: $e', isError: true);
+      }
+    } finally {
+      if (mounted) setState(() => _isTranslating = false);
+    }
+  }
+
+  void _cancelCurrentTranslation() {
+    _cancelTranslation = true;
+    setState(() {
+      _isTranslating = false;
+      _statusMessage = '翻译已取消';
+    });
+    AppToast.show(context, '已取消翻译');
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final currentTask = AiTaskManager.instance.getTask(widget.videoPath);
     final isRunning = currentTask != null && currentTask.isRunning;
     final entries = _currentDisplayEntries;
+
+    final hasBuiltinTracks = widget.subtitleTracks != null && widget.subtitleTracks!.isNotEmpty;
+    final canUseAsr = aiSubtitleEnabled.value;
+    final canTranslate = aiTranslationEnabled.value;
+
+    String sheetTitle;
+    if (canUseAsr && canTranslate) {
+      sheetTitle = 'AI 语音字幕 · 识别与翻译';
+    } else if (canTranslate) {
+      sheetTitle = 'AI 字幕翻译';
+    } else {
+      sheetTitle = 'AI 语音字幕识别';
+    }
 
     return Container(
       constraints: BoxConstraints(
@@ -571,10 +800,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  const Expanded(
+                  Expanded(
                     child: Text(
-                      'AI 语音识别字幕',
-                      style: TextStyle(
+                      sheetTitle,
+                      style: const TextStyle(
                         fontSize: 17,
                         fontWeight: FontWeight.w600,
                         color: Colors.white,
@@ -600,39 +829,83 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                 padding: const EdgeInsets.all(20),
                 shrinkWrap: true,
                 children: [
-                  if (_otherRunningTask != null)
-                    _buildOtherTaskNotice(_otherRunningTask!),
-                  // 1. 状态看板
-                  _buildStatusCard(theme, isRunning, entries.length),
-                  const SizedBox(height: 6),
-                  _buildEngineCaption(),
-
-                  const SizedBox(height: 16),
-
-                  // 2. 模型选择
-                  _buildSectionHeader(Icons.memory_rounded, '语音识别模型'),
-                  const SizedBox(height: 8),
-                  _buildModelSelector(theme),
-
-                  const SizedBox(height: 16),
-
-                  // 3. 语言选择
-                  _buildSectionHeader(Icons.translate_rounded, '识别原音频语言'),
-                  const SizedBox(height: 8),
-                  _buildLanguageSelector(theme),
-
-                  const SizedBox(height: 16),
-
-                  // 4. 字幕显示开关与管理
-                  if (entries.isNotEmpty) ...[
-                    _buildSectionHeader(Icons.visibility_rounded, '字幕显示与管理'),
-                    const SizedBox(height: 8),
-                    _buildSubtitleControls(theme),
+                  // 来源切换（仅当识别与翻译同时开启、且视频有内置字幕时显示）
+                  if (canUseAsr && canTranslate && hasBuiltinTracks) ...[
+                    SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(
+                          value: 'asr',
+                          icon: Icon(Icons.mic_none_rounded, size: 16),
+                          label: Text('AI 语音识别'),
+                        ),
+                        ButtonSegment(
+                          value: 'builtin',
+                          icon: Icon(Icons.subtitles_rounded, size: 16),
+                          label: Text('翻译内置字幕'),
+                        ),
+                      ],
+                      selected: {_selectedSource},
+                      onSelectionChanged: (set) => setState(() => _selectedSource = set.first),
+                    ),
                     const SizedBox(height: 16),
-                    _buildCollapsiblePreviewHeader(theme, entries.length),
-                    if (_previewExpanded) ...[
+                  ],
+
+                  if (_selectedSource == 'builtin' || (!canUseAsr && canTranslate)) ...[
+                    // ---------------- 内置字幕翻译流程 ----------------
+                    _buildTranslationStatusCard(theme, entries.length),
+                    const SizedBox(height: 16),
+                    _buildSectionHeader(Icons.subtitles_outlined, '选择要翻译的内置字幕轨'),
+                    const SizedBox(height: 8),
+                    _buildBuiltinTrackSelector(theme),
+                    const SizedBox(height: 16),
+
+                    if (entries.isNotEmpty) ...[
+                      _buildSectionHeader(Icons.visibility_rounded, '字幕显示与管理'),
                       const SizedBox(height: 8),
-                      _buildSubtitlePreviewList(entries),
+                      _buildSubtitleControls(theme),
+                      const SizedBox(height: 16),
+                      _buildCollapsiblePreviewHeader(theme, entries.length),
+                      if (_previewExpanded) ...[
+                        const SizedBox(height: 8),
+                        _buildSubtitlePreviewList(entries),
+                      ],
+                    ],
+                  ] else ...[
+                    // ---------------- AI 语音识别流程 ----------------
+                    if (_otherRunningTask != null)
+                      _buildOtherTaskNotice(_otherRunningTask!),
+                    // 1. 状态看板
+                    _buildStatusCard(theme, isRunning, entries.length),
+                    const SizedBox(height: 6),
+                    _buildEngineCaption(),
+
+                    const SizedBox(height: 16),
+
+                    // 2. 模型选择
+                    _buildSectionHeader(Icons.memory_rounded, '语音识别模型'),
+                    const SizedBox(height: 8),
+                    _buildModelSelector(theme),
+
+                    const SizedBox(height: 16),
+
+                    // 3. 语言选择
+                    _buildSectionHeader(Icons.translate_rounded, '识别原音频语言'),
+                    const SizedBox(height: 8),
+                    _buildLanguageSelector(theme),
+
+                    const SizedBox(height: 16),
+
+                    // 4. 字幕显示开关与管理
+                    if (entries.isNotEmpty) ...[
+                      _buildSectionHeader(Icons.visibility_rounded, '字幕显示与管理'),
+                      const SizedBox(height: 8),
+                      _buildSubtitleControls(theme),
+                      const SizedBox(height: 16),
+                      _buildCollapsiblePreviewHeader(theme, entries.length),
+                      if (_previewExpanded) ...[
+                        const SizedBox(height: 8),
+                        _buildSubtitlePreviewList(entries),
+                      ],
                     ],
                   ],
                 ],
@@ -646,6 +919,150 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 内置字幕轨下拉选择器
+  Widget _buildBuiltinTrackSelector(ThemeData theme) {
+    final tracks = widget.subtitleTracks;
+    if (tracks == null || tracks.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF262630),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: const Row(
+          children: [
+            Icon(Icons.info_outline_rounded, size: 16, color: Colors.white54),
+            SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '当前视频未检测到内置字幕轨。若是外部视频文件，可尝试使用 AI 语音识别生成字幕。',
+                style: TextStyle(fontSize: 12.5, color: Colors.white70),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF262630),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<int>(
+          value: _selectedBuiltinTrackIndex.clamp(0, tracks.length - 1),
+          isExpanded: true,
+          focusColor: Colors.transparent,
+          dropdownColor: const Color(0xFF262630),
+          icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
+          items: List.generate(tracks.length, (idx) {
+            final track = tracks[idx];
+            return DropdownMenuItem<int>(
+              value: idx,
+              child: Text(
+                _trackDisplayLabel(track),
+                style: const TextStyle(fontSize: 13, color: Colors.white),
+              ),
+            );
+          }),
+          onChanged: _isTranslating
+              ? null
+              : (val) {
+                  if (val != null) setState(() => _selectedBuiltinTrackIndex = val);
+                },
+        ),
+      ),
+    );
+  }
+
+  /// 翻译状态看板
+  Widget _buildTranslationStatusCard(ThemeData theme, int entryCount) {
+    final targetLang = aiTranslationTargetLang.value;
+    final langName = TranslationLanguage.findByCode(targetLang).name;
+
+    Color bg = const Color(0xFF262630);
+    Color accent = Colors.white54;
+    IconData icon = Icons.translate_rounded;
+    String text = '选择内置字幕轨，点击下方提取并翻译为 $langName';
+
+    if (_isTranslating) {
+      bg = PolyFlixColors.violet.withValues(alpha: .15);
+      accent = const Color(0xFF9D91FF);
+      icon = Icons.sync_rounded;
+      text = _statusMessage ?? '正在处理内置字幕...';
+    } else if (entryCount > 0) {
+      bg = Colors.green.withValues(alpha: .12);
+      accent = Colors.greenAccent;
+      icon = Icons.check_circle_rounded;
+      text = _statusMessage ?? '已生成 $entryCount 条字幕并就绪';
+    } else if (_statusMessage != null && _statusMessage!.contains('失败')) {
+      bg = Colors.red.withValues(alpha: .12);
+      accent = Colors.redAccent;
+      icon = Icons.error_outline_rounded;
+      text = _statusMessage!;
+    }
+
+    final double? progressPercent = (_totalTranslateCount > 0 && _isTranslating)
+        ? (_translatedCount / _totalTranslateCount).clamp(0.0, 1.0)
+        : null;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: accent.withValues(alpha: .3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (_isTranslating)
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.2,
+                    color: accent,
+                  ),
+                )
+              else
+                Icon(icon, color: accent, size: 20),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: _isTranslating || entryCount > 0 ? Colors.white : Colors.white70,
+                    fontWeight: _isTranslating ? FontWeight.w500 : FontWeight.normal,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_isTranslating && progressPercent != null) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: progressPercent,
+                minHeight: 5,
+                backgroundColor: Colors.white12,
+                color: accent,
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -912,7 +1329,6 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   /// 打开模型选择面板；选中的模型会立即生效（有缓存则载入该模型缓存）。
   Future<void> _openModelPicker() async {
-    // AI 面板里只要"已导入模型的选择器"，完整对照表留给设置页
     final result = await ModelCatalogSheet.show(
       context,
       selectedId: _selectedModel,
@@ -920,14 +1336,12 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     );
     if (result == null || !mounted) return;
 
-    // 模型文件状态可能变了（刚导入 / 刚删除），重新检测
     await _checkModels();
     if (!mounted) return;
     await _onSelectModel(result.modelId);
   }
 
   Widget _buildLanguageSelector(ThemeData theme) {
-    // 英语专用模型只能识别英语，这里直接锁死语言，避免用户选错后得到乱码
     final englishOnly =
         ModelManager.instance.infoOf(_selectedModel)?.isEnglishOnly ?? false;
 
@@ -965,7 +1379,6 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         child: DropdownButton<String>(
           value: _selectedLanguage,
           isExpanded: true,
-          // M3 下聚焦时会用 focusColor 填出一块底色，这里关掉保持纯文字
           focusColor: Colors.transparent,
           dropdownColor: const Color(0xFF262630),
           icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
@@ -990,59 +1403,97 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   Widget _buildSubtitleControls(ThemeData theme) {
     final hasEntries = _generator.entries.isNotEmpty;
+    final targetLang = aiTranslationTargetLang.value;
+    final langName = TranslationLanguage.findByCode(targetLang).name;
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: const Color(0xFF262630),
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: Colors.white12),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(
-            Icons.closed_caption_rounded,
-            color: Colors.white70,
-            size: 20,
-          ),
-          const SizedBox(width: 10),
-          const Expanded(
-            child: Text(
-              '在视频画面上显示原声字幕',
-              style: TextStyle(fontSize: 13, color: Colors.white),
-            ),
-          ),
-          Switch.adaptive(
-            value: _isAiSubtitleActive,
-            activeTrackColor: theme.colorScheme.primary,
-            onChanged: (val) {
-              setState(() => _isAiSubtitleActive = val);
-              widget.onToggleSubtitleActive(val);
-            },
-          ),
-          if (hasEntries) ...[
-            const SizedBox(width: 4),
-            IconButton(
-              tooltip: '导出为 SRT 字幕文件',
-              icon: const Icon(
-                Icons.file_download_outlined,
+          Row(
+            children: [
+              const Icon(
+                Icons.closed_caption_rounded,
                 color: Colors.white70,
                 size: 20,
               ),
-              onPressed: _exportSrtFile,
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text(
+                  '在视频画面上显示字幕',
+                  style: TextStyle(fontSize: 13, color: Colors.white),
+                ),
+              ),
+              Switch.adaptive(
+                value: _isAiSubtitleActive,
+                activeTrackColor: theme.colorScheme.primary,
+                onChanged: (val) {
+                  setState(() => _isAiSubtitleActive = val);
+                  widget.onToggleSubtitleActive(val);
+                },
+              ),
+              if (hasEntries) ...[
+                const SizedBox(width: 4),
+                IconButton(
+                  tooltip: _hasAnyTranslation ? '导出双语 SRT 字幕' : '导出为 SRT 字幕',
+                  icon: const Icon(
+                    Icons.file_download_outlined,
+                    color: Colors.white70,
+                    size: 20,
+                  ),
+                  onPressed: _exportSrtFile,
+                ),
+              ],
+              const SizedBox(width: 4),
+              IconButton(
+                tooltip: '删除字幕缓存',
+                icon: const Icon(
+                  Icons.delete_outline_rounded,
+                  color: Colors.white60,
+                  size: 20,
+                ),
+                onPressed: (hasEntries || _cachedModels.contains(_selectedModel))
+                    ? _deleteSubtitlesWithConfirm
+                    : null,
+              ),
+            ],
+          ),
+          // 若启用了翻译，且当前处于 ASR 模式、条目已有，展示一键翻译按钮
+          if (aiTranslationEnabled.value && hasEntries && _selectedSource == 'asr') ...[
+            const SizedBox(height: 8),
+            const Divider(color: Colors.white10, height: 1),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: _isTranslating ? _cancelCurrentTranslation : _translateCurrentEntries,
+                    icon: _isTranslating
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.g_translate_rounded, size: 16),
+                    label: Text(
+                      _isTranslating
+                          ? '取消翻译 ($_translatedCount/$_totalTranslateCount)'
+                          : (_hasAnyTranslation
+                              ? '重新翻译为 $langName'
+                              : '一键翻译为 $langName'),
+                      style: const TextStyle(fontSize: 12.5),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
-          const SizedBox(width: 4),
-          IconButton(
-            tooltip: '删除字幕缓存',
-            icon: const Icon(
-              Icons.delete_outline_rounded,
-              color: Colors.white60,
-              size: 20,
-            ),
-            onPressed: (hasEntries || _cachedModels.contains(_selectedModel))
-                ? _deleteSubtitlesWithConfirm
-                : null,
-          ),
         ],
       ),
     );
@@ -1059,7 +1510,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             const Icon(Icons.list_alt_rounded, size: 16, color: Colors.white70),
             const SizedBox(width: 6),
             Text(
-              '识别字幕预览 (共 $totalCount 条)',
+              '字幕条目预览 (共 $totalCount 条)',
               style: const TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
@@ -1087,7 +1538,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   Widget _buildSubtitlePreviewList(List<SubtitleEntry> entries) {
     return Container(
-      height: 140,
+      height: 160,
       decoration: BoxDecoration(
         color: const Color(0xFF19191E),
         borderRadius: BorderRadius.circular(10),
@@ -1121,12 +1572,28 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      e.text,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.white70,
-                      ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          e.text,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white70,
+                          ),
+                        ),
+                        if (e.translatedText != null && e.translatedText!.isNotEmpty) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            e.translatedText!,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500,
+                              color: Theme.of(context).colorScheme.primary,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
                 ],
@@ -1139,6 +1606,50 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Widget _buildBottomActions(ThemeData theme, bool isRunning) {
+    if (_selectedSource == 'builtin') {
+      if (_isTranslating) {
+        return FilledButton.icon(
+          style: FilledButton.styleFrom(
+            backgroundColor: Colors.redAccent.shade700,
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+          icon: const Icon(Icons.close_rounded, size: 20),
+          label: Text(
+            '取消翻译 ($_translatedCount/$_totalTranslateCount)',
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          ),
+          onPressed: _cancelCurrentTranslation,
+        );
+      }
+
+      final hasTracks = widget.subtitleTracks != null && widget.subtitleTracks!.isNotEmpty;
+      final targetLang = aiTranslationTargetLang.value;
+      final langName = TranslationLanguage.findByCode(targetLang).name;
+
+      return Row(
+        children: [
+          Expanded(
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: hasTracks ? PolyFlixColors.violet : Colors.white12,
+                foregroundColor: hasTracks ? Colors.white : Colors.white38,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              icon: const Icon(Icons.g_translate_rounded, size: 20),
+              label: Text(
+                hasTracks ? '提取并翻译为 $langName' : '无内置字幕可提取',
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+              onPressed: hasTracks ? _extractAndTranslateBuiltin : null,
+            ),
+          ),
+        ],
+      );
+    }
+
     if (isRunning) {
       return FilledButton.icon(
         style: FilledButton.styleFrom(
