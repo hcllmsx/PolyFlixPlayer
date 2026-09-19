@@ -124,9 +124,22 @@ class SubtitleGenerator {
   String? _entriesVideoPath;
   String? get entriesVideoPath => _entriesVideoPath;
 
+  /// 当前这批字幕是由哪个模型生成的（或从该模型缓存中载入）。
+  String? _entriesModelId;
+  String? get entriesModelId => _entriesModelId;
+
+  /// 规范化路径比对：忽略正反斜杠差异与大小写差异，保证跨平台与 Windows 路径判断一致。
+  static bool isSameVideoPath(String? a, String? b) {
+    if (a == null || b == null) return a == b;
+    if (a == b) return true;
+    final normA = a.replaceAll('/', '\\').toLowerCase().trim();
+    final normB = b.replaceAll('/', '\\').toLowerCase().trim();
+    return normA == normB;
+  }
+
   /// 这批字幕是否属于指定视频。
   bool holdsEntriesFor(String videoPath) =>
-      _entries.isNotEmpty && _entriesVideoPath == videoPath;
+      _entries.isNotEmpty && isSameVideoPath(_entriesVideoPath, videoPath);
 
   /// 当前状态。
   AsrState _state = AsrState.idle;
@@ -161,6 +174,7 @@ class SubtitleGenerator {
     _cancelled = false;
     _entries.clear();
     _entriesVideoPath = videoPath;
+    _entriesModelId = modelId;
     _updateState(AsrState.preparing, message: '正在准备…');
 
     try {
@@ -466,20 +480,29 @@ class SubtitleGenerator {
   void clear() {
     _entries.clear();
     _entriesVideoPath = null;
+    _entriesModelId = null;
     _state = AsrState.idle;
   }
 
   /// 批量设置字幕条目（从缓存恢复或从后台任务同步）。
   ///
   /// [videoPath] 用于记录这批字幕属于哪个视频，供面板/叠加层判断归属。
+  /// [modelId] 记录这批字幕对应的模型 ID，供面板精准展示对应的模型。
   /// [markCompleted] 为 true 时把状态一并置为"识别完成"：从本地缓存恢复的
   /// 字幕在控制面板里应显示成已完成（否则面板停在"就绪"、预览区也展不开），
   /// 而这批字幕并不需要真的再跑一次识别。
   void setEntries(
-    List<SubtitleEntry> list, {String? videoPath, bool markCompleted = false}) {
+    List<SubtitleEntry> list, {
+    String? videoPath,
+    String? modelId,
+    bool markCompleted = false,
+  }) {
     _entries.clear();
     _entries.addAll(list);
     _entriesVideoPath = videoPath;
+    if (modelId != null) {
+      _entriesModelId = modelId;
+    }
     if (markCompleted && list.isNotEmpty) {
       _state = AsrState.completed;
     }
@@ -508,11 +531,12 @@ class SubtitleGenerator {
     // 动态归属检测：只有当单例当前确属本次识别的视频时，才允许向单例写入条目或广播状态。
     // 识别流程通常耗时数十秒至数分钟，期间用户随时会切换并播放另一个视频，
     // 因此绝不能用初始布尔快照，必须在每个阶段实时求值。
-    bool isCurrentVideo() => _entriesVideoPath == videoPath;
+    bool isCurrentVideo() => isSameVideoPath(_entriesVideoPath, videoPath);
 
     if (_entriesVideoPath == null || isCurrentVideo()) {
       _entries.clear();
       _entriesVideoPath = videoPath;
+      _entriesModelId = modelId;
       _updateState(AsrState.preparing, message: '正在准备模型…');
     }
     onProgress?.call(AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在准备模型…');

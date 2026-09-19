@@ -329,6 +329,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
               'AI 字幕识别完成 (共 ${SubtitleGenerator.instance.entries.length} 条)',
             );
           }
+        } else if (p.state == AsrState.idle) {
+          if (!forThisVideo || SubtitleGenerator.instance.entries.isEmpty) {
+            _aiSubtitleActive = false;
+          }
         } else if (p.state == AsrState.error && forThisVideo) {
           _showOsd(p.message ?? 'AI 语音识别失败');
         }
@@ -702,6 +706,13 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     );
   }
 
+  /// 当前视频是否确实持有有效的 AI 字幕条目。
+  bool get _hasAiSubtitleEntries {
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    return SubtitleGenerator.instance.holdsEntriesFor(activeKey) &&
+        SubtitleGenerator.instance.entries.isNotEmpty;
+  }
+
   /// AI 识别或翻译总开关是否至少有一个启用。
   bool get _aiFeatureEnabled => aiSubtitleEnabled.value || aiTranslationEnabled.value;
 
@@ -917,6 +928,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         cached,
         // 归属用本次会话的播放地址（面板/叠加层据此判断"是不是本视频"）
         videoPath: ownerKey,
+        modelId: id,
         markCompleted: true,
       );
       return (modelId: id, count: cached.length);
@@ -1699,7 +1711,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
                   )
                 : Icon(
                     Icons.auto_awesome_rounded,
-                    color: _aiSubtitleActive
+                    color: (_aiSubtitleActive && _hasAiSubtitleEntries)
                         ? Theme.of(context).colorScheme.primary
                         : Colors.white,
                   ),
@@ -1906,7 +1918,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
                   )
                 : Icon(
                     Icons.auto_awesome_rounded,
-                    color: _aiSubtitleActive
+                    color: (_aiSubtitleActive && _hasAiSubtitleEntries)
                         ? Theme.of(context).colorScheme.primary
                         : Colors.white,
                   ),
@@ -2018,6 +2030,16 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       subtitleTracks: _subtitleTracks,
       activeSubtitleId: _activeSubtitleId,
     );
+
+    // 面板关闭后，若当前已无可用字幕，强制将 _aiSubtitleActive 置为 false，
+    // 并触发 setState 确保左下角按钮与画面叠加层立即同步变为未激活状态
+    if (mounted) {
+      setState(() {
+        if (!_hasAiSubtitleEntries) {
+          _aiSubtitleActive = false;
+        }
+      });
+    }
   }
 }
 

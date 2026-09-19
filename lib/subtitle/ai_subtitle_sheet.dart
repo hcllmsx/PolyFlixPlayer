@@ -197,6 +197,15 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _selectedLanguage = runningTask.language;
       _currentState = runningTask.state;
       _statusMessage = runningTask.statusMessage;
+    } else if (_generator.holdsEntriesFor(widget.videoPath) &&
+        _generator.entriesModelId != null &&
+        _generator.entriesModelId!.isNotEmpty) {
+      // 关键对齐：当前视频在播放器中已经展示/载入了字幕，
+      // 必须精准对齐到生成该字幕的模型（彻底解决“展示着模型2字幕，点进面板却选中模型1”的问题）
+      _selectedModel = _generator.entriesModelId!;
+      _localEntries = _generator.entries;
+      _currentState = _generator.state;
+      _statusMessage = '已载入 ${_selectedModel.toUpperCase()} 模型字幕 (共 ${_localEntries.length} 条)';
     } else {
       // 尝试自动读取当前视频的本地字幕缓存（按模型精准匹配）
       AiTaskManager.instance
@@ -211,6 +220,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               _generator.setEntries(
                 cached,
                 videoPath: widget.videoPath,
+                modelId: _selectedModel,
                 markCompleted: true,
               );
             }
@@ -231,7 +241,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         _statusMessage = p.message;
       });
     });
-    _checkModels();
+    _checkModels(autoLoadCached: true);
 
     // 设备能力检测：不满足最低要求时禁用识别入口并给出明确提示
     detectDeviceCapabilities().then((caps) {
@@ -264,20 +274,14 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   void _onTaskManagerChanged() {
     if (!mounted) return;
     final task = AiTaskManager.instance.getTask(widget.videoPath);
-    if (task != null) {
+    if (task != null && task.isRunning) {
       setState(() {
         _currentState = task.state;
         _statusMessage = task.statusMessage;
-        if (task.state == AsrState.preparing ||
-            task.state == AsrState.processing) {
-          _selectedModel = task.modelId;
-        }
+        _selectedModel = task.modelId;
       });
-      if (task.state == AsrState.completed) {
-        _checkModels();
-      }
     } else {
-      // 其它视频任务状态变化（例如进度、完成或被取消）时，触发重绘更新通知横幅与操作按钮
+      // 任务结束或非运行状态时，触发重绘更新通知横幅与操作按钮，不强行覆盖 _currentState
       setState(() {});
     }
   }
@@ -289,7 +293,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     super.dispose();
   }
 
-  Future<void> _checkModels() async {
+  Future<void> _checkModels({bool autoLoadCached = false}) async {
     // 扫一遍模型目录，记下"哪些模型已导入"。
     //
     // 注意：这里必须记录**全部**模型的可用性，不能只记当前选中的那一个 ——
@@ -299,21 +303,51 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     final imported = (await ModelManager.instance.getDownloadedModels())
         .toSet();
 
+    // 顺便确认当前视频有哪些模型留下了字幕缓存（界面标记用）
+    final cachedList = await AiTaskManager.instance.getCachedModelIds(
+      _cacheKey,
+    );
+    if (!mounted) return;
+
+    var activeId = _selectedModel;
+
+    // 优先级 1：若生成器正在承载当前视频的字幕，锁定为该字幕的归属模型
+    if (_generator.holdsEntriesFor(widget.videoPath) &&
+        _generator.entriesModelId != null &&
+        _generator.entriesModelId!.isNotEmpty) {
+      activeId = _generator.entriesModelId!;
+    } else if (autoLoadCached && _localEntries.isEmpty && cachedList.isNotEmpty) {
+      // 优先级 2：仅在面板首次打开初始化时，若尚未载入字幕，智能预选已有缓存的模型并载入
+      if (!cachedList.contains(activeId)) {
+        activeId = cachedList.first;
+        final cached = await AiTaskManager.instance.loadCachedSubtitles(
+          _cacheKey,
+          modelId: activeId,
+        );
+        if (mounted && cached != null && cached.isNotEmpty) {
+          setState(() {
+            _localEntries = cached;
+            _currentState = AsrState.completed;
+            _statusMessage = '已载入历史字幕缓存 (共 ${cached.length} 条)';
+          });
+          _generator.setEntries(
+            cached,
+            videoPath: widget.videoPath,
+            modelId: activeId,
+            markCompleted: true,
+          );
+        }
+      }
+    }
+
     // 选中的模型没导入时，回落到第一个已导入的模型；一个都没导入则保持原选择，
     // 由界面提示去设置页导入。
-    var activeId = _selectedModel;
     if (!imported.contains(activeId)) {
       final fallback = availableModels
           .where((m) => imported.contains(m.id))
           .toList();
       if (fallback.isNotEmpty) activeId = fallback.first.id;
     }
-
-    // 顺便确认当前视频有哪些模型留下了字幕缓存（界面标记用）
-    final cachedList = await AiTaskManager.instance.getCachedModelIds(
-      _cacheKey,
-    );
-    if (!mounted) return;
 
     setState(() {
       _cachedModels = cachedList.toSet();
@@ -363,6 +397,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _generator.setEntries(
         cached,
         videoPath: widget.videoPath,
+        modelId: id,
         markCompleted: true,
       );
     } else {
@@ -471,23 +506,49 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
     if (confirm != true) return;
 
-    // 1. 删除磁盘物理缓存文件
+    // 1. 删除当前选定模型的磁盘物理缓存文件（主缓存 + 关联翻译缓存全量扫盘清理）
     await AiTaskManager.instance.deleteCachedSubtitles(
       _cacheKey,
       modelId: _selectedModel,
     );
-
-    // 2. 清空内存字幕
-    _localEntries.clear();
-    if (_generator.holdsEntriesFor(widget.videoPath)) {
-      _generator.clear();
+    if (widget.videoPath != _cacheKey) {
+      await AiTaskManager.instance.deleteCachedSubtitles(
+        widget.videoPath,
+        modelId: _selectedModel,
+      );
     }
 
-    // 3. 刷新状态并恢复识别按钮可点击
+    // 2. 清理任务管理器中该模型的历史任务记录（解除 completed 状态死锁）
+    AiTaskManager.instance.clearTaskFor(
+      _cacheKey,
+      modelId: _selectedModel,
+    );
+    if (widget.videoPath != _cacheKey) {
+      AiTaskManager.instance.clearTaskFor(
+        widget.videoPath,
+        modelId: _selectedModel,
+      );
+    }
+
+    // 3. 清空内存字幕（若当前内存中的字幕归属是被删除的模型，清空并关闭画面显示）
+    final isCurrentGenModel = _generator.entriesModelId == null ||
+        _generator.entriesModelId!.toLowerCase() == _selectedModel.toLowerCase();
+    if (isCurrentGenModel) {
+      _localEntries = [];
+      _generator.clear();
+      widget.onToggleSubtitleActive(false);
+    }
+
+    // 4. 重新扫描磁盘缓存与可用模型（不自动回填其他模型缓存）
+    await _checkModels(autoLoadCached: false);
+
+    // 5. 立即刷新界面状态：回到就绪状态，确保「开始识别」按钮恢复可点击
     if (mounted) {
       setState(() {
-        _cachedModels.remove(_selectedModel);
-        // 重置状态为就绪，避免仍显示「识别已完成」的提示
+        if (isCurrentGenModel) {
+          _localEntries = [];
+          _isAiSubtitleActive = false;
+        }
         _currentState = AsrState.idle;
         _statusMessage = null;
         _previewExpanded = false;
@@ -690,6 +751,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       _generator.setEntries(
         translatedEntries,
         videoPath: widget.videoPath,
+        modelId: _selectedModel,
         markCompleted: true,
       );
       widget.onToggleSubtitleActive(true);
@@ -1114,7 +1176,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       accent = const Color(0xFF9D91FF);
       icon = Icons.graphic_eq_rounded;
       text = task?.statusMessage ?? _statusMessage ?? '正在处理音频...';
-    } else if (_currentState == AsrState.completed) {
+    } else if (_currentState == AsrState.completed && entryCount > 0) {
       bg = Colors.green.withValues(alpha: .12);
       accent = Colors.greenAccent;
       icon = Icons.check_circle_rounded;
@@ -1458,7 +1520,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                   color: Colors.white60,
                   size: 20,
                 ),
-                onPressed: (hasEntries || _cachedModels.contains(_selectedModel))
+                onPressed: _cachedModels.contains(_selectedModel)
                     ? _deleteSubtitlesWithConfirm
                     : null,
               ),

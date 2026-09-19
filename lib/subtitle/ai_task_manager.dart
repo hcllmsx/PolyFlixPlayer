@@ -404,6 +404,22 @@ class AiTaskManager extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 清理指定视频在特定模型下的历史任务记录（重置任务状态，防止 completed 状态死锁）。
+  void clearTaskFor(String videoPath, {String? modelId}) {
+    final mId = modelId?.toLowerCase();
+    _tasks.removeWhere((t) {
+      if (!t.isFinished) return false;
+      final matchPath = _isSamePath(t.videoPath, videoPath) ||
+          _isSamePath(t.cacheKey, videoPath);
+      if (!matchPath) return false;
+      if (mId != null && mId.isNotEmpty) {
+        return t.modelId.toLowerCase() == mId;
+      }
+      return true;
+    });
+    notifyListeners();
+  }
+
   /// 后台驱动切片识别流水线。
   Future<void> _runTask(AiTask task) async {
     try {
@@ -641,29 +657,80 @@ class AiTaskManager extends ChangeNotifier {
     } catch (_) {}
   }
 
-  /// 删除指定视频在特定模型下的本地字幕缓存文件。
-  Future<bool> deleteCachedSubtitles(
+  /// 删除指定视频的本地字幕缓存文件（全量扫盘清理主缓存与关联翻译缓存）。
+  ///
+  /// - 若提供 [modelId]，删除该模型下的主缓存与关联翻译缓存；
+  /// - 若 [modelId] 为 null 或为空，彻底清除该视频在所有模型下的字幕缓存与翻译缓存。
+  /// 返回实际物理删除的文件数量（大于 0 表示成功删除）。
+  Future<int> deleteCachedSubtitles(
     String videoPath, {
-    required String modelId,
+    String? modelId,
   }) async {
+    int deletedCount = 0;
     try {
       final dir = NativeFileHelper.desktopSubtitleCacheDir();
-      if (!dir.existsSync()) return false;
+      if (!dir.existsSync()) return 0;
 
+      final cleanName = _extractCleanBaseName(videoPath);
       final fingerprint = _getVideoFingerprint(videoPath);
-      final targetFile = _findCacheFile(
-        videoPath,
-        modelId,
-        fingerprint,
-        dir.path,
-      );
-      if (targetFile != null && await targetFile.exists()) {
-        await targetFile.delete();
-        return true;
+      final pathHash6 = md5
+          .convert(utf8.encode(videoPath))
+          .toString()
+          .substring(0, 6);
+      final oldHash16 = md5
+          .convert(utf8.encode(videoPath))
+          .toString()
+          .substring(0, 16);
+      final mId = (modelId != null && modelId.isNotEmpty)
+          ? modelId.toLowerCase()
+          : null;
+
+      final entities = dir.listSync();
+      for (final item in entities) {
+        if (item is! File || !item.path.endsWith('.json')) continue;
+        final name = item.uri.pathSegments.last;
+
+        bool shouldDelete = false;
+
+        if (mId != null) {
+          // 1. 指定模型的主字幕缓存
+          // 规则 A: 包含同指纹+同模型: _${mId}_${fingerprint}.json
+          // 规则 B: 包含同短哈希+同模型: _${mId}_${pathHash6}.json
+          // 规则 C: 包含 cleanName+同模型: ${cleanName}_${mId}_
+          if (name.contains('_${mId}_$fingerprint.json') ||
+              name.contains('_${mId}_$pathHash6.json') ||
+              (name.startsWith('${cleanName}_${mId}_') && name.endsWith('.json'))) {
+            shouldDelete = true;
+          }
+
+          // 2. 指定模型的 ASR 翻译缓存: trans_*_asr_${mId}_*.json
+          if (name.startsWith('trans_') && name.contains('_asr_${mId}_')) {
+            if (name.contains(cleanName) || name.contains(fingerprint)) {
+              shouldDelete = true;
+            }
+          }
+        } else {
+          // 未指定模型：清空当前视频所有模型的缓存与翻译缓存
+          if (name.contains('_$fingerprint.json') ||
+              name.contains('_$pathHash6.json') ||
+              name.startsWith('${cleanName}_') ||
+              name == 'sub_$oldHash16.json') {
+            shouldDelete = true;
+          }
+          if (name.startsWith('trans_') &&
+              (name.contains(cleanName) || name.contains(fingerprint))) {
+            shouldDelete = true;
+          }
+        }
+
+        if (shouldDelete) {
+          try {
+            await item.delete();
+            deletedCount++;
+          } catch (_) {}
+        }
       }
-      return false;
-    } catch (_) {
-      return false;
-    }
+    } catch (_) {}
+    return deletedCount;
   }
 }
