@@ -287,8 +287,14 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         if (mounted) _brightness = b;
       });
       PlatformMediaHelper.getVolume().then((v) {
-        if (mounted) _volume = v * 100.0;
+        if (mounted) {
+          setState(() {
+            _volume = v * 100.0;
+            _muted = v == 0;
+          });
+        }
       });
+      PlatformMediaHelper.addVolumeListener(_onSystemVolumeChanged);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       SystemChrome.setSystemUIOverlayStyle(
         const SystemUiOverlayStyle(
@@ -354,6 +360,22 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     if (mounted) setState(() {});
   }
 
+  /// 移动端系统音量变化回调（响应手机侧边实体音量键）。
+  void _onSystemVolumeChanged(double v) {
+    if (!mounted) return;
+    final percent = (v * 100.0).clamp(0.0, 100.0);
+    // 若当前正在用屏幕手势滑动调节音量，手势自身在实时驱动显示，忽略外部广播避免冲突
+    if (_dragType == _VerticalDragType.volume) return;
+    setState(() {
+      _volume = percent;
+      _muted = percent == 0;
+    });
+    _showOsd(
+      '音量 ${percent.round()}%',
+      icon: percent == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+    );
+  }
+
   @override
   void dispose() {
     if (isDesktopPlatform) windowManager.removeListener(this);
@@ -366,6 +388,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _restartHintTimer?.cancel();
     _keyboardFocus.dispose();
     if (isMobilePlatform) {
+      PlatformMediaHelper.removeVolumeListener(_onSystemVolumeChanged);
       if (_brightnessModified) {
         PlatformMediaHelper.resetBrightness();
       }
@@ -423,6 +446,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   Future<void> _initPlayer() async {
     _player = Player();
     _controller = VideoController(_player);
+    if (isMobilePlatform) {
+      // 移动端音频由系统媒体音量全权驱动，确保播放器自身始终为 100% 全额输出
+      await _player.setVolume(100.0);
+    }
 
     _player.stream.playing.listen((value) {
       if (mounted) {
@@ -450,9 +477,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         _maybeApplyResume();
       }
     });
-    // 音量双向同步：滑块调节 / 系统变化都反映到本地状态。
+    // 音量双向同步：滑块调节 / 系统变化都反映到本地状态（桌面端生效）。
     _player.stream.volume.listen((value) {
-      if (mounted) setState(() => _volume = value);
+      if (mounted && !isMobilePlatform) setState(() => _volume = value);
     });
     // 轨道列表与当前轨道由播放器驱动，供音轨/字幕菜单使用。
     _player.stream.tracks.listen((value) {
@@ -1154,8 +1181,11 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       final next = (_dragStartValue + ratio * 100.0).clamp(0.0, 100.0);
       _volume = next;
       _muted = next == 0;
-      PlatformMediaHelper.setVolume(next / 100.0);
-      _player.setVolume(next);
+      if (isMobilePlatform) {
+        PlatformMediaHelper.setVolume(next / 100.0);
+      } else {
+        _player.setVolume(next);
+      }
       _showOsd(
         '音量 ${next.round()}%',
         icon: next == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded,
@@ -1328,7 +1358,11 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       return;
     }
     _muted = false;
-    await _player.setVolume(next);
+    if (isMobilePlatform) {
+      await PlatformMediaHelper.setVolume(next / 100.0);
+    } else {
+      await _player.setVolume(next);
+    }
     if (mounted) {
       setState(() => _volume = next);
       _showOsd('音量 ${next.round()}%');
@@ -1338,15 +1372,23 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   Future<void> _toggleMute() async {
     if (_muted) {
       _muted = false;
-      await _player.setVolume(_volumeBeforeMute);
+      if (isMobilePlatform) {
+        await PlatformMediaHelper.setVolume(_volumeBeforeMute / 100.0);
+      } else {
+        await _player.setVolume(_volumeBeforeMute);
+      }
       if (mounted) {
         setState(() => _volume = _volumeBeforeMute);
         _showOsd('已取消静音');
       }
     } else {
-      _volumeBeforeMute = _volume;
+      _volumeBeforeMute = _volume > 0 ? _volume : 50;
       _muted = true;
-      await _player.setVolume(0);
+      if (isMobilePlatform) {
+        await PlatformMediaHelper.setVolume(0);
+      } else {
+        await _player.setVolume(0);
+      }
       if (mounted) {
         setState(() => _volume = 0);
         _showOsd('已静音');

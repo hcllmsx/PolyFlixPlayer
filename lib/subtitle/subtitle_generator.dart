@@ -26,6 +26,7 @@ import 'package:ffmpeg_kit_flutter_new_min/return_code.dart';
 
 import '../settings/app_settings.dart';
 import '../utils/native_file_helper.dart';
+import '../utils/platform_utils.dart';
 import 'engine_pack.dart';
 import 'model_manager.dart';
 import 'whisper_server.dart';
@@ -257,7 +258,12 @@ class SubtitleGenerator {
   /// 速度杠杆：设置里为 0 时走自动策略 —— 取逻辑核心数的一半并夹在 [4, 12]。
   /// 实测（310 秒音频 / small 模型）：4 线程 38.8s → 8 线程 23.4s → 12 线程
   /// 22.3s，再往上基本没收益（tiny 模型 16 线程反而变慢）。
+  /// 移动端静默锁定为自动策略，不读取用户配置。
   static int resolveAsrThreads() {
+    if (!isDesktopPlatform) {
+      final half = Platform.numberOfProcessors ~/ 2;
+      return half.clamp(2, 8);
+    }
     final configured = aiAsrThreadCount.value;
     if (configured > 0) return configured;
     return (Platform.numberOfProcessors ~/ 2).clamp(4, 12);

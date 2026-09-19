@@ -36,12 +36,6 @@ class _SettingsPageState extends State<SettingsPage> {
   int _cacheBytes = 0;
   bool _loadingCache = true;
   bool _clearingCache = false;
-
-  int _subtitleBytes = 0;
-  int _subtitleCount = 0;
-  bool _loadingSubtitles = true;
-  bool _clearingSubtitles = false;
-
   String _currentVersion = '26.8.23';
 
   // AI 字幕模型状态
@@ -63,7 +57,6 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _refreshCacheSize();
-    _refreshSubtitleCacheSize();
     _loadLocalVersion();
     _refreshModels();
     detectGpuCapability().then((cap) {
@@ -163,64 +156,6 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
       );
-  }
-
-  Future<void> _refreshSubtitleCacheSize() async {
-    final info = await NativeFileHelper.getSubtitleCacheInfo();
-    if (mounted) {
-      setState(() {
-        _subtitleBytes = info.bytes;
-        _subtitleCount = info.count;
-        _loadingSubtitles = false;
-      });
-    }
-  }
-
-  Future<void> _clearSubtitleCache() async {
-    if (_clearingSubtitles || _subtitleCount == 0) return;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('清空 AI 字幕缓存'),
-        content: Text(
-          '确定要清空所有已识别生成的字幕缓存（共 $_subtitleCount 个视频）吗？\n\n'
-          '清空后，已识别的视频再次播放时需重新进行语音识别。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-            ),
-            onPressed: () => Navigator.of(ctx).pop(true),
-            child: const Text('确认清空'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed == true) {
-      setState(() => _clearingSubtitles = true);
-      final cleared = await NativeFileHelper.clearSubtitleCache();
-      await _refreshSubtitleCacheSize();
-      if (!mounted) return;
-      setState(() => _clearingSubtitles = false);
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(
-          SnackBar(
-            content: Text(
-              cleared > 0
-                  ? '已清空字幕缓存，释放了 ${_formatBytes(cleared)} 存储空间。'
-                  : '字幕缓存已全部清空。',
-            ),
-          ),
-        );
-    }
   }
 
   String _formatBytes(int bytes) {
@@ -558,7 +493,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     if (isDesktopPlatform) ...[
                       OutlinedButton.icon(
                         icon: const Icon(Icons.folder_open_rounded, size: 16),
-                        label: const Text('打开缓存目录'),
+                        label: const Text('打开目录'),
                         style: OutlinedButton.styleFrom(
                           visualDensity: VisualDensity.compact,
                           padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -578,74 +513,6 @@ class _SettingsPageState extends State<SettingsPage> {
                         : FilledButton.tonal(
                             onPressed: _clearCache,
                             child: const Text('清理'),
-                          ),
-                  ],
-                ),
-                const Divider(height: 28),
-                Row(
-                  children: [
-                    Icon(
-                      Icons.subtitles_rounded,
-                      color: scheme.primary,
-                    ),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('AI 识别字幕缓存'),
-                          const SizedBox(height: 4),
-                          Text(
-                            _loadingSubtitles
-                                ? '正在计算字幕缓存…'
-                                : '已缓存 $_subtitleCount 个视频的字幕，占用 ${_formatBytes(_subtitleBytes)}',
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: scheme.onSurfaceVariant,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '已生成的字幕安全保存在应用持久存储中，可在脱机状态下长期复用，重装应用或清理临时缓存不会丢失。',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              height: 1.4,
-                              color: scheme.onSurfaceVariant.withValues(alpha: .75),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    if (isDesktopPlatform) ...[
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.folder_open_rounded, size: 16),
-                        label: const Text('打开字幕目录'),
-                        style: OutlinedButton.styleFrom(
-                          visualDensity: VisualDensity.compact,
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
-                        ),
-                        onPressed: () => NativeFileHelper.openDirectory(
-                          NativeFileHelper.desktopSubtitleCacheDir(),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                    ],
-                    _clearingSubtitles
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2.2),
-                          )
-                        : FilledButton.tonal(
-                            onPressed:
-                                _subtitleCount > 0 ? _clearSubtitleCache : null,
-                            child: const Text('清空'),
                           ),
                   ],
                 ),
@@ -815,7 +682,17 @@ class _SettingsPageState extends State<SettingsPage> {
                           ),
                         ),
                     ],
+                    const SizedBox(height: 4),
+                  ] else ...[
+                    const SizedBox(height: 6),
                   ],
+                  Text(
+                    '本机逻辑核心：$cores',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
                   if (_engineHintText() != null) ...[
                     const SizedBox(height: 8),
                     Text(
@@ -861,76 +738,78 @@ class _SettingsPageState extends State<SettingsPage> {
                 title: const Text('强制使用 CPU 识别'),
                 subtitle: const Text('显卡驱动异常或识别报错时打开，无需删除引擎包。'),
               ),
-            const Divider(height: 1, indent: 16, endIndent: 16),
+            if (isDesktopPlatform) ...[
+              const Divider(height: 1, indent: 16, endIndent: 16),
 
-            // ---------- 识别线程数 ----------
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-              child: _cardSectionTitle('识别线程数'),
-            ),
-            ListenableBuilder(
-              listenable: aiAsrThreadCount,
-              builder: (context, _) {
-                final current = options.contains(aiAsrThreadCount.value)
-                    ? aiAsrThreadCount.value
-                    : 0;
-                return Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        gpuActive
-                            ? '当前使用 GPU 引擎包加速，线程数不生效。'
-                            : '仅 CPU 识别时生效：本机 $cores 逻辑核心，'
-                                  '「自动」取核心数一半并限制在 4~12。',
-                        style: TextStyle(
-                          fontSize: 12,
-                          height: 1.45,
-                          color: scheme.onSurfaceVariant,
+              // ---------- 识别线程数 ----------
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: _cardSectionTitle('识别线程数'),
+              ),
+              ListenableBuilder(
+                listenable: aiAsrThreadCount,
+                builder: (context, _) {
+                  final current = options.contains(aiAsrThreadCount.value)
+                      ? aiAsrThreadCount.value
+                      : 0;
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          gpuActive
+                              ? '当前使用 GPU 引擎包加速，线程数不生效。'
+                              : '仅 CPU 识别时生效：本机 $cores 逻辑核心，'
+                                    '「自动」取核心数一半并限制在 4~12。',
+                          style: TextStyle(
+                            fontSize: 12,
+                            height: 1.45,
+                            color: scheme.onSurfaceVariant,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.end,
-                        children: [
-                          DropdownButton<int>(
-                            value: current,
-                            underline: const SizedBox.shrink(),
-                            // Material 3 下 DropdownButton 聚焦时会用 focusColor 填充底色，
-                            // 选完一项后那块灰底会一直留着，这里显式关掉。
-                            focusColor: Colors.transparent,
-                            // GPU 加速时线程数不起作用，置灰不可选
-                            onChanged: gpuActive
-                                ? null
-                                : (v) {
-                                    if (v != null) setAiAsrThreadCount(v);
-                                  },
-                            items: [
-                              for (final v in options)
-                                DropdownMenuItem<int>(
-                                  value: v,
-                                  child: Text(
-                                    v == 0 ? '自动' : '$v 线程',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: gpuActive
-                                          ? scheme.onSurface.withValues(
-                                              alpha: .38,
-                                            )
-                                          : null,
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            DropdownButton<int>(
+                              value: current,
+                              underline: const SizedBox.shrink(),
+                              // Material 3 下 DropdownButton 聚焦时会用 focusColor 填充底色，
+                              // 选完一项后那块灰底会一直留着，这里显式关掉。
+                              focusColor: Colors.transparent,
+                              // GPU 加速时线程数不起作用，置灰不可选
+                              onChanged: gpuActive
+                                  ? null
+                                  : (v) {
+                                      if (v != null) setAiAsrThreadCount(v);
+                                    },
+                              items: [
+                                for (final v in options)
+                                  DropdownMenuItem<int>(
+                                    value: v,
+                                    child: Text(
+                                      v == 0 ? '自动' : '$v 线程',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: gpuActive
+                                            ? scheme.onSurface.withValues(
+                                                alpha: .38,
+                                              )
+                                            : null,
+                                      ),
                                     ),
                                   ),
-                                ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ],
             const SizedBox(height: 14),
           ],
         );
@@ -1175,7 +1054,8 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _engineHintText() {
     if (_checkingEngine) return null;
     if (!isDesktopPlatform) {
-      return '移动端采用内置 CPU 识别引擎，无需额外导入引擎包；导入语音模型后即可使用。';
+      return '移动端采用内置 CPU 识别引擎，无需额外导入引擎包；导入语音模型后即可使用。\n'
+          '移动端识别线程数已锁定为“自动”。';
     }
     if (_enginePacks.isEmpty) {
       return '点「浏览全部引擎」看对照表：按文件名去网盘下载官方 zip，'

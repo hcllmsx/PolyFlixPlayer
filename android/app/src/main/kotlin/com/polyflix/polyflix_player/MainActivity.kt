@@ -14,6 +14,10 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.database.ContentObserver
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -23,6 +27,9 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.polyflix.player/storage_permission"
     private val REQUEST_CODE_PICK_VIDEOS = 2002
     private var pendingPickResult: MethodChannel.Result? = null
+    private var volumeObserver: ContentObserver? = null
+    private var mediaChannel: MethodChannel? = null
+    private var lastReportedVolume: Double = -1.0
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -139,7 +146,11 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.polyflix.player/media_control").setMethodCallHandler { call, result ->
+        volumeControlStream = AudioManager.STREAM_MUSIC
+
+        val media = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.polyflix.player/media_control")
+        mediaChannel = media
+        media.setMethodCallHandler { call, result ->
             when (call.method) {
                 "getBrightness" -> {
                     try {
@@ -169,10 +180,10 @@ class MainActivity : FlutterActivity() {
                 }
                 "getVolume" -> {
                     try {
-                        val am = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                         if (am != null) {
-                            val current = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
-                            val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                            val current = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                             val percent = if (max > 0) current.toDouble() / max else 0.5
                             result.success(percent)
                         } else {
@@ -185,11 +196,12 @@ class MainActivity : FlutterActivity() {
                 "setVolume" -> {
                     try {
                         val volume = call.argument<Double>("volume") ?: 0.5
-                        val am = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                         if (am != null) {
-                            val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                             val target = Math.round(volume * max).toInt().coerceIn(0, max)
-                            am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, target, 0)
+                            lastReportedVolume = if (max > 0) target.toDouble() / max else 0.0
+                            am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
                             result.success(true)
                         } else {
                             result.success(false)
@@ -200,6 +212,44 @@ class MainActivity : FlutterActivity() {
                 }
                 else -> result.notImplemented()
             }
+        }
+        setupVolumeObserver()
+    }
+
+    private fun setupVolumeObserver() {
+        if (volumeObserver != null) return
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                super.onChange(selfChange)
+                try {
+                    val current = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    val percent = if (max > 0) current.toDouble() / max else 0.5
+                    if (Math.abs(percent - lastReportedVolume) > 0.001) {
+                        lastReportedVolume = percent
+                        mediaChannel?.invokeMethod("onVolumeChanged", percent)
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        try {
+            contentResolver.registerContentObserver(
+                Settings.System.CONTENT_URI,
+                true,
+                observer
+            )
+            volumeObserver = observer
+        } catch (_: Exception) {}
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        volumeObserver?.let {
+            try {
+                contentResolver.unregisterContentObserver(it)
+            } catch (_: Exception) {}
+            volumeObserver = null
         }
     }
 

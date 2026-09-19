@@ -11,6 +11,7 @@ library;
 import 'package:flutter/foundation.dart';
 
 import '../subtitle/model_manager.dart';
+import '../utils/platform_utils.dart';
 import 'app_store.dart';
 
 // ------------------------------ 存储键（settings.json 里的字段名） ------------------------------
@@ -81,7 +82,8 @@ Future<void> loadAppSettings() async {
   aiAsrModelId.value = availableModels.any((m) => m.id == savedModel)
       ? savedModel
       : 'tiny';
-  aiAsrThreadCount.value = store.getInt(_kAiAsrThreads, 0);
+  aiAsrThreadCount.value =
+      isDesktopPlatform ? store.getInt(_kAiAsrThreads, 0) : 0;
   aiAsrForceCpu.value = store.getBool(_kAiAsrForceCpu, false);
   resumePlaybackEnabled.value = store.getBool(_kResumePlayback, true);
   final resumeMin = store.getInt(_kResumeMinVideoSeconds, 60);
@@ -109,8 +111,12 @@ Future<void> setAiAsrModelId(String value) async {
   await AppStore.instance.setString(_kAiAsrModelId, value);
 }
 
-/// 写入"AI 识别线程数"（0 = 自动）。
+/// 写入"AI 识别线程数"（0 = 自动）。移动端静默锁定为 0（自动）不可修改。
 Future<void> setAiAsrThreadCount(int value) async {
+  if (!isDesktopPlatform) {
+    aiAsrThreadCount.value = 0;
+    return;
+  }
   aiAsrThreadCount.value = value;
   await AppStore.instance.setInt(_kAiAsrThreads, value);
 }
