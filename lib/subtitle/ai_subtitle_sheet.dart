@@ -1754,7 +1754,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }) {
     if (isRunning) return '识别进行中，暂不能切换模型';
     if (!isAvailable) {
-      if (hasCache) return '已生成字幕缓存（本地模型文件已移除，可正常显示或删除）';
+      if (hasCache) return '未找到生成该字幕时的模型';
       return '尚未导入模型，点击右侧选择（需先在设置页导入）';
     }
 
