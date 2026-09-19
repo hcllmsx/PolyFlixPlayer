@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android 8.0（API 26）+ 的自适应图标定义。
+    加了它之后，桌面不再把图标垫在白色底板上，而是用「背景层 + 前景层」合成：
+      - 背景层：铺满整个格子（蓝紫渐变），保证圆形/水滴/方角遮罩下都不露白
+      - 前景层：应用 logo 主体，缩放到 90% 居中，四周留出安全余量给桌面视差动画
+    API 25 及以下会自动回退到 res/mipmap-*/ic_launcher.png。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
