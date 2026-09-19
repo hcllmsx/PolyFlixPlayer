@@ -50,6 +50,14 @@ class AzureTranslationEngine implements TranslationEngine {
   String get displayName => '微软 Azure 翻译';
 
   @override
+  bool get isConfigured => key.isNotEmpty;
+
+  @override
+  String? get configurationError => isConfigured
+      ? null
+      : '未配置微软 Azure 翻译密钥 (Key)';
+
+  @override
   Future<String> testConnection({String testText = 'Hello'}) async {
     final results = await translateBatch(
       texts: [testText],

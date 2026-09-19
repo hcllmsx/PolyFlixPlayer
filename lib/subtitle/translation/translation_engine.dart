@@ -160,4 +160,10 @@ abstract class TranslationEngine {
     required String targetLanguage,
     String sourceLanguage = 'auto',
   });
+
+  /// 当前引擎是否已完成必要的凭据/地址配置。
+  bool get isConfigured;
+
+  /// 未配置时的提示文案（如已就绪则为 null）。
+  String? get configurationError;
 }

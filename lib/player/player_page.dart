@@ -2948,7 +2948,9 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
     final percentText = task.percent > 0
         ? ' ${(task.percent * 100).toStringAsFixed(0)}%'
         : '';
-    final actionName = task.state == AsrState.preparing ? '正在提取音频' : 'AI 识别中';
+    final actionName = task.taskType == AiTaskType.translation
+        ? '字幕翻译中'
+        : (task.state == AsrState.preparing ? '正在提取音频' : 'AI 识别中');
 
     return Material(
       color: Colors.transparent,

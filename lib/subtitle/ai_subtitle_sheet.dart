@@ -10,6 +10,7 @@ import 'package:media_kit/media_kit.dart';
 import 'ai_task_manager.dart';
 import '../main.dart';
 import '../settings/app_settings.dart';
+import '../settings/settings_page.dart';
 import '../utils/app_toast.dart';
 import 'device_capability.dart';
 import 'engine_pack.dart';
@@ -149,7 +150,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     if (_selectedSource == 'builtin') {
       return _builtinTracksCache[_selectedBuiltinTrackIndex] ?? const <SubtitleEntry>[];
     }
-    final task = AiTaskManager.instance.getTask(widget.videoPath);
+    final task = AiTaskManager.instance.getAsrTask(widget.videoPath);
     if (task != null && task.isRunning) {
       return task.entries;
     }
@@ -214,14 +215,16 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     }
     _currentState = _generator.state;
 
-    // 检查并优先同步当前视频正在执行的后台任务
-    final runningTask = AiTaskManager.instance.getTask(widget.videoPath);
+    // 检查并优先同步当前视频正在执行的后台识别任务
+    final runningTask = AiTaskManager.instance.getAsrTask(widget.videoPath);
     if (runningTask != null &&
         !runningTask.isCancelled &&
         (runningTask.state == AsrState.preparing ||
             runningTask.state == AsrState.processing)) {
       _selectedModel = runningTask.modelId;
-      _selectedLanguage = runningTask.language;
+      if (_languageOptions.any((opt) => opt['code'] == runningTask.language)) {
+        _selectedLanguage = runningTask.language;
+      }
       _currentState = runningTask.state;
       _statusMessage = runningTask.statusMessage;
     } else if (_generator.holdsEntriesFor(widget.videoPath) &&
@@ -311,8 +314,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   void _onTaskManagerChanged() {
     if (!mounted) return;
     // 1. 同步 ASR 语音识别任务
-    final asrTask = AiTaskManager.instance.getTask(widget.videoPath);
-    if (asrTask != null && asrTask.isRunning && asrTask.taskType == AiTaskType.transcription) {
+    final asrTask = AiTaskManager.instance.getAsrTask(widget.videoPath);
+    if (asrTask != null && asrTask.isRunning) {
       _currentState = asrTask.state;
       _statusMessage = asrTask.statusMessage;
       _selectedModel = asrTask.modelId;
@@ -796,8 +799,55 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     }
   }
 
+  /// 检查翻译引擎是否已配置；未配置时弹出提示对话框并可直接跳转设置页。
+  bool _ensureTranslationEngineConfigured() {
+    final check = TranslationService.instance.checkConfiguration();
+    if (check.isConfigured) return true;
+
+    final errorMsg = check.errorMessage ?? '未配置翻译服务凭据';
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF202027),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 22),
+            SizedBox(width: 8),
+            Text('翻译服务未配置', style: TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+        content: Text(
+          '$errorMsg。\n\n请前往「设置」页面填写对应翻译 API 的 Key 或密钥后即可使用。',
+          style: const TextStyle(color: Colors.white70, fontSize: 13.5, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('稍后再说', style: TextStyle(color: Colors.white54)),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: PolyFlixColors.violet,
+            ),
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const SettingsPage()),
+              );
+            },
+            child: const Text('前往设置'),
+          ),
+        ],
+      ),
+    );
+    return false;
+  }
+
   /// 提取并翻译选中的内置字幕轨（作为全局后台任务运行）
   Future<void> _extractAndTranslateBuiltin() async {
+    if (!_ensureTranslationEngineConfigured()) return;
+
     final tracks = widget.subtitleTracks;
     if (tracks == null || tracks.isEmpty) {
       AppToast.show(context, '当前视频未检测到内置字幕轨', isError: true);
@@ -927,6 +977,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   /// 翻译当前已识别生成的字幕条目（作为全局后台任务运行）
   Future<void> _translateCurrentEntries() async {
+    if (!_ensureTranslationEngineConfigured()) return;
+
     final entries = _currentDisplayEntries;
     if (entries.isEmpty) return;
     final currentTask = _currentTranslationTask;
@@ -978,10 +1030,29 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     AppToast.show(context, '已取消翻译');
   }
 
+  void _schedulePendingTranslation() {
+    if (!_ensureTranslationEngineConfigured()) return;
+
+    final targetLang = aiTranslationTargetLang.value;
+    AiTaskManager.instance.scheduleTranslationAfterAsr(
+      videoPath: widget.videoPath,
+      targetLang: targetLang,
+    );
+    final langName = TranslationLanguage.findByCode(targetLang).name;
+    AppToast.show(context, '已加入待翻译队列，识别完成后将自动开始翻译为 $langName');
+    setState(() {});
+  }
+
+  void _cancelPendingTranslation() {
+    AiTaskManager.instance.cancelPendingTranslation(widget.videoPath);
+    AppToast.show(context, '已取消预约翻译');
+    setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final currentTask = AiTaskManager.instance.getTask(widget.videoPath);
+    final currentTask = AiTaskManager.instance.getAsrTask(widget.videoPath);
     final isRunning = currentTask != null && currentTask.isRunning;
     final entries = _currentDisplayEntries;
 
@@ -1459,7 +1530,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Widget _buildStatusCard(ThemeData theme, bool isRunning, int entryCount) {
-    final task = AiTaskManager.instance.getTask(widget.videoPath);
+    final task = AiTaskManager.instance.getAsrTask(widget.videoPath);
     Color bg = const Color(0xFF262630);
     Color accent = Colors.white54;
     IconData icon = Icons.info_outline_rounded;
@@ -1469,7 +1540,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       bg = PolyFlixColors.violet.withValues(alpha: .15);
       accent = const Color(0xFF9D91FF);
       icon = Icons.graphic_eq_rounded;
-      text = task?.statusMessage ?? _statusMessage ?? '正在处理音频...';
+      final pendingHint = task != null && task.hasPendingTranslation
+          ? ' (已预约识别后翻译)'
+          : '';
+      text = '${task?.statusMessage ?? _statusMessage ?? "正在处理音频..."}$pendingHint';
     } else if (_currentState == AsrState.completed && entryCount > 0) {
       bg = Colors.green.withValues(alpha: .12);
       accent = Colors.greenAccent;
@@ -1724,6 +1798,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       );
     }
 
+    final safeLanguage = _languageOptions.any((opt) => opt['code'] == _selectedLanguage)
+        ? _selectedLanguage
+        : 'auto';
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
       decoration: BoxDecoration(
@@ -1733,7 +1811,7 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
-          value: _selectedLanguage,
+          value: safeLanguage,
           isExpanded: true,
           focusColor: Colors.transparent,
           dropdownColor: const Color(0xFF262630),
@@ -1758,9 +1836,14 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Widget _buildSubtitleControls(ThemeData theme) {
+    final asrTask = AiTaskManager.instance.getAsrTask(widget.videoPath);
+    final isAsrRunning = asrTask != null && asrTask.isRunning;
+    final hasPendingTrans = asrTask?.hasPendingTranslation == true;
+
     final hasEntries = _currentDisplayEntries.isNotEmpty;
-    final canShowTranslateBtn =
-        aiTranslationEnabled.value && hasEntries && _selectedSource == 'asr';
+    final canShowTranslateBtn = aiTranslationEnabled.value &&
+        _selectedSource == 'asr' &&
+        (isAsrRunning || hasEntries);
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -1775,31 +1858,64 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         crossAxisAlignment: WrapCrossAlignment.center,
         children: [
           // 1. 最左侧：翻译按钮（ASR 模式且开启翻译）
-          if (canShowTranslateBtn)
-            FilledButton.tonalIcon(
-              style: FilledButton.styleFrom(
-                visualDensity: VisualDensity.compact,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          if (canShowTranslateBtn) ...[
+            if (isAsrRunning)
+              FilledButton.tonalIcon(
+                style: FilledButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  backgroundColor: hasPendingTrans
+                      ? Colors.teal.withValues(alpha: .28)
+                      : PolyFlixColors.violet.withValues(alpha: .2),
+                  foregroundColor: hasPendingTrans
+                      ? Colors.tealAccent
+                      : Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                ),
+                onPressed: hasPendingTrans
+                    ? _cancelPendingTranslation
+                    : _schedulePendingTranslation,
+                icon: Icon(
+                  hasPendingTrans
+                      ? Icons.check_circle_outline_rounded
+                      : Icons.schedule_send_rounded,
+                  size: 15,
+                  color: hasPendingTrans ? Colors.tealAccent : null,
+                ),
+                label: Text(
+                  hasPendingTrans ? '已预约识别后翻译 (点击取消)' : '预约识别后翻译',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: hasPendingTrans ? FontWeight.w600 : FontWeight.normal,
+                    color: hasPendingTrans ? Colors.tealAccent : null,
+                  ),
+                ),
+              )
+            else
+              FilledButton.tonalIcon(
+                style: FilledButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                ),
+                onPressed: _isTranslating
+                    ? _cancelCurrentTranslation
+                    : _translateCurrentEntries,
+                icon: _isTranslating
+                    ? const SizedBox(
+                        width: 13,
+                        height: 13,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.g_translate_rounded, size: 15),
+                label: Text(
+                  _isTranslating
+                      ? '取消翻译 ($_translatedCount/$_totalTranslateCount)'
+                      : (_hasAnyTranslation
+                          ? '重新翻译'
+                          : '翻译字幕'),
+                  style: const TextStyle(fontSize: 12),
+                ),
               ),
-              onPressed: _isTranslating
-                  ? _cancelCurrentTranslation
-                  : _translateCurrentEntries,
-              icon: _isTranslating
-                  ? const SizedBox(
-                      width: 13,
-                      height: 13,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.g_translate_rounded, size: 15),
-              label: Text(
-                _isTranslating
-                    ? '取消翻译 ($_translatedCount/$_totalTranslateCount)'
-                    : (_hasAnyTranslation
-                        ? '重新翻译'
-                        : '翻译字幕'),
-                style: const TextStyle(fontSize: 12),
-              ),
-            ),
+          ],
 
           // 2. 导出按钮
           if (!_hasAnyTranslation) ...[

@@ -35,6 +35,7 @@ class AiTask extends ChangeNotifier {
     this.targetLanguage,
     this.sourceType,
     this.engineId,
+    this.pendingTranslationLang,
     String? cacheKey,
     DateTime? startTime,
   }) : cacheKey = cacheKey ?? videoPath,
@@ -45,6 +46,10 @@ class AiTask extends ChangeNotifier {
   final String? targetLanguage;
   final String? sourceType;
   final String? engineId;
+
+  /// 若在 ASR 识别过程中预约了翻译，记录目标语言（如 'zh-Hans'）
+  String? pendingTranslationLang;
+  bool get hasPendingTranslation => pendingTranslationLang != null;
 
   /// 提取音频用的地址：本地文件路径，或 PFLX 本次会话的本地流地址。
   final String videoPath;
@@ -188,6 +193,7 @@ class AiTask extends ChangeNotifier {
   void cancel() {
     if (_isCancelled) return;
     _isCancelled = true;
+    pendingTranslationLang = null;
     _state = AsrState.idle;
     _statusMessage = '已取消';
     _endTime ??= DateTime.now();
@@ -209,6 +215,7 @@ class AiTask extends ChangeNotifier {
     'targetLanguage': targetLanguage,
     'sourceType': sourceType,
     'engineId': engineId,
+    'pendingTranslationLang': pendingTranslationLang,
     'totalUnits': _totalUnits,
     'completedUnits': _completedUnits,
     'startTime': startTime.toIso8601String(),
@@ -244,6 +251,7 @@ class AiTask extends ChangeNotifier {
         targetLanguage: json['targetLanguage'] as String?,
         sourceType: json['sourceType'] as String?,
         engineId: json['engineId'] as String?,
+        pendingTranslationLang: json['pendingTranslationLang'] as String?,
         startTime:
             DateTime.tryParse((json['startTime'] as String?) ?? '') ??
             DateTime.now(),
@@ -394,7 +402,29 @@ class AiTaskManager extends ChangeNotifier {
   }
 
   /// 获取指定视频最近一次的任务（如果存在，兼容本地路径与流地址）。
-  AiTask? getTask(String videoPath) {
+  ///
+  /// 若未指定 [type]，在有正在运行的 ASR 任务时优先返回该 ASR 任务，避免被新起的翻译任务掩盖。
+  AiTask? getTask(String videoPath, {AiTaskType? type}) {
+    if (type != null) {
+      for (final task in _tasks.reversed) {
+        if (task.taskType == type &&
+            (_isSamePath(task.videoPath, videoPath) ||
+                _isSamePath(task.cacheKey, videoPath))) {
+          return task;
+        }
+      }
+      return null;
+    }
+
+    for (final task in _tasks.reversed) {
+      if (task.taskType == AiTaskType.transcription &&
+          task.isRunning &&
+          (_isSamePath(task.videoPath, videoPath) ||
+              _isSamePath(task.cacheKey, videoPath))) {
+        return task;
+      }
+    }
+
     for (final task in _tasks.reversed) {
       if (_isSamePath(task.videoPath, videoPath) ||
           _isSamePath(task.cacheKey, videoPath)) {
@@ -402,6 +432,31 @@ class AiTaskManager extends ChangeNotifier {
       }
     }
     return null;
+  }
+
+  /// 获取指定视频最近一次的语音识别任务。
+  AiTask? getAsrTask(String videoPath) =>
+      getTask(videoPath, type: AiTaskType.transcription);
+
+  /// 为指定视频正在运行的 ASR 任务预约识别完成后自动翻译。
+  void scheduleTranslationAfterAsr({
+    required String videoPath,
+    required String targetLang,
+  }) {
+    final task = getAsrTask(videoPath);
+    if (task != null && task.isRunning) {
+      task.pendingTranslationLang = targetLang;
+      notifyListeners();
+    }
+  }
+
+  /// 取消指定视频 ASR 任务的预约翻译。
+  void cancelPendingTranslation(String videoPath) {
+    final task = getAsrTask(videoPath);
+    if (task != null && task.hasPendingTranslation) {
+      task.pendingTranslationLang = null;
+      notifyListeners();
+    }
   }
 
   /// 获取指定视频最近一次的翻译任务（可按来源类型筛选）。
@@ -467,6 +522,9 @@ class AiTaskManager extends ChangeNotifier {
     if (existing != null && existing.isRunning) return existing;
 
     final engine = TranslationService.instance.getActiveEngine();
+    if (!engine.isConfigured) {
+      throw TranslationException(engine.configurationError ?? '未配置翻译服务凭据');
+    }
     final task = AiTask(
       id: 'trans_${DateTime.now().millisecondsSinceEpoch}_${_tasks.length}',
       taskType: AiTaskType.translation,
@@ -682,6 +740,23 @@ class AiTaskManager extends ChangeNotifier {
           task.entries,
           modelId: task.modelId,
         );
+
+        // 检查是否有预约翻译：若有且任务未取消，在全量 ASR 识别落盘后自动无缝触发全量翻译
+        if (task.pendingTranslationLang != null &&
+            !task.isCancelled &&
+            task.entries.isNotEmpty) {
+          final targetLang = task.pendingTranslationLang!;
+          task.pendingTranslationLang = null;
+          // 异步拉起全量翻译任务
+          startTranslationTask(
+            videoPath: task.videoPath,
+            videoTitle: task.videoTitle,
+            targetLang: targetLang,
+            sourceType: 'asr_${task.modelId}',
+            cacheKey: task.cacheKey,
+            rawEntries: task.entries,
+          );
+        }
       }
     } catch (e) {
       final errorMsg = e is StateError ? e.message : e.toString();

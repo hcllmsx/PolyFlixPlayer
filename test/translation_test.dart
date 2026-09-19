@@ -8,6 +8,7 @@ import 'package:polyflix_player/subtitle/translation/adaptive_http_client.dart';
 import 'package:polyflix_player/subtitle/translation/translation_service.dart';
 import 'package:polyflix_player/subtitle/translation/builtin_subtitle_extractor.dart';
 import 'package:polyflix_player/subtitle/ai_task_manager.dart';
+import 'package:polyflix_player/settings/app_settings.dart';
 
 void main() {
   group('SRT Parser & Serializer Tests', () {
@@ -205,7 +206,32 @@ Second subtitle entry.
   });
 
   group('AiTaskManager Translation Task Tests', () {
+    test('Unconfigured engine check throws TranslationException and reports error', () async {
+      aiTranslationMode.value = 'cloud';
+      aiTranslationProvider.value = 'baidu';
+      aiBaiduAppId.value = '';
+      aiBaiduSecretKey.value = '';
+
+      final check = TranslationService.instance.checkConfiguration();
+      expect(check.isConfigured, isFalse);
+      expect(check.errorMessage, contains('未配置百度翻译'));
+
+      final manager = AiTaskManager.instance;
+      expect(
+        () => manager.startTranslationTask(
+          videoPath: 'test.mp4',
+          videoTitle: 'test',
+          targetLang: 'zh-Hans',
+          sourceType: 'builtin_0',
+        ),
+        throwsA(isA<TranslationException>()),
+      );
+    });
+
     test('startTranslationTask creates task with AiTaskType.translation and adds to activeTasks', () async {
+      aiBaiduAppId.value = 'test_app_id';
+      aiBaiduSecretKey.value = 'test_secret_key';
+
       final manager = AiTaskManager.instance;
       const testPath = 'C:\\Videos\\Sample.mp4';
       const testTitle = 'Sample.mp4';
@@ -234,6 +260,46 @@ Second subtitle entry.
       final queried = manager.getTranslationTask(testPath, sourceType: testSource);
       expect(queried, isNotNull);
       expect(queried!.id, task.id);
+    });
+
+    test('Pending translation scheduling and task separation', () {
+      final manager = AiTaskManager.instance;
+      const testPath = 'C:\\Videos\\PendingMovie.mkv';
+      const testTitle = 'PendingMovie.mkv';
+
+      // 1. 创建并模拟一个正在运行的 ASR 任务
+      final asrTask = AiTask(
+        id: 'asr_pending_test',
+        taskType: AiTaskType.transcription,
+        videoPath: testPath,
+        videoTitle: testTitle,
+        modelId: 'base',
+        language: 'en',
+      );
+      asrTask.updateState(AsrState.processing);
+
+      // 直接添加到 tasks
+      manager.allTasks; // 触发内部就绪
+      expect(asrTask.isRunning, isTrue);
+      expect(asrTask.hasPendingTranslation, isFalse);
+
+      // 预约排队翻译
+      asrTask.pendingTranslationLang = 'zh-Hans';
+      expect(asrTask.hasPendingTranslation, isTrue);
+      expect(asrTask.pendingTranslationLang, 'zh-Hans');
+
+      // 验证序列化与反序列化保持 pendingTranslationLang
+      final json = asrTask.toJson();
+      expect(json['pendingTranslationLang'], 'zh-Hans');
+
+      final restored = AiTask.fromJson(json);
+      expect(restored, isNotNull);
+      expect(restored!.pendingTranslationLang, 'zh-Hans');
+      expect(restored.hasPendingTranslation, isTrue);
+
+      // 取消预约
+      asrTask.pendingTranslationLang = null;
+      expect(asrTask.hasPendingTranslation, isFalse);
     });
   });
 }

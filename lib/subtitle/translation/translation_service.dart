@@ -42,6 +42,15 @@ class TranslationService {
     }
   }
 
+  /// 检查当前配置的翻译引擎是否就绪（凭据是否填写）。
+  ({bool isConfigured, String? errorMessage}) checkConfiguration() {
+    final engine = getActiveEngine();
+    if (!engine.isConfigured) {
+      return (isConfigured: false, errorMessage: engine.configurationError);
+    }
+    return (isConfigured: true, errorMessage: null);
+  }
+
   /// 测试当前配置的引擎可用性。
   Future<String> testCurrentEngine({String testText = 'Hello'}) async {
     final engine = getActiveEngine();
@@ -66,6 +75,9 @@ class TranslationService {
     if (entries.isEmpty) return const [];
 
     final engine = getActiveEngine();
+    if (!engine.isConfigured) {
+      throw TranslationException(engine.configurationError ?? '未配置翻译服务凭据');
+    }
     final batchSize = _resolveBatchSize(engine.id);
     final delayBetweenBatches = _resolveDelay(engine.id);
 

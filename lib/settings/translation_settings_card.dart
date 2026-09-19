@@ -280,12 +280,12 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
                           ButtonSegment<String>(
                             value: 'online',
                             icon: Icon(Icons.cloud_outlined, size: 18),
-                            label: Text('在线 API (推荐)'),
+                            label: Text('在线 API'),
                           ),
                           ButtonSegment<String>(
                             value: 'local',
                             icon: Icon(Icons.memory_rounded, size: 18),
-                            label: Text('本地模型 (离线)'),
+                            label: Text('本地模型'),
                           ),
                         ],
                         selected: {mode},
@@ -300,7 +300,7 @@ class _TranslationSettingsCardState extends State<TranslationSettingsCard> {
                     if (mode == 'local') ...[
                       _buildLocalModeSection(scheme),
                     ] else ...[
-                      // 4. 分支：在线 API (百度 / 腾讯 / 微软)
+                      // 4. 分支：在线 API (百度 / 微软)
                       _buildOnlineModeSection(scheme, provider),
                     ],
                   ],

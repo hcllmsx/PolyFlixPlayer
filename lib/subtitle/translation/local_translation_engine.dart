@@ -20,6 +20,12 @@ class LocalTranslationEngine implements TranslationEngine {
   String get displayName => '本地模型 (离线)';
 
   @override
+  bool get isConfigured => false;
+
+  @override
+  String? get configurationError => '本地离线翻译功能暂未就绪，请前往设置配置在线翻译 API';
+
+  @override
   Future<String> testConnection({String testText = 'Hello'}) async {
     throw const TranslationException(
       '本地离线翻译模型尚在开发规划中，敬请期待后续版本。建议先在设置中选用百度、腾讯或微软 Azure 在线翻译（均有免费额度）。',

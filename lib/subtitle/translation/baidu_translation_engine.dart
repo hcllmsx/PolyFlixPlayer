@@ -33,6 +33,14 @@ class BaiduTranslationEngine implements TranslationEngine {
   String get displayName => '百度翻译';
 
   @override
+  bool get isConfigured => appId.isNotEmpty && secretKey.isNotEmpty;
+
+  @override
+  String? get configurationError => isConfigured
+      ? null
+      : '未配置百度翻译 APP ID 或密钥 (Secret Key)';
+
+  @override
   Future<String> testConnection({String testText = 'Hello'}) async {
     final results = await translateBatch(
       texts: [testText],

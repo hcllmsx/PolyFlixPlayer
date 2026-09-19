@@ -255,6 +255,23 @@ class _AiTaskTile extends StatelessWidget {
                 ),
               ),
               const Spacer(),
+              if (task.hasPendingTranslation) ...[
+                Container(
+                  margin: const EdgeInsets.only(right: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.teal.withValues(alpha: .2),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text(
+                    '已预约翻译',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.tealAccent,
+                    ),
+                  ),
+                ),
+              ],
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
