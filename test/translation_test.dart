@@ -5,6 +5,9 @@ import 'package:polyflix_player/subtitle/translation/srt_parser.dart';
 import 'package:polyflix_player/subtitle/translation/baidu_translation_engine.dart';
 import 'package:polyflix_player/subtitle/translation/azure_translation_engine.dart';
 import 'package:polyflix_player/subtitle/translation/adaptive_http_client.dart';
+import 'package:polyflix_player/subtitle/translation/translation_service.dart';
+import 'package:polyflix_player/subtitle/translation/builtin_subtitle_extractor.dart';
+import 'package:polyflix_player/subtitle/ai_task_manager.dart';
 
 void main() {
   group('SRT Parser & Serializer Tests', () {
@@ -112,6 +115,125 @@ Second subtitle entry.
       final port = await AdaptiveHttpClient.detectLocalProxyPort();
       // 在开启代理时返回数字端口，未开启时返回 null
       expect(port == null || port > 0, isTrue);
+    });
+  });
+
+  group('Translation Cache Storage & Deletion Tests', () {
+    test('saveTranslationCache, loadTranslationCache and deleteTranslationCache work correctly', () async {
+      final service = TranslationService.instance;
+      const testKey = 'test_video_builtin_123';
+      const testSourceType = 'builtin_1';
+      const testLang = 'zh-Hans';
+      const testEngine = 'local';
+      final testEntries = [
+        const SubtitleEntry(
+          start: Duration(seconds: 1),
+          end: Duration(seconds: 3),
+          text: 'Hello world',
+          translatedText: '你好世界',
+        ),
+      ];
+
+      // 1. 保存缓存
+      await service.saveTranslationCache(
+        sourceKey: testKey,
+        sourceType: testSourceType,
+        targetLang: testLang,
+        engineId: testEngine,
+        entries: testEntries,
+      );
+
+      // 2. 读取缓存
+      final loaded = await service.loadTranslationCache(
+        sourceKey: testKey,
+        sourceType: testSourceType,
+        targetLang: testLang,
+        engineId: testEngine,
+      );
+      expect(loaded, isNotNull);
+      expect(loaded!.length, 1);
+      expect(loaded.first.text, 'Hello world');
+      expect(loaded.first.translatedText, '你好世界');
+
+      // 3. 删除缓存
+      await service.deleteTranslationCache(
+        sourceKey: testKey,
+        sourceType: testSourceType,
+        targetLang: testLang,
+        engineId: testEngine,
+      );
+
+      // 4. 再次读取应为 null
+      final reloaded = await service.loadTranslationCache(
+        sourceKey: testKey,
+        sourceType: testSourceType,
+        targetLang: testLang,
+        engineId: testEngine,
+      );
+      expect(reloaded, isNull);
+    });
+  });
+
+  group('BuiltInSubtitleExtractor Disk Cache Tests', () {
+    test('saveCachedSubtitles and loadCachedSubtitles persist entries to disk', () async {
+      const testPath = 'C:\\Videos\\Movie.mkv';
+      const testTrack = 0;
+      final testEntries = [
+        const SubtitleEntry(
+          start: Duration(seconds: 5),
+          end: Duration(seconds: 10),
+          text: 'Built-in subtitle text line',
+        ),
+      ];
+
+      // 保存提取结果缓存
+      await BuiltInSubtitleExtractor.saveCachedSubtitles(
+        videoPath: testPath,
+        subtitleIndex: testTrack,
+        entries: testEntries,
+      );
+
+      // 读取缓存
+      final cached = await BuiltInSubtitleExtractor.loadCachedSubtitles(
+        videoPath: testPath,
+        subtitleIndex: testTrack,
+      );
+      expect(cached, isNotNull);
+      expect(cached!.length, 1);
+      expect(cached.first.text, 'Built-in subtitle text line');
+    });
+  });
+
+  group('AiTaskManager Translation Task Tests', () {
+    test('startTranslationTask creates task with AiTaskType.translation and adds to activeTasks', () async {
+      final manager = AiTaskManager.instance;
+      const testPath = 'C:\\Videos\\Sample.mp4';
+      const testTitle = 'Sample.mp4';
+      const testLang = 'zh-Hans';
+      const testSource = 'builtin_0';
+
+      final task = await manager.startTranslationTask(
+        videoPath: testPath,
+        videoTitle: testTitle,
+        targetLang: testLang,
+        sourceType: testSource,
+        rawEntries: [
+          const SubtitleEntry(
+            start: Duration(seconds: 1),
+            end: Duration(seconds: 2),
+            text: 'Test',
+          ),
+        ],
+      );
+
+      expect(task.taskType, AiTaskType.translation);
+      expect(task.targetLanguage, testLang);
+      expect(task.sourceType, testSource);
+      expect(task.modelDisplayName, contains('内置字幕翻译'));
+
+      final queried = manager.getTranslationTask(testPath, sourceType: testSource);
+      expect(queried, isNotNull);
+      expect(queried!.id, task.id);
     });
   });
 }

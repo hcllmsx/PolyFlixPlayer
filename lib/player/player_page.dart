@@ -19,6 +19,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:window_manager/window_manager.dart';
 
+import '../main.dart';
 import '../pflx/pflx.dart';
 import '../pflx/pflx_stream_server.dart';
 import '../settings/app_settings.dart';
@@ -28,6 +29,8 @@ import '../subtitle/ai_task_manager.dart';
 import '../subtitle/model_manager.dart';
 import '../subtitle/subtitle_generator.dart';
 import '../subtitle/subtitle_overlay.dart';
+import '../subtitle/translation/builtin_subtitle_extractor.dart';
+import '../subtitle/translation/translation_service.dart';
 import '../utils/platform_media_helper.dart';
 import '../utils/platform_utils.dart';
 
@@ -49,9 +52,6 @@ const int _kSeekStepSeconds = 10;
 /// 取 100 而不是更小的值：点画面隐藏控制条时，手在点完之后往往还有一个自然的
 /// 收尾动作，光标会跟着挪一截，阈值太小就会出现"刚点了隐藏、立刻又弹回来"。
 const double _kPointerWakeDistance = 100;
-
-/// 字幕菜单里"关闭字幕"项的哨兵值（不会与真实轨道 id 冲突）。
-const String _kSubtitlesOff = '__off__';
 
 /// 播放进度落盘步长：位置每前进 5 秒写一次。
 ///
@@ -166,8 +166,18 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 正在退出播放页，防止退出流程被重复触发。
   bool _closing = false;
 
-  // ---------------- AI 字幕状态 ----------------
-  /// AI 字幕是否正在显示。
+  // ---------------- 主/副字幕状态 ----------------
+  /// 当前主字幕源 ID（'none', 'ai_translation', 'ai_original', 'builtin_0', ...）。
+  String _primarySubId = 'none';
+
+  /// 当前副字幕源 ID（'none', 'ai_translation', 'ai_original', 'builtin_0', ...）。
+  String _secondarySubId = 'none';
+
+  /// 内置字幕文本解析缓存（以字幕轨序号为 key）。
+  final Map<int, List<SubtitleEntry>> _builtinTracksCache = {};
+
+
+  /// AI 字幕是否正在显示（主或副选了 AI 字幕）。
   bool _aiSubtitleActive = false;
 
   /// AI 字幕是否正在运行 ASR 识别。
@@ -514,6 +524,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _windowFitApplied = false;
     _aiCacheChecked = false;
     _durationKnown = false;
+    _primarySubId = 'none';
+    _secondarySubId = 'none';
+    _builtinTracksCache.clear();
     _aiRestoreDebounce?.cancel();
     _restartHintTimer?.cancel();
     _showRestartButton = false;
@@ -694,11 +707,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     return null;
   }
 
-  /// 当前是否存在"翻译字幕"。
-  ///
-  /// 若字幕条目中已产生有效的译文，则标记为存在翻译字幕。
+  /// 当前视频是否确实持有有效的 AI 翻译字幕。
   bool get _hasTranslation {
-    if (!_aiSubtitleActive) return false;
     final activeKey = _streamServer?.url ?? _sourcePath;
     if (!SubtitleGenerator.instance.holdsEntriesFor(activeKey)) return false;
     return SubtitleGenerator.instance.entries.any(
@@ -706,11 +716,163 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     );
   }
 
-  /// 当前视频是否确实持有有效的 AI 字幕条目。
-  bool get _hasAiSubtitleEntries {
+  /// 当前视频是否确实持有有效的 AI 语音原声字幕。
+  bool get _hasAiOriginal {
     final activeKey = _streamServer?.url ?? _sourcePath;
     return SubtitleGenerator.instance.holdsEntriesFor(activeKey) &&
         SubtitleGenerator.instance.entries.isNotEmpty;
+  }
+
+  /// 当前视频是否确实持有有效的 AI 字幕条目。
+  bool get _hasAiSubtitleEntries => _hasAiOriginal;
+
+  /// 是否有任意有效的主字幕或副字幕处于激活状态。
+  bool get _hasAnyActiveSubtitle =>
+      _primarySubId != 'none' || _secondarySubId != 'none';
+
+  /// 主字幕是否为视频内置字幕（由底层 mpv 直接原生渲染）。
+  bool get _isBuiltinPrimary => _primarySubId.startsWith('builtin_');
+
+  /// 根据字幕源 ID 检索当前对应的文本条目列表。
+  List<SubtitleEntry>? _getEntriesForSubId(String id) {
+    if (id == 'none') return null;
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    if (id == 'ai_original') {
+      if (!SubtitleGenerator.instance.holdsEntriesFor(activeKey)) return null;
+      return SubtitleGenerator.instance.entries;
+    }
+    if (id == 'ai_translation') {
+      if (!SubtitleGenerator.instance.holdsEntriesFor(activeKey)) return null;
+      final raw = SubtitleGenerator.instance.entries;
+      return raw.map((e) => SubtitleEntry(
+        start: e.start,
+        end: e.end,
+        text: (e.translatedText != null && e.translatedText!.isNotEmpty)
+            ? e.translatedText!
+            : e.text,
+      )).toList();
+    }
+    if (id.startsWith('builtin_')) {
+      final idx = int.tryParse(id.substring(8));
+      if (idx != null && _builtinTracksCache.containsKey(idx)) {
+        return _builtinTracksCache[idx];
+      }
+    }
+    return null;
+  }
+
+  /// 提取并缓存指定的内置字幕轨（用于作为副字幕或供外部调用）。
+  Future<void> _ensureBuiltinTrackLoaded(int idx) async {
+    if (_builtinTracksCache.containsKey(idx)) return;
+    if (idx < 0 || idx >= _subtitleTracks.length) return;
+    final track = _subtitleTracks[idx];
+    if (BuiltInSubtitleExtractor.isGraphicSubtitle(track)) return;
+
+    final videoPath = _streamServer?.url ?? _sourcePath;
+    try {
+      final entries = await BuiltInSubtitleExtractor.extractSubtitles(
+        videoPath: videoPath,
+        subtitleIndex: idx,
+      );
+      if (mounted) {
+        setState(() {
+          _builtinTracksCache[idx] = entries;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        _showOsd('内置字幕提取失败: $e');
+      }
+    }
+  }
+
+  /// 切换主字幕（位于画面上方，大字号）。
+  Future<void> _selectPrimarySubtitle(String id, {bool showOsd = true}) async {
+    _primarySubId = id;
+    _aiSubtitleActive = _primarySubId.startsWith('ai_') || _secondarySubId.startsWith('ai_');
+
+    if (id == 'none') {
+      await _player.setSubtitleTrack(SubtitleTrack.no());
+      if (mounted) {
+        setState(() {});
+        if (showOsd) _showOsd('已关闭主字幕');
+      }
+      return;
+    }
+
+    if (id.startsWith('builtin_')) {
+      final idx = int.tryParse(id.substring(8)) ?? 0;
+      if (idx >= 0 && idx < _subtitleTracks.length) {
+        final track = _subtitleTracks[idx];
+        // 关键修复：内置字幕直接交由底层 mpv 原生渲染！
+        // 0 延迟、100% 格式兼容（SRT/ASS/PGS/VobSub），彻底避免提取延迟或失败导致黑屏无字幕
+        await _player.setSubtitleTrack(track);
+        if (mounted) {
+          setState(() {});
+          if (showOsd) _showOsd('主字幕：${_subtitleLabel(track)}');
+        }
+        return;
+      }
+    }
+
+    // AI 识别或翻译字幕：关闭底层 mpv 原生字幕，统一由 Flutter 叠层渲染
+    await _player.setSubtitleTrack(SubtitleTrack.no());
+    if (mounted) {
+      setState(() {});
+      if (showOsd) {
+        final label = id == 'ai_translation' ? 'AI 翻译字幕' : 'AI 语音原字幕';
+        _showOsd('主字幕：$label');
+      }
+    }
+  }
+
+  /// 切换副字幕（位于画面下方，小字号）。
+  Future<void> _selectSecondarySubtitle(String id, {bool showOsd = true}) async {
+    _secondarySubId = id;
+    _aiSubtitleActive = _primarySubId.startsWith('ai_') || _secondarySubId.startsWith('ai_');
+
+    if (id == 'none') {
+      if (mounted) {
+        setState(() {});
+        if (showOsd) _showOsd('已关闭副字幕');
+      }
+      return;
+    }
+
+    if (id.startsWith('builtin_')) {
+      final idx = int.tryParse(id.substring(8)) ?? 0;
+      if (idx >= 0 && idx < _subtitleTracks.length) {
+        final track = _subtitleTracks[idx];
+        if (!_builtinTracksCache.containsKey(idx)) {
+          _ensureBuiltinTrackLoaded(idx);
+        }
+        if (mounted) {
+          setState(() {});
+          if (showOsd) _showOsd('副字幕：${_subtitleLabel(track)}');
+        }
+        return;
+      }
+    }
+
+    if (mounted) {
+      setState(() {});
+      if (showOsd) {
+        final label = id == 'ai_translation' ? 'AI 翻译字幕' : 'AI 语音原字幕';
+        _showOsd('副字幕：$label');
+      }
+    }
+  }
+
+  /// 关闭全部主副字幕。
+  Future<void> _closeAllSubtitles() async {
+    _primarySubId = 'none';
+    _secondarySubId = 'none';
+    _aiSubtitleActive = false;
+    await _player.setSubtitleTrack(SubtitleTrack.no());
+    if (mounted) {
+      setState(() {});
+      _showOsd('已关闭全部字幕');
+    }
   }
 
   /// AI 识别或翻译总开关是否至少有一个启用。
@@ -726,16 +888,6 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       return 'AI 语音识别字幕';
     }
   }
-
-  /// 主字幕来源优先级：翻译字幕 > 内置字幕 > AI 识别字幕。
-  ///
-  /// AI 字幕只有在"没有翻译字幕、也没有内置字幕在显示"时才升为主字幕；
-  /// 否则一律作为副字幕，与内置字幕同时显示（内置在下、AI 在上）。
-  bool get _aiIsPrimary =>
-      _aiSubtitleActive && _activeSubtitleId == null && !_hasTranslation;
-
-  /// AI 字幕叠层的底部间距：作副字幕时抬到内置字幕上方，避免两行字叠在一起。
-  double get _aiOverlayBottom => _aiIsPrimary ? 80 : 132;
 
   /// 拼出便于识别的轨道描述：标题 · [语言] · 编码。
   String _trackLabel({
@@ -772,47 +924,6 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _showOsd('音轨：${_audioLabel(track)}');
   }
 
-  /// 选择字幕。
-  ///
-  /// 内置字幕轨与 AI 字幕分属"主/副"两个槽位，互不顶掉：
-  /// 选内置轨只换主字幕，AI 副字幕保持原状；开关 AI 也不会关掉内置字幕。
-  /// 只有"关闭字幕"会把两个槽位一起清空。
-  Future<void> _selectSubtitle(String id) async {
-    if (id == _kSubtitlesOff) {
-      await _player.setSubtitleTrack(SubtitleTrack.no());
-      if (_aiSubtitleActive) {
-        setState(() => _aiSubtitleActive = false);
-      }
-      _showOsd('字幕已关闭');
-      return;
-    }
-    if (id == '__ai_subtitle__') {
-      // 只有"属于当前视频"的字幕才能直接开关显示；
-      // 生成器里若是别的视频的字幕，则引导用户打开面板去识别/载入本视频字幕。
-      final activeKey = _streamServer?.url ?? _sourcePath;
-      if (SubtitleGenerator.instance.holdsEntriesFor(activeKey)) {
-        // 已有识别结果时按开关处理：再点一次即关闭这条副/主字幕
-        setState(() => _aiSubtitleActive = !_aiSubtitleActive);
-        final role = _hasTranslation
-            ? '副字幕'
-            : (_activeSubtitleId == null ? '主字幕' : '副字幕');
-        _showOsd(_aiSubtitleActive ? '$role：AI 语音识别字幕' : '已关闭$role：AI 语音识别字幕');
-      } else {
-        await _showAiSubtitleSheet();
-      }
-      return;
-    }
-    final track = _subtitleTracks.where((t) => t.id == id).firstOrNull;
-    if (track == null) return;
-    // 不动 _aiSubtitleActive：内置字幕与 AI 字幕可以同时显示
-    await _player.setSubtitleTrack(track);
-    _showOsd(
-      _aiSubtitleActive
-          ? '主字幕：${_subtitleLabel(track)}（AI 副字幕同时显示）'
-          : '主字幕：${_subtitleLabel(track)}',
-    );
-  }
-
   /// 打开视频后主动选中一条字幕，让它真正显示出来。
   ///
   /// 不能只依赖 mpv 的自动选择：media_kit 只在调用 setSubtitleTrack 时才把
@@ -825,12 +936,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     final tracks = _subtitleTracks;
     if (tracks.isEmpty) return;
     _autoSubtitleApplied = true;
-    final target = tracks.firstWhere(
-      (t) => t.isDefault == true,
-      orElse: () => tracks.first,
-    );
-    await _player.setSubtitleTrack(target);
-    if (mounted) _showOsd('主字幕：${_subtitleLabel(target)}');
+    final defaultIdx = tracks.indexWhere((t) => t.isDefault == true);
+    final targetIdx = defaultIdx >= 0 ? defaultIdx : 0;
+    await _selectPrimarySubtitle('builtin_$targetIdx', showOsd: false);
   }
 
   /// 安排一次"恢复 AI 字幕"检查（带 500ms 去抖）。
@@ -872,9 +980,11 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
 
     // 生成器里已经载着本视频的字幕（刚识别完就退出、又进来）：直接按需显示
     if (generator.holdsEntriesFor(activeKey)) {
-      if (_subtitleTracks.isEmpty && !_aiSubtitleActive) {
-        setState(() => _aiSubtitleActive = true);
-        _showOsd('已自动显示 AI 语音识别字幕');
+      if (_subtitleTracks.isEmpty && _primarySubId == 'none') {
+        final targetSubId = _hasTranslation ? 'ai_translation' : 'ai_original';
+        final subLabel = _hasTranslation ? 'AI 翻译字幕' : 'AI 语音识别字幕';
+        await _selectPrimarySubtitle(targetSubId, showOsd: false);
+        _showOsd('已自动显示 $subLabel');
       }
       return;
     }
@@ -887,23 +997,23 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     if (restored == null || !mounted) return;
 
     if (_subtitleTracks.isNotEmpty) {
-      _showOsd(
-        'AI 字幕已就绪（${restored.modelId.toUpperCase()} · ${restored.count} 条），'
-        '可在字幕菜单中显示',
-      );
+      // 视频已有内嵌字幕时，内嵌字幕为主，AI字幕静默就绪，不强行弹出干扰
       return;
     }
 
-    setState(() => _aiSubtitleActive = true);
+    // 视频无内嵌字幕时：若有翻译缓存则优先使用翻译字幕为主字幕，否则使用识别字幕；副字幕默认保持关闭
+    final targetSubId = restored.hasTranslation ? 'ai_translation' : 'ai_original';
+    final subLabel = restored.hasTranslation ? 'AI 翻译字幕' : 'AI 语音识别字幕';
+    await _selectPrimarySubtitle(targetSubId, showOsd: false);
     _showOsd(
-      '已自动显示 AI 语音识别字幕（${restored.modelId.toUpperCase()} · ${restored.count} 条）',
+      '已自动显示 $subLabel（${restored.modelId.toUpperCase()} · ${restored.count} 条）',
     );
   }
 
   /// 从本地缓存里挑一份适合当前视频的 AI 字幕并载入生成器。
   ///
-  /// 返回实际使用的模型与条数；该视频没有任何缓存时返回 null。
-  Future<({String modelId, int count})?> _loadAiSubtitleCache(
+  /// 返回实际使用的模型、条数以及是否包含已翻译内容；该视频没有任何缓存时返回 null。
+  Future<({String modelId, int count, bool hasTranslation})?> _loadAiSubtitleCache(
     String cacheKey, {
     required String ownerKey,
   }) async {
@@ -924,14 +1034,32 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     for (final id in ordered) {
       final cached = await manager.loadCachedSubtitles(cacheKey, modelId: id);
       if (cached == null || cached.isEmpty) continue;
+
+      // 检查是否有该模型 ASR 字幕的历史翻译缓存
+      final targetLang = aiTranslationTargetLang.value;
+      final engineId = TranslationService.instance.getActiveEngine().id;
+      final transCached = await TranslationService.instance.loadTranslationCache(
+        sourceKey: cacheKey,
+        sourceType: 'asr_$id',
+        targetLang: targetLang,
+        engineId: engineId,
+      );
+
+      final entriesToLoad = (transCached != null && transCached.isNotEmpty)
+          ? transCached
+          : cached;
+      final hasTranslation = entriesToLoad.any(
+        (e) => e.translatedText != null && e.translatedText!.isNotEmpty,
+      );
+
       SubtitleGenerator.instance.setEntries(
-        cached,
+        entriesToLoad,
         // 归属用本次会话的播放地址（面板/叠加层据此判断"是不是本视频"）
         videoPath: ownerKey,
         modelId: id,
         markCompleted: true,
       );
-      return (modelId: id, count: cached.length);
+      return (modelId: id, count: entriesToLoad.length, hasTranslation: hasTranslation);
     }
     return null;
   }
@@ -1520,17 +1648,14 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         Center(
           child: Video(controller: _controller, controls: NoVideoControls),
         ),
-        // AI 字幕叠加层（独立于内置字幕，可同时显示）
-        // 总开关关闭时一律不显示，避免"设置里已关掉、画面上还在"
-        if (aiSubtitleEnabled.value && _aiSubtitleActive)
+        // 画面字幕叠加层（统一由 Flutter 渲染在视频画面上，主字幕在上、副字幕在下）
+        if (_hasAnyActiveSubtitle)
           SubtitleOverlay(
-            generator: SubtitleGenerator.instance,
-            videoPath: _streamServer?.url ?? _sourcePath,
             position: currentPosition,
             visible: true,
-            // 主字幕在下（贴近画面底部），副字幕抬到内置字幕上方，避免叠字
-            isPrimary: _aiIsPrimary,
-            bottomOffset: _aiOverlayBottom,
+            primaryEntries: _isBuiltinPrimary ? null : _getEntriesForSubId(_primarySubId),
+            secondaryEntries: _getEntriesForSubId(_secondarySubId),
+            bottomOffset: _isBuiltinPrimary ? 132 : 80,
           ),
         _PlayerScrim(showControls: _controlsVisible),
         _PlayerTopBar(
@@ -1691,9 +1816,12 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           ),
         ),
         IconButton(
-          onPressed: _showSubtitleSheet,
-          tooltip: '字幕',
-          icon: const Icon(Icons.subtitles_outlined, color: Colors.white),
+          onPressed: _showSubtitleSettingsSheet,
+          tooltip: '字幕设置',
+          icon: Icon(
+            _hasAnyActiveSubtitle ? Icons.subtitles_rounded : Icons.subtitles_outlined,
+            color: Colors.white,
+          ),
         ),
         // AI 字幕按钮（总开关打开时常驻可见，点击弹出控制面板）
         if (_aiFeatureEnabled)
@@ -1709,11 +1837,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
                       color: Theme.of(context).colorScheme.primary,
                     ),
                   )
-                : Icon(
+                : const Icon(
                     Icons.auto_awesome_rounded,
-                    color: (_aiSubtitleActive && _hasAiSubtitleEntries)
-                        ? Theme.of(context).colorScheme.primary
-                        : Colors.white,
+                    color: Colors.white,
                   ),
           ),
       ],
@@ -1750,64 +1876,32 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     if (selected != null) await _selectAudio(selected);
   }
 
-  /// 底部弹窗：选择字幕（顶部固定有"关闭字幕"项）。返回轨道 id，取消返回 null。
-  Future<void> _showSubtitleSheet() async {
+  /// 底部弹窗：设置主字幕与副字幕通道。
+  Future<void> _showSubtitleSettingsSheet() async {
     setState(() => _controlsVisible = true);
-    final selected = await showModalBottomSheet<String>(
+    await showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF202027),
       showDragHandle: true,
       isScrollControlled: true,
-      constraints: const BoxConstraints(maxWidth: 480),
-      builder: (context) => ConstrainedBox(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(context).size.height * 0.85,
-        ),
-        child: _TrackSelectionSheet(
-          title: '字幕',
-          subtitle: '内置字幕与 AI 字幕可同时显示（内置在下，AI 在上）。',
-          options: [
-            _TrackOption(
-              id: _kSubtitlesOff,
-              label: '关闭字幕',
-              selected: _activeSubtitleId == null && !_aiSubtitleActive,
-            ),
-            for (final t in _subtitleTracks)
-              _TrackOption(
-                id: t.id,
-                label: _subtitleLabel(t),
-                // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
-                selected: t.id == _activeSubtitleId,
-              ),
-            // AI 字幕总开关关闭时，整项从字幕列表里隐藏
-            if (_aiFeatureEnabled)
-              _TrackOption(
-                id: '__ai_subtitle__',
-                label: _aiSubtitleRunning
-                    ? 'AI 语音识别字幕 (识别中…)'
-                    : (_hasTranslation
-                        ? (_aiIsPrimary ? 'AI 双语字幕（主字幕）' : 'AI 双语字幕（副字幕）')
-                        : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）')),
-                selected: _aiSubtitleActive,
-              ),
-          ],
-          footerNote: _subtitleTracks.isEmpty
-              ? (_aiFeatureEnabled
-                    ? '该视频没有内嵌字幕（可直接选择 AI 语音字幕）'
-                    : '该视频没有内嵌字幕')
-              : null,
-        ),
+      constraints: const BoxConstraints(maxWidth: 520),
+      builder: (context) => _SubtitleSettingsSheet(
+        primarySubId: _primarySubId,
+        secondarySubId: _secondarySubId,
+        hasTranslation: _hasTranslation,
+        hasAiOriginal: _hasAiOriginal,
+        subtitleTracks: _subtitleTracks,
+        onSelectPrimary: (id) => _selectPrimarySubtitle(id),
+        onSelectSecondary: (id) => _selectSecondarySubtitle(id),
+        onCloseAll: _closeAllSubtitles,
+        formatTrackLabel: _subtitleLabel,
       ),
     );
-    if (selected != null) {
-      await _selectSubtitle(selected);
-    }
   }
 
   /// 桌面端控制条右侧附加区：音量滑块 + 音轨 + 字幕。
   Widget _buildDesktopTrackControls() {
     final audioTracks = _audioTracks;
-    final subtitleTracks = _subtitleTracks;
     final muted = _muted || _volume == 0;
 
     return Row(
@@ -1866,41 +1960,13 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
               ),
           ],
         ),
-        PopupMenuButton<String>(
-          tooltip: '字幕',
-          icon: const Icon(Icons.subtitles_outlined, color: Colors.white),
-          onSelected: _selectSubtitle,
-          itemBuilder: (context) => [
-            _trackMenuItem(
-              value: _kSubtitlesOff,
-              label: '关闭字幕',
-              selected: _activeSubtitleId == null && !_aiSubtitleActive,
-            ),
-            if (subtitleTracks.isEmpty)
-              _infoMenuItem('该视频没有内嵌字幕')
-            else ...[
-              const PopupMenuDivider(),
-              for (final t in subtitleTracks)
-                _trackMenuItem(
-                  value: t.id,
-                  label: _subtitleLabel(t),
-                  // 内置轨是主字幕槽位，勾选状态不受 AI 副字幕影响
-                  selected: t.id == _activeSubtitleId,
-                ),
-            ],
-            // AI 语音识别字幕：副字幕槽位（没有内置字幕在显示时升为主字幕）
-            // 总开关关闭时整项隐藏，菜单里不再出现任何 AI 相关入口
-            if (aiSubtitleEnabled.value) ...[
-              const PopupMenuDivider(),
-              _trackMenuItem(
-                value: '__ai_subtitle__',
-                label: _aiSubtitleRunning
-                    ? 'AI 语音识别字幕 (识别中…)'
-                    : (_aiIsPrimary ? 'AI 语音识别字幕（主字幕）' : 'AI 语音识别字幕（副字幕）'),
-                selected: _aiSubtitleActive,
-              ),
-            ],
-          ],
+        IconButton(
+          tooltip: '字幕设置',
+          icon: Icon(
+            _hasAnyActiveSubtitle ? Icons.subtitles_rounded : Icons.subtitles_outlined,
+            color: Colors.white,
+          ),
+          onPressed: _showSubtitleSettingsSheet,
         ),
         // 桌面端独立的 AI 字幕与翻译快捷按钮（只要启用了识别或翻译就显示）
         if (_aiFeatureEnabled)
@@ -1916,11 +1982,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
                       color: Theme.of(context).colorScheme.primary,
                     ),
                   )
-                : Icon(
+                : const Icon(
                     Icons.auto_awesome_rounded,
-                    color: (_aiSubtitleActive && _hasAiSubtitleEntries)
-                        ? Theme.of(context).colorScheme.primary
-                        : Colors.white,
+                    color: Colors.white,
                   ),
           ),
       ],
@@ -1966,35 +2030,6 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     );
   }
 
-  /// 不可选的说明项（如"该视频没有内嵌字幕"）。
-  ///
-  /// 字号字重与 [_trackMenuItem] 完全一致，只把颜色调淡，表达"这里只是说明、
-  /// 不是可选项"，避免看起来像换了一种字体。
-  PopupMenuItem<String> _infoMenuItem(String label) {
-    return PopupMenuItem<String>(
-      enabled: false,
-      height: 44,
-      child: Row(
-        children: [
-          const SizedBox(width: 26),
-          Expanded(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
-                // 用主题的禁用色（Material 对"不可点项"的标准淡色），
-                // 比 onSurfaceVariant 更浅，保持它是"说明文字"的观感。
-                color: Theme.of(context).disabledColor,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 
   Future<void> _showSpeedSheet() async {
     setState(() => _controlsVisible = true);
@@ -2760,15 +2795,11 @@ class _TrackSelectionSheet extends StatelessWidget {
     required this.title,
     required this.subtitle,
     required this.options,
-    this.footerNote,
   });
 
   final String title;
   final String subtitle;
   final List<_TrackOption> options;
-
-  /// 底部的灰色说明文字（如"该视频没有内嵌字幕"），null 表示不显示。
-  final String? footerNote;
 
   @override
   Widget build(BuildContext context) {
@@ -2799,16 +2830,6 @@ class _TrackSelectionSheet extends StatelessWidget {
                       option: option,
                       onTap: () => Navigator.of(context).pop(option.id),
                     ),
-                  if (footerNote != null) ...[
-                    const SizedBox(height: 4),
-                    Text(
-                      footerNote!,
-                      style: const TextStyle(
-                        color: Color(0xFF8D8A96),
-                        fontSize: 13,
-                      ),
-                    ),
-                  ],
                 ],
               ),
             ),
@@ -2970,4 +2991,376 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
       ),
     );
   }
+}
+
+/// 主/副字幕通道设置面板。
+///
+/// 视觉与交互全面升级：支持独立配置主字幕（上方 · 主要阅读）与副字幕（下方 · 对照辅助），
+/// 排除无法转为文本的图形字幕（图形字幕仅保留在主字幕中直通 mpv 渲染）。
+class _SubtitleSettingsSheet extends StatefulWidget {
+  const _SubtitleSettingsSheet({
+    required this.primarySubId,
+    required this.secondarySubId,
+    required this.hasTranslation,
+    required this.hasAiOriginal,
+    required this.subtitleTracks,
+    required this.onSelectPrimary,
+    required this.onSelectSecondary,
+    required this.onCloseAll,
+    required this.formatTrackLabel,
+  });
+
+  final String primarySubId;
+  final String secondarySubId;
+  final bool hasTranslation;
+  final bool hasAiOriginal;
+  final List<SubtitleTrack> subtitleTracks;
+  final ValueChanged<String> onSelectPrimary;
+  final ValueChanged<String> onSelectSecondary;
+  final VoidCallback onCloseAll;
+  final String Function(SubtitleTrack) formatTrackLabel;
+
+  @override
+  State<_SubtitleSettingsSheet> createState() => _SubtitleSettingsSheetState();
+}
+
+class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
+  late String _currentPrimary;
+  late String _currentSecondary;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentPrimary = widget.primarySubId;
+    _currentSecondary = widget.secondarySubId;
+  }
+
+  void _choosePrimary(String id) {
+    setState(() {
+      _currentPrimary = id;
+      // 若副字幕正好选了同一个有效字幕，则自动重置副字幕为关闭
+      if (id != 'none' && _currentSecondary == id) {
+        _currentSecondary = 'none';
+        widget.onSelectSecondary('none');
+      }
+    });
+    widget.onSelectPrimary(id);
+  }
+
+  void _chooseSecondary(String id) {
+    setState(() {
+      _currentSecondary = id;
+      // 若主字幕正好选了同一个有效字幕，则自动重置主字幕为关闭
+      if (id != 'none' && _currentPrimary == id) {
+        _currentPrimary = 'none';
+        widget.onSelectPrimary('none');
+      }
+    });
+    widget.onSelectSecondary(id);
+  }
+
+  void _closeAll() {
+    setState(() {
+      _currentPrimary = 'none';
+      _currentSecondary = 'none';
+    });
+    widget.onCloseAll();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isNone = _currentPrimary == 'none' && _currentSecondary == 'none';
+
+    // 构建主字幕候选池
+    final allPrimaryItems = <_SubDropdownItem>[
+      const _SubDropdownItem(id: 'none', label: '关闭主字幕'),
+      if (widget.hasTranslation)
+        const _SubDropdownItem(
+          id: 'ai_translation',
+          label: 'AI 翻译字幕',
+          badge: '已翻译',
+          badgeColor: Color(0xFF00796B),
+        ),
+      if (widget.hasAiOriginal)
+        const _SubDropdownItem(
+          id: 'ai_original',
+          label: 'AI 语音原字幕',
+          badge: '已识别',
+          badgeColor: PolyFlixColors.violet,
+        ),
+      ...widget.subtitleTracks.asMap().entries.map((entry) {
+        final i = entry.key;
+        final track = entry.value;
+        final isGraphic = BuiltInSubtitleExtractor.isGraphicSubtitle(track);
+        return _SubDropdownItem(
+          id: 'builtin_$i',
+          label: widget.formatTrackLabel(track),
+          badge: isGraphic ? '图形' : null,
+          badgeColor: const Color(0xFFBF360C),
+        );
+      }),
+    ];
+
+    // 构建副字幕候选池（过滤掉图形字幕，副字幕仅提供可文本渲染的轨道）
+    final allSecondaryItems = <_SubDropdownItem>[
+      const _SubDropdownItem(id: 'none', label: '关闭副字幕'),
+      if (widget.hasAiOriginal)
+        const _SubDropdownItem(
+          id: 'ai_original',
+          label: 'AI 语音原字幕',
+          badge: '已识别',
+          badgeColor: PolyFlixColors.violet,
+        ),
+      if (widget.hasTranslation)
+        const _SubDropdownItem(
+          id: 'ai_translation',
+          label: 'AI 翻译字幕',
+          badge: '已翻译',
+          badgeColor: Color(0xFF00796B),
+        ),
+      ...widget.subtitleTracks.asMap().entries
+          .where((e) => !BuiltInSubtitleExtractor.isGraphicSubtitle(e.value))
+          .map((entry) {
+        final i = entry.key;
+        final track = entry.value;
+        return _SubDropdownItem(
+          id: 'builtin_$i',
+          label: widget.formatTrackLabel(track),
+        );
+      }),
+    ];
+
+    // 互斥过滤：已经在主字幕选中的项，不在副字幕下拉框中出现；
+    // 已经在副字幕选中的项，也不在主字幕下拉框中出现（'none' 除外）
+    final primaryItems = allPrimaryItems.where((item) {
+      if (item.id == 'none') return true;
+      return item.id != _currentSecondary;
+    }).toList();
+
+    final secondaryItems = allSecondaryItems.where((item) {
+      if (item.id == 'none') return true;
+      return item.id != _currentPrimary;
+    }).toList();
+
+    final effectivePrimary = primaryItems.any((it) => it.id == _currentPrimary)
+        ? _currentPrimary
+        : 'none';
+    final effectiveSecondary = secondaryItems.any((it) => it.id == _currentSecondary)
+        ? _currentSecondary
+        : 'none';
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 6, 20, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // 顶栏：标题 + 一键关闭全部
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.primary.withValues(alpha: .15),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(
+                    Icons.subtitles_rounded,
+                    color: theme.colorScheme.primary,
+                    size: 20,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                const Text(
+                  '字幕设置',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const Spacer(),
+                if (!isNone)
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.redAccent.shade100,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: _closeAll,
+                    icon: const Icon(Icons.subtitles_off_outlined, size: 16),
+                    label: const Text('关闭全部字幕', style: TextStyle(fontSize: 12.5)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Divider(color: Colors.white10, height: 1),
+            const SizedBox(height: 16),
+
+            // 1. 主字幕板块（上层 · 大号）
+            _buildSectionHeader(
+              icon: Icons.vertical_align_top_rounded,
+              title: '主字幕',
+              subTitle: '显示在上方 · 主要阅读',
+              theme: theme,
+            ),
+            const SizedBox(height: 8),
+            _buildDropdown(
+              selectedValue: effectivePrimary,
+              items: primaryItems,
+              onChanged: _choosePrimary,
+              theme: theme,
+            ),
+
+            const SizedBox(height: 18),
+
+            // 2. 副字幕板块（下层 · 对照辅助）
+            _buildSectionHeader(
+              icon: Icons.vertical_align_bottom_rounded,
+              title: '副字幕',
+              subTitle: '显示在下方 · 对照辅助',
+              theme: theme,
+            ),
+            const SizedBox(height: 8),
+            _buildDropdown(
+              selectedValue: effectiveSecondary,
+              items: secondaryItems,
+              onChanged: _chooseSecondary,
+              theme: theme,
+            ),
+
+            const SizedBox(height: 16),
+            const Center(
+              child: Text(
+                '提示：主字幕在上方、副字幕在下方。图形类字幕仅能在主字幕中由底层硬件直接渲染。',
+                style: TextStyle(color: Colors.white38, fontSize: 11.5),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionHeader({
+    required IconData icon,
+    required String title,
+    required String subTitle,
+    required ThemeData theme,
+  }) {
+    return Row(
+      children: [
+        Icon(icon, size: 16, color: theme.colorScheme.primary),
+        const SizedBox(width: 6),
+        Text(
+          title,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          subTitle,
+          style: const TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDropdown({
+    required String selectedValue,
+    required List<_SubDropdownItem> items,
+    required ValueChanged<String> onChanged,
+    required ThemeData theme,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF262630),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          isExpanded: true,
+          value: selectedValue,
+          dropdownColor: const Color(0xFF262630),
+          borderRadius: BorderRadius.circular(12),
+          menuMaxHeight: 320,
+          icon: const Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white70),
+          items: items.map((item) {
+            final isSelected = item.id == selectedValue;
+            return DropdownMenuItem<String>(
+              value: item.id,
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 22,
+                    child: isSelected
+                        ? Icon(
+                            Icons.check_rounded,
+                            size: 17,
+                            color: theme.colorScheme.primary,
+                          )
+                        : null,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      item.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: isSelected ? Colors.white : Colors.white70,
+                        fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                      ),
+                    ),
+                  ),
+                  if (item.badge != null) ...[
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                      decoration: BoxDecoration(
+                        color: item.badgeColor ?? Colors.white24,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        item.badge!,
+                        style: const TextStyle(
+                          fontSize: 9.5,
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            );
+          }).toList(),
+          onChanged: (val) {
+            if (val != null) onChanged(val);
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _SubDropdownItem {
+  const _SubDropdownItem({
+    required this.id,
+    required this.label,
+    this.badge,
+    this.badgeColor,
+  });
+
+  final String id;
+  final String label;
+  final String? badge;
+  final Color? badgeColor;
 }

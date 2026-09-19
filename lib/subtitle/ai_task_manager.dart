@@ -13,8 +13,17 @@ import 'package:flutter/foundation.dart';
 import '../utils/native_file_helper.dart';
 import 'model_manager.dart';
 import 'subtitle_generator.dart';
+import 'translation/translation_engine.dart';
+import 'translation/translation_service.dart';
+import 'translation/builtin_subtitle_extractor.dart';
 
-/// 单个 AI 语音识别任务实体。
+/// 任务类型：语音识别 或 字幕翻译
+enum AiTaskType {
+  transcription,
+  translation,
+}
+
+/// 单个 AI 任务实体（支持语音识别与字幕翻译）。
 class AiTask extends ChangeNotifier {
   AiTask({
     required this.id,
@@ -22,12 +31,20 @@ class AiTask extends ChangeNotifier {
     required this.videoTitle,
     required this.modelId,
     required this.language,
+    this.taskType = AiTaskType.transcription,
+    this.targetLanguage,
+    this.sourceType,
+    this.engineId,
     String? cacheKey,
     DateTime? startTime,
   }) : cacheKey = cacheKey ?? videoPath,
        startTime = startTime ?? DateTime.now();
 
   final String id;
+  final AiTaskType taskType;
+  final String? targetLanguage;
+  final String? sourceType;
+  final String? engineId;
 
   /// 提取音频用的地址：本地文件路径，或 PFLX 本次会话的本地流地址。
   final String videoPath;
@@ -68,14 +85,29 @@ class AiTask extends ChangeNotifier {
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
+  int _totalUnits = 0;
+  int get totalUnits => _totalUnits;
+
+  int _completedUnits = 0;
+  int get completedUnits => _completedUnits;
+
   String get modelDisplayName {
+    if (taskType == AiTaskType.translation) {
+      final langName = targetLanguage != null
+          ? TranslationLanguage.findByCode(targetLanguage!).name
+          : '目标语言';
+      final src = (sourceType != null && sourceType!.startsWith('builtin_'))
+          ? '内置字幕'
+          : '识别字幕';
+      return '$src翻译 → $langName';
+    }
     for (final m in availableModels) {
       if (m.id == modelId) return m.displayName;
     }
     return modelId.toUpperCase();
   }
 
-  /// 是否正在识别（提取音频或推理中）。
+  /// 是否正在运行（语音识别或字幕翻译中）。
   ///
   /// [isInterrupted] 的任务虽然保存时是 processing，但续跑不可能，所以不算运行中。
   bool get isRunning =>
@@ -138,6 +170,16 @@ class AiTask extends ChangeNotifier {
     notifyListeners();
   }
 
+  void updateTranslationProgress(int completed, int total, {String? message}) {
+    _completedUnits = completed;
+    _totalUnits = total;
+    if (total > 0) {
+      _percent = (completed / total).clamp(0.0, 1.0);
+    }
+    if (message != null) _statusMessage = message;
+    notifyListeners();
+  }
+
   void addEntries(List<SubtitleEntry> newEntries) {
     _entries.addAll(newEntries);
     notifyListeners();
@@ -158,11 +200,17 @@ class AiTask extends ChangeNotifier {
   /// 恢复历史记录时用它可以算出一个合理的耗时，而不是把离线时长也算进去。
   Map<String, dynamic> toJson({DateTime? lastSeen}) => {
     'id': id,
+    'taskType': taskType.name,
     'videoPath': videoPath,
     'cacheKey': cacheKey,
     'videoTitle': videoTitle,
     'modelId': modelId,
     'language': language,
+    'targetLanguage': targetLanguage,
+    'sourceType': sourceType,
+    'engineId': engineId,
+    'totalUnits': _totalUnits,
+    'completedUnits': _completedUnits,
     'startTime': startTime.toIso8601String(),
     'endTime': _endTime?.toIso8601String(),
     'lastSeen': lastSeen?.toIso8601String(),
@@ -178,19 +226,31 @@ class AiTask extends ChangeNotifier {
   static AiTask? fromJson(Map<String, dynamic> json) {
     try {
       final videoPath = json['videoPath'] as String;
+      final taskTypeStr = json['taskType'] as String?;
+      final taskType = AiTaskType.values.firstWhere(
+        (t) => t.name == taskTypeStr,
+        orElse: () => AiTaskType.transcription,
+      );
+
       final task = AiTask(
         id: json['id'] as String,
+        taskType: taskType,
         videoPath: videoPath,
         // 旧记录没有 cacheKey：按 videoPath 兜底（老版本本来就用它当缓存键）
         cacheKey: (json['cacheKey'] as String?) ?? videoPath,
         videoTitle: (json['videoTitle'] as String?) ?? '',
         modelId: (json['modelId'] as String?) ?? '',
         language: (json['language'] as String?) ?? 'auto',
+        targetLanguage: json['targetLanguage'] as String?,
+        sourceType: json['sourceType'] as String?,
+        engineId: json['engineId'] as String?,
         startTime:
             DateTime.tryParse((json['startTime'] as String?) ?? '') ??
             DateTime.now(),
       );
 
+      task._totalUnits = (json['totalUnits'] as num?)?.toInt() ?? 0;
+      task._completedUnits = (json['completedUnits'] as num?)?.toInt() ?? 0;
       task._entryCount = (json['entryCount'] as num?)?.toInt() ?? 0;
       task._percent = ((json['percent'] as num?)?.toDouble() ?? 0).clamp(
         0.0,
@@ -215,7 +275,9 @@ class AiTask extends ChangeNotifier {
               task._state == AsrState.processing)) {
         task._interrupted = true;
         task._state = AsrState.idle;
-        task._statusMessage = '已中断（应用退出时任务未完成，可重新识别）';
+        task._statusMessage = taskType == AiTaskType.translation
+            ? '已中断（应用退出时翻译未完成，可重新发起）'
+            : '已中断（应用退出时任务未完成，可重新识别）';
         task._endTime = lastSeen ?? task.startTime;
       }
       return task;
@@ -342,6 +404,19 @@ class AiTaskManager extends ChangeNotifier {
     return null;
   }
 
+  /// 获取指定视频最近一次的翻译任务（可按来源类型筛选）。
+  AiTask? getTranslationTask(String videoPath, {String? sourceType}) {
+    for (final task in _tasks.reversed) {
+      if (task.taskType != AiTaskType.translation) continue;
+      final match = _isSamePath(task.videoPath, videoPath) ||
+          _isSamePath(task.cacheKey, videoPath);
+      if (!match) continue;
+      if (sourceType != null && task.sourceType != sourceType) continue;
+      return task;
+    }
+    return null;
+  }
+
   /// 指定本地路径的视频是否有音频识别任务。
   bool hasTaskForPath(String path) => getTask(path) != null;
 
@@ -356,10 +431,13 @@ class AiTaskManager extends ChangeNotifier {
     String? cacheKey,
   }) async {
     final existing = getTask(videoPath);
-    if (existing != null && existing.isRunning) return existing;
+    if (existing != null && existing.isRunning && existing.taskType == AiTaskType.transcription) {
+      return existing;
+    }
 
     final task = AiTask(
       id: '${DateTime.now().millisecondsSinceEpoch}_${_tasks.length}',
+      taskType: AiTaskType.transcription,
       videoPath: videoPath,
       cacheKey: cacheKey,
       videoTitle: videoTitle,
@@ -375,14 +453,157 @@ class AiTaskManager extends ChangeNotifier {
     return task;
   }
 
-  /// 取消指定视频的任务。
-  void cancelTask(String videoPath) {
-    final task = getTask(videoPath);
-    if (task != null) {
-      task.cancel();
-      SubtitleGenerator.instance.cancel();
-      notifyListeners();
+  /// 启动字幕翻译任务（在全局后台执行，即使切换页面或返回首页也不中断）。
+  Future<AiTask> startTranslationTask({
+    required String videoPath,
+    required String videoTitle,
+    required String targetLang,
+    required String sourceType, // 例如 'builtin_0' 或 'asr_medium'
+    String? cacheKey,
+    List<SubtitleEntry>? rawEntries,
+    int? builtinTrackIndex,
+  }) async {
+    final existing = getTranslationTask(videoPath, sourceType: sourceType);
+    if (existing != null && existing.isRunning) return existing;
+
+    final engine = TranslationService.instance.getActiveEngine();
+    final task = AiTask(
+      id: 'trans_${DateTime.now().millisecondsSinceEpoch}_${_tasks.length}',
+      taskType: AiTaskType.translation,
+      videoPath: videoPath,
+      cacheKey: cacheKey,
+      videoTitle: videoTitle,
+      modelId: sourceType,
+      language: targetLang,
+      targetLanguage: targetLang,
+      sourceType: sourceType,
+      engineId: engine.id,
+    );
+
+    _tasks.add(task);
+    notifyListeners();
+
+    _runTranslationTask(
+      task: task,
+      rawEntries: rawEntries,
+      builtinTrackIndex: builtinTrackIndex,
+    );
+    return task;
+  }
+
+  Future<void> _runTranslationTask({
+    required AiTask task,
+    List<SubtitleEntry>? rawEntries,
+    int? builtinTrackIndex,
+  }) async {
+    final targetLang = task.targetLanguage ?? 'zh-Hans';
+    final langName = TranslationLanguage.findByCode(targetLang).name;
+
+    task.updateState(
+      AsrState.preparing,
+      message: '正在准备待翻译字幕...',
+    );
+
+    try {
+      List<SubtitleEntry> entries = rawEntries ?? [];
+      // 若无传入待翻译条目且为内置字幕，则从内置字幕中提取
+      if (entries.isEmpty && builtinTrackIndex != null) {
+        task.updateState(
+          AsrState.preparing,
+          message: '正在从视频提取内置字幕文本...',
+        );
+        entries = await BuiltInSubtitleExtractor.extractSubtitles(
+          videoPath: task.videoPath,
+          subtitleIndex: builtinTrackIndex,
+        );
+      } else if (entries.any((e) => e.translatedText != null)) {
+        // 剥离已有翻译，保留纯原文用于新翻译
+        entries = entries
+            .map((e) => SubtitleEntry(
+                  start: e.start,
+                  end: e.end,
+                  text: e.text,
+                ))
+            .toList();
+      }
+
+      if (task.isCancelled) return;
+
+      if (entries.isEmpty) {
+        throw const TranslationException('待翻译字幕内容为空');
+      }
+
+      task.updateState(
+        AsrState.processing,
+        message: '正在翻译为 $langName (0/${entries.length})...',
+      );
+      task.updateTranslationProgress(0, entries.length);
+
+      final translatedEntries = await TranslationService.instance.translateEntries(
+        entries: entries,
+        targetLanguage: targetLang,
+        onProgress: (cur, total) {
+          if (!task.isCancelled) {
+            task.updateTranslationProgress(
+              cur,
+              total,
+              message: '正在翻译为 $langName ($cur/$total)...',
+            );
+          }
+        },
+        isCancelled: () => task.isCancelled,
+      );
+
+      if (task.isCancelled) return;
+
+      // 持久化翻译结果到磁盘缓存
+      await TranslationService.instance.saveTranslationCache(
+        sourceKey: task.cacheKey,
+        sourceType: task.sourceType ?? 'unknown',
+        targetLang: targetLang,
+        engineId: task.engineId ?? TranslationService.instance.getActiveEngine().id,
+        entries: translatedEntries,
+      );
+
+      // 如果当前播放器正好承载着该视频，无缝同步到画面显示
+      if (SubtitleGenerator.instance.holdsEntriesFor(task.videoPath)) {
+        SubtitleGenerator.instance.setEntries(
+          translatedEntries,
+          videoPath: task.videoPath,
+          markCompleted: true,
+        );
+      }
+
+      task._entries
+        ..clear()
+        ..addAll(translatedEntries);
+      task.updateState(
+        AsrState.completed,
+        percent: 1.0,
+        message: '已成功翻译为 $langName (共 ${translatedEntries.length} 条)',
+      );
+    } catch (e) {
+      if (!task.isCancelled) {
+        task.updateState(
+          AsrState.error,
+          errorMessage: e.toString(),
+          message: '翻译失败: $e',
+        );
+      }
     }
+  }
+
+  /// 取消指定视频的任务（兼容 ASR 与翻译任务）。
+  void cancelTask(String videoPath) {
+    for (final task in _tasks.reversed) {
+      final match = _isSamePath(task.videoPath, videoPath) ||
+          _isSamePath(task.cacheKey, videoPath);
+      if (match && task.isRunning) {
+        task.cancel();
+      }
+    }
+    SubtitleGenerator.instance.cancel();
+    notifyListeners();
   }
 
   /// 删除一条任务记录。

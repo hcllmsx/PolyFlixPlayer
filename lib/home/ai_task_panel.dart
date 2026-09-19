@@ -194,6 +194,7 @@ class _AiTaskTile extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final running = task.isRunning;
 
+    final isTranslation = task.taskType == AiTaskType.translation;
     final (
       Color stateColor,
       IconData stateIcon,
@@ -213,14 +214,18 @@ class _AiTaskTile extends StatelessWidget {
       _ when task.state == AsrState.completed => (
         Colors.green,
         Icons.check_circle_rounded,
-        '已完成',
+        isTranslation ? '翻译完成' : '已完成',
       ),
       _ when task.state == AsrState.error => (
         scheme.error,
         Icons.error_outline_rounded,
-        '识别失败',
+        isTranslation ? '翻译失败' : '识别失败',
       ),
-      _ => (scheme.primary, Icons.autorenew_rounded, '识别中'),
+      _ => (
+        scheme.primary,
+        isTranslation ? Icons.g_translate_rounded : Icons.autorenew_rounded,
+        isTranslation ? '翻译中' : '识别中',
+      ),
     };
 
     return Container(
@@ -253,12 +258,19 @@ class _AiTaskTile extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
-                  color: scheme.primary.withValues(alpha: .14),
+                  color: isTranslation
+                      ? Colors.deepPurple.withValues(alpha: .2)
+                      : scheme.primary.withValues(alpha: .14),
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: Text(
                   task.modelDisplayName,
-                  style: TextStyle(fontSize: 11, color: scheme.primary),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isTranslation
+                        ? Colors.deepPurpleAccent.shade100
+                        : scheme.primary,
+                  ),
                 ),
               ),
             ],
@@ -294,7 +306,7 @@ class _AiTaskTile extends StatelessWidget {
             // 进行中显示实时耗时，结束后为固定总耗时
             '已耗时 ${AiTask.formatDuration(task.elapsed)}'
             ' · 开始于 ${_hhmm(task.startTime)}'
-            '${task.entryCount > 0 ? ' · 已生成 ${task.entryCount} 条字幕' : ''}',
+            '${task.entryCount > 0 ? (isTranslation ? ' · 已翻译 ${task.entryCount} 条字幕' : ' · 已生成 ${task.entryCount} 条字幕') : ''}',
             style: TextStyle(
               fontSize: 11.5,
               height: 1.4,

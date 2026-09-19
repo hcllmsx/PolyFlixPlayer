@@ -235,4 +235,41 @@ class TranslationService {
       return null;
     }
   }
+
+  /// 删除指定源与语言的翻译缓存。
+  Future<void> deleteTranslationCache({
+    required String sourceKey,
+    required String sourceType,
+    String? targetLang,
+    String? engineId,
+  }) async {
+    try {
+      final dir = NativeFileHelper.desktopSubtitleCacheDir();
+      if (!dir.existsSync()) return;
+
+      if (targetLang != null && engineId != null) {
+        final fileName = _generateCacheFileName(
+          sourceKey: sourceKey,
+          sourceType: sourceType,
+          targetLang: targetLang,
+          engineId: engineId,
+        );
+        final file = File('${dir.path}${Platform.pathSeparator}$fileName');
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } else {
+        final cleanName = _extractCleanBaseName(sourceKey);
+        final prefix = 'trans_${cleanName}_${sourceType}_';
+        for (final entity in dir.listSync()) {
+          if (entity is File &&
+              entity.path.split(Platform.pathSeparator).last.startsWith(prefix)) {
+            try {
+              entity.deleteSync();
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+  }
 }
