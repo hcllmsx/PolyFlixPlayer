@@ -62,14 +62,23 @@ class SrtParser {
 
   /// 序列化为 SRT 格式。
   ///
-  /// [bilingual]: 是否输出双语（原文 + 换行 + 译文）
+  /// [bilingual]: 是否输出双语（译文 + 换行 + 原文）
   /// [translationOnly]: 是否仅输出译文（当译文为空时回退原文）
+  /// [headerComment]: 写在文件开头（第一条字幕之前）的说明文字，
+  /// 播放器会忽略第一条字幕前的内容，不会显示；用文本编辑器打开可见。
   static String serialize(
     List<SubtitleEntry> entries, {
     bool bilingual = false,
     bool translationOnly = false,
+    String? headerComment,
   }) {
     final buffer = StringBuffer();
+
+    if (headerComment != null && headerComment.trim().isNotEmpty) {
+      buffer.writeln(headerComment.trim());
+      buffer.writeln();
+    }
+
     int index = 1;
 
     for (final entry in entries) {
@@ -79,7 +88,7 @@ class SrtParser {
             ? entry.translatedText!
             : entry.text;
       } else if (bilingual && entry.translatedText != null && entry.translatedText!.isNotEmpty) {
-        display = '${entry.text}\n${entry.translatedText!}';
+        display = '${entry.translatedText!}\n${entry.text}';
       } else {
         display = entry.text;
       }

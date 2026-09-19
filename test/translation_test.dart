@@ -52,8 +52,18 @@ Second subtitle entry.
       ];
 
       final bilingual = SrtParser.serialize(entries, bilingual: true);
-      expect(bilingual.contains('1\n00:00:01,000 --> 00:00:03,000\nHello world\n你好世界'), isTrue);
-      expect(bilingual.contains('2\n00:00:04,000 --> 00:00:06,000\nGoodbye\n再见'), isTrue);
+      // 双语导出：译文在上，原文在下
+      expect(bilingual.contains('1\n00:00:01,000 --> 00:00:03,000\n你好世界\nHello world'), isTrue);
+      expect(bilingual.contains('2\n00:00:04,000 --> 00:00:06,000\n再见\nGoodbye'), isTrue);
+
+      // 头部注释：播放器不显示，文本打开可见
+      final withHeader = SrtParser.serialize(
+        entries,
+        bilingual: false,
+        headerComment: '导出说明',
+      );
+      expect(withHeader.startsWith('导出说明\n\n1\n'), isTrue);
+      expect(SrtParser.parse(withHeader).length, 2);
 
       final translationOnly = SrtParser.serialize(entries, translationOnly: true);
       expect(translationOnly.contains('1\n00:00:01,000 --> 00:00:03,000\n你好世界'), isTrue);

@@ -32,6 +32,11 @@ enum SubtitleExportMode {
 /// AI 语音识别与字幕翻译控制面板。
 ///
 /// 支持配置识别模型、源语言选择、视频内置字幕提取、目标语言翻译及双语字幕导出。
+/// 写入 SRT 文件开头的导出信息（播放器不显示，文本编辑器打开可见）。
+const String kSrtHeaderComment =
+    '本字幕由 影现播放器（PolyFlixPlayer）导出\n'
+    '作者B站：火车啦啦 https://space.bilibili.com/255947051';
+
 class AiSubtitleSheet extends StatefulWidget {
   const AiSubtitleSheet({
     super.key,
@@ -659,17 +664,30 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
       switch (mode) {
         case SubtitleExportMode.original:
-          srtContent = SrtParser.serialize(entries, bilingual: false, translationOnly: false);
+          srtContent = SrtParser.serialize(
+            entries,
+            bilingual: false,
+            translationOnly: false,
+            headerComment: kSrtHeaderComment,
+          );
           dialogTitle = '导出原字幕 SRT 文件';
           suffix = 'original';
           break;
         case SubtitleExportMode.translated:
-          srtContent = SrtParser.serialize(entries, translationOnly: true);
+          srtContent = SrtParser.serialize(
+            entries,
+            translationOnly: true,
+            headerComment: kSrtHeaderComment,
+          );
           dialogTitle = '导出翻译字幕 SRT 文件';
           suffix = 'translated';
           break;
         case SubtitleExportMode.bilingual:
-          srtContent = SrtParser.serialize(entries, bilingual: true);
+          srtContent = SrtParser.serialize(
+            entries,
+            bilingual: true,
+            headerComment: kSrtHeaderComment,
+          );
           dialogTitle = '导出双语 SRT 文件';
           suffix = 'bilingual';
           break;
