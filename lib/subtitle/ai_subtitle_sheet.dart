@@ -21,6 +21,13 @@ import 'translation/srt_parser.dart';
 import 'translation/translation_engine.dart';
 import 'translation/translation_service.dart';
 
+/// 字幕导出模式
+enum SubtitleExportMode {
+  original,
+  translated,
+  bilingual,
+}
+
 /// AI 语音识别与字幕翻译控制面板。
 ///
 /// 支持配置识别模型、源语言选择、视频内置字幕提取、目标语言翻译及双语字幕导出。
@@ -557,39 +564,53 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     }
   }
 
-  Future<void> _exportSrtFile() async {
+  Future<void> _exportSrt(SubtitleExportMode mode) async {
     final entries = _currentDisplayEntries;
     if (entries.isEmpty) return;
 
     try {
-      final hasTrans = entries.any((e) => e.translatedText != null && e.translatedText!.isNotEmpty);
-      final srtContent = hasTrans
-          ? SrtParser.serialize(entries, bilingual: true)
-          : SubtitleGenerator.convertToSrt(entries);
+      String srtContent;
+      String dialogTitle;
+      String suffix;
+
+      switch (mode) {
+        case SubtitleExportMode.original:
+          srtContent = SrtParser.serialize(entries, bilingual: false, translationOnly: false);
+          dialogTitle = '导出原字幕 SRT 文件';
+          suffix = 'original';
+          break;
+        case SubtitleExportMode.translated:
+          srtContent = SrtParser.serialize(entries, translationOnly: true);
+          dialogTitle = '导出翻译字幕 SRT 文件';
+          suffix = 'translated';
+          break;
+        case SubtitleExportMode.bilingual:
+          srtContent = SrtParser.serialize(entries, bilingual: true);
+          dialogTitle = '导出双语 SRT 文件';
+          suffix = 'bilingual';
+          break;
+      }
+
       final srtBytes = Uint8List.fromList(utf8.encode(srtContent));
 
       // 提取建议的导出文件名
-      String defaultName = hasTrans ? 'subtitle_bilingual.srt' : 'subtitle.srt';
+      String baseName = 'subtitle';
       if (widget.videoTitle != null && widget.videoTitle!.trim().isNotEmpty) {
-        final sanitized = widget.videoTitle!
+        baseName = widget.videoTitle!
             .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
             .trim();
-        defaultName = hasTrans ? '${sanitized}_bilingual.srt' : '$sanitized.srt';
       } else {
         final base = widget.videoPath
             .split(Platform.isWindows ? r'\' : '/')
             .last;
         final dotIdx = base.lastIndexOf('.');
-        if (dotIdx > 0) {
-          final prefix = base.substring(0, dotIdx);
-          defaultName = hasTrans ? '${prefix}_bilingual.srt' : '$prefix.srt';
-        } else {
-          defaultName = hasTrans ? '${base}_bilingual.srt' : '$base.srt';
-        }
+        baseName = dotIdx > 0 ? base.substring(0, dotIdx) : base;
       }
 
+      final defaultName = '${baseName}_$suffix.srt';
+
       final savedUri = await FilePicker.saveFile(
-        dialogTitle: hasTrans ? '导出双语 SRT 字幕文件' : '导出 SRT 字幕文件',
+        dialogTitle: dialogTitle,
         fileName: defaultName,
         bytes: srtBytes,
         type: FileType.custom,
@@ -1464,9 +1485,9 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   }
 
   Widget _buildSubtitleControls(ThemeData theme) {
-    final hasEntries = _generator.entries.isNotEmpty;
-    final targetLang = aiTranslationTargetLang.value;
-    final langName = TranslationLanguage.findByCode(targetLang).name;
+    final hasEntries = _currentDisplayEntries.isNotEmpty;
+    final canShowTranslateBtn =
+        aiTranslationEnabled.value && hasEntries && _selectedSource == 'asr';
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -1500,18 +1521,6 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
                   widget.onToggleSubtitleActive(val);
                 },
               ),
-              if (hasEntries) ...[
-                const SizedBox(width: 4),
-                IconButton(
-                  tooltip: _hasAnyTranslation ? '导出双语 SRT 字幕' : '导出为 SRT 字幕',
-                  icon: const Icon(
-                    Icons.file_download_outlined,
-                    color: Colors.white70,
-                    size: 20,
-                  ),
-                  onPressed: _exportSrtFile,
-                ),
-              ],
               const SizedBox(width: 4),
               IconButton(
                 tooltip: '删除字幕缓存',
@@ -1526,33 +1535,90 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               ),
             ],
           ),
-          // 若启用了翻译，且当前处于 ASR 模式、条目已有，展示一键翻译按钮
-          if (aiTranslationEnabled.value && hasEntries && _selectedSource == 'asr') ...[
+          if (hasEntries) ...[
             const SizedBox(height: 8),
             const Divider(color: Colors.white10, height: 1),
-            const SizedBox(height: 8),
-            Row(
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                Expanded(
-                  child: FilledButton.tonalIcon(
-                    onPressed: _isTranslating ? _cancelCurrentTranslation : _translateCurrentEntries,
+                // 1. 最左侧：翻译按钮（ASR 模式且开启翻译）
+                if (canShowTranslateBtn)
+                  FilledButton.tonalIcon(
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    ),
+                    onPressed: _isTranslating
+                        ? _cancelCurrentTranslation
+                        : _translateCurrentEntries,
                     icon: _isTranslating
                         ? const SizedBox(
-                            width: 14,
-                            height: 14,
+                            width: 13,
+                            height: 13,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(Icons.g_translate_rounded, size: 16),
+                        : const Icon(Icons.g_translate_rounded, size: 15),
                     label: Text(
                       _isTranslating
                           ? '取消翻译 ($_translatedCount/$_totalTranslateCount)'
                           : (_hasAnyTranslation
-                              ? '重新翻译为 $langName'
-                              : '一键翻译为 $langName'),
-                      style: const TextStyle(fontSize: 12.5),
+                              ? '重新翻译'
+                              : '翻译字幕'),
+                      style: const TextStyle(fontSize: 12),
                     ),
                   ),
-                ),
+
+                // 2. 导出按钮
+                if (!_hasAnyTranslation) ...[
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      side: const BorderSide(color: Colors.white24),
+                      foregroundColor: Colors.white70,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    ),
+                    onPressed: () => _exportSrt(SubtitleExportMode.original),
+                    icon: const Icon(Icons.file_download_outlined, size: 15),
+                    label: const Text('导出原字幕', style: TextStyle(fontSize: 12)),
+                  ),
+                ] else ...[
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      side: const BorderSide(color: Colors.white24),
+                      foregroundColor: Colors.white70,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    ),
+                    onPressed: () => _exportSrt(SubtitleExportMode.original),
+                    icon: const Icon(Icons.file_download_outlined, size: 15),
+                    label: const Text('导出原字幕', style: TextStyle(fontSize: 12)),
+                  ),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      side: const BorderSide(color: Colors.white24),
+                      foregroundColor: Colors.white70,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    ),
+                    onPressed: () => _exportSrt(SubtitleExportMode.translated),
+                    icon: const Icon(Icons.file_download_outlined, size: 15),
+                    label: const Text('导出翻译字幕', style: TextStyle(fontSize: 12)),
+                  ),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      side: const BorderSide(color: Colors.white24),
+                      foregroundColor: Colors.white70,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    ),
+                    onPressed: () => _exportSrt(SubtitleExportMode.bilingual),
+                    icon: const Icon(Icons.file_download_outlined, size: 15),
+                    label: const Text('导出双语字幕', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
               ],
             ),
           ],

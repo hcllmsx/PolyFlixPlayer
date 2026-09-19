@@ -54,6 +54,10 @@ Second subtitle entry.
       final translationOnly = SrtParser.serialize(entries, translationOnly: true);
       expect(translationOnly.contains('1\n00:00:01,000 --> 00:00:03,000\n你好世界'), isTrue);
       expect(translationOnly.contains('Hello world'), isFalse);
+
+      final originalOnly = SrtParser.serialize(entries, bilingual: false, translationOnly: false);
+      expect(originalOnly.contains('1\n00:00:01,000 --> 00:00:03,000\nHello world'), isTrue);
+      expect(originalOnly.contains('你好世界'), isFalse);
     });
   });
 
