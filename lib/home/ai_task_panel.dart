@@ -147,7 +147,7 @@ class _AiTaskPanelState extends State<AiTaskPanel> {
                 padding: const EdgeInsets.symmetric(horizontal: 8),
               ),
               icon: const Icon(Icons.cleaning_services_outlined, size: 16),
-              label: const Text('清空已完成', style: TextStyle(fontSize: 12)),
+              label: const Text('一键清空', style: TextStyle(fontSize: 12)),
               onPressed: _confirmClearFinished,
             ),
           ),

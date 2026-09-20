@@ -19,6 +19,7 @@ import '../settings/playback_progress.dart';
 import '../settings/settings_page.dart';
 import '../settings/update_service.dart';
 import '../subtitle/ai_task_manager.dart';
+import '../utils/app_snack_bar.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'ai_task_panel.dart';
@@ -278,9 +279,33 @@ class _HomePageState extends State<HomePage> {
     _playPath(path, name);
   }
 
+  /// 源文件是否已经在磁盘上不存在了。
+  ///
+  /// 任务列表里的历史记录、媒体库中已被删除或随移动硬盘拔走的条目，都可能指向
+  /// 一个早已不存在的文件；那时进播放页只会停在黑屏加载，不如提前告知用户。
+  /// 网络串流地址不走这条检查（它们的"存在性"要由播放器自己去判定）。
+  bool _isSourceMissing(String path) {
+    final lower = path.toLowerCase();
+    if (lower.startsWith('http://') ||
+        lower.startsWith('https://') ||
+        lower.startsWith('rtsp://')) {
+      return false;
+    }
+    try {
+      return !File(path).existsSync();
+    } catch (_) {
+      // 非法路径 / 无权限读取，一律按"打不开"处理
+      return true;
+    }
+  }
+
   /// 识别是否为 PFLX 产物后直接进入播放页（不写入媒体库）。
   void _playPath(String path, String name) {
     if (!mounted) return;
+    if (_isSourceMissing(path)) {
+      _showTip('「$name」的源文件已不存在，无法播放');
+      return;
+    }
     final info = scan(path);
     final isPflx =
         info != null &&
@@ -377,6 +402,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _open(_LibraryItem item, {String? initialNotice}) async {
+    if (!mounted) return;
+    // 文件被删除/移动（或移动硬盘已拔出）时不再进播放页：否则只会看到一片
+    // 黑屏和转圈，用户不知道发生了什么。
+    if (_isSourceMissing(item.path)) {
+      _showTip('「${item.name}」的源文件已不存在，无法播放');
+      return;
+    }
+
     // 播放页也有拖放目标，进入前先关掉首页的，避免两者同时接收拖放事件。
     setState(() => _dropEnabled = false);
 
@@ -429,13 +462,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _removeItem(_LibraryItem item) {
-    final task = AiTaskManager.instance.getTask(item.path);
+    // 只有**仍在运行**的任务才拦住移除；已完成/失败/取消的历史记录只是留档，
+    // 不该阻止用户把视频移出播放列表。
+    final task = AiTaskManager.instance.getRunningTask(item.path);
     if (task != null) {
-      if (task.isRunning) {
-        _showTip('「${item.name}」正在进行音频识别，不允许移出播放列表');
-      } else {
-        _showTip('「${item.name}」有音频识别任务，不允许移出播放列表');
-      }
+      final name = task.taskType == AiTaskType.translation
+          ? '字幕翻译'
+          : '音频识别';
+      _showTip('「${item.name}」正在进行$name，不允许移出播放列表');
       return;
     }
     final index = _items.indexWhere((e) => e.path == item.path);
@@ -452,9 +486,9 @@ class _HomePageState extends State<HomePage> {
     final messenger = ScaffoldMessenger.of(context);
     messenger.hideCurrentSnackBar();
     messenger.showSnackBar(
-      SnackBar(
+      buildSnackBar(
+        context,
         duration: const Duration(seconds: 8),
-        behavior: SnackBarBehavior.floating,
         content: Row(
           children: [
             Expanded(
@@ -534,7 +568,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               Builder(
                 builder: (context) {
-                  final task = AiTaskManager.instance.getTask(item.path);
+                  final task = AiTaskManager.instance.getRunningTask(item.path);
                   final hasTask = task != null;
                   final errorColor = Theme.of(ctx).colorScheme.error;
                   final disabledColor =
@@ -550,17 +584,17 @@ class _HomePageState extends State<HomePage> {
                         color: hasTask ? disabledColor : errorColor,
                       ),
                     ),
-                    subtitle: hasTask
-                        ? Text(
-                            task.isRunning
-                                ? '该视频正在进行音频识别，无法移除'
-                                : '该视频有音频识别任务，无法移除',
+                    subtitle: task == null
+                        ? null
+                        : Text(
+                            task.taskType == AiTaskType.translation
+                                ? '该视频正在进行字幕翻译，无法移除'
+                                : '该视频正在进行音频识别，无法移除',
                             style: TextStyle(
                               fontSize: 12,
                               color: disabledColor,
                             ),
-                          )
-                        : null,
+                          ),
                     onTap: () {
                       Navigator.of(ctx).pop();
                       _removeItem(item);
@@ -579,7 +613,7 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+      ..showSnackBar(buildSnackBar(context, content: Text(message)));
   }
 
   @override
@@ -1409,8 +1443,8 @@ class _VideoLibraryCard extends StatelessWidget {
           }
           return false;
         } else if (direction == DismissDirection.endToStart) {
-          final hasTask = AiTaskManager.instance.hasTaskForPath(item.path);
-          if (hasTask) {
+          final running = AiTaskManager.instance.hasRunningTaskForPath(item.path);
+          if (running) {
             onDelete();
             return false;
           }

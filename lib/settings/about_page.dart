@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../utils/app_snack_bar.dart';
 import 'update_service.dart';
 
 class AboutPage extends StatefulWidget {
@@ -30,13 +31,15 @@ class _AboutPageState extends State<AboutPage> {
     try {
       final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
       if (!ok && mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('无法打开链接: $url')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          buildSnackBar(context, content: Text('无法打开链接: $url')),
+        );
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('打开链接失败: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          buildSnackBar(context, content: Text('打开链接失败: $e')),
+        );
       }
     }
   }

@@ -13,6 +13,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'app_snack_bar.dart';
+
 /// 浮层提示入口。
 class AppToast {
   AppToast._();
@@ -31,8 +33,9 @@ class AppToast {
     final overlay = Overlay.maybeOf(context, rootOverlay: true);
     if (overlay == null) {
       // 拿不到 Overlay（widget 已卸载等极端情况）时退回 SnackBar，而不是静默丢弃
-      ScaffoldMessenger.maybeOf(context)
-          ?.showSnackBar(SnackBar(content: Text(message)));
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        buildSnackBar(context, content: Text(message)),
+      );
       return;
     }
 

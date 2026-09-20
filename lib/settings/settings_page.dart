@@ -13,6 +13,7 @@ import '../subtitle/engine_pack.dart';
 import '../subtitle/model_catalog_sheet.dart';
 import '../subtitle/model_manager.dart';
 import '../subtitle/whisper_server.dart';
+import '../utils/app_snack_bar.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'about_page.dart';
@@ -117,9 +118,12 @@ class _SettingsPageState extends State<SettingsPage> {
       await ModelManager.instance.deleteModel(model.id);
       await _refreshModels();
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('已删除模型 ${model.displayName}')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          buildSnackBar(
+            context,
+            content: Text('已删除模型 ${model.displayName}'),
+          ),
+        );
       }
     }
   }
@@ -149,7 +153,8 @@ class _SettingsPageState extends State<SettingsPage> {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
-        SnackBar(
+        buildSnackBar(
+          context,
           content: Text(
             cleared > 0
                 ? '已清理临时缓存，释放了 ${_formatBytes(cleared)} 存储空间。'
@@ -179,13 +184,15 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
       if (!ok && mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('无法打开链接: $url')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          buildSnackBar(context, content: Text('无法打开链接: $url')),
+        );
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('打开链接失败: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          buildSnackBar(context, content: Text('打开链接失败: $e')),
+        );
       }
     }
   }
@@ -880,7 +887,7 @@ class _SettingsPageState extends State<SettingsPage> {
         result.modelId;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text('已选用：$label')));
+      ..showSnackBar(buildSnackBar(context, content: Text('已选用：$label')));
   }
 
   /// 导入本地已下载好的 ggml 模型文件。
@@ -910,7 +917,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(result.message)));
+      ..showSnackBar(buildSnackBar(context, content: Text(result.message)));
   }
 
   /// 导入本地已下载好的引擎包 zip。
@@ -941,7 +948,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(result.message)));
+      ..showSnackBar(buildSnackBar(context, content: Text(result.message)));
   }
 
   /// 同类型引擎包已存在时的询问：替换 / 保留两个 / 取消。

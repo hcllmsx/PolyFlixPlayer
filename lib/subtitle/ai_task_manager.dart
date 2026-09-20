@@ -485,8 +485,23 @@ class AiTaskManager extends ChangeNotifier {
     return null;
   }
 
-  /// 指定本地路径的视频是否有音频识别任务。
-  bool hasTaskForPath(String path) => getTask(path) != null;
+  /// 获取指定视频**正在运行**的任务（语音识别或字幕翻译均计入）。
+  ///
+  /// 只看真正还在跑的任务：已完成 / 失败 / 取消 / 中断的历史记录留在任务列表里
+  /// 供回看，不应该再影响播放列表的增删。
+  AiTask? getRunningTask(String videoPath) {
+    for (final task in _tasks.reversed) {
+      if (!task.isRunning) continue;
+      if (_isSamePath(task.videoPath, videoPath) ||
+          _isSamePath(task.cacheKey, videoPath)) {
+        return task;
+      }
+    }
+    return null;
+  }
+
+  /// 指定路径的视频是否还有**正在运行**的任务。
+  bool hasRunningTaskForPath(String path) => getRunningTask(path) != null;
 
   /// 启动某视频的语音识别任务。
   ///

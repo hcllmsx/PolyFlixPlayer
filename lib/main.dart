@@ -10,6 +10,7 @@ import 'settings/app_settings.dart';
 import 'subtitle/ai_task_manager.dart';
 import 'subtitle/device_capability.dart';
 import 'subtitle/whisper_server.dart';
+import 'utils/app_snack_bar.dart';
 import 'utils/native_file_helper.dart';
 import 'utils/platform_utils.dart';
 
@@ -188,9 +189,14 @@ class _PolyFlixAppState extends State<PolyFlixApp> with WidgetsBindingObserver {
       dialogTheme: DialogThemeData(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
       ),
-      snackBarTheme: const SnackBarThemeData(
+      // 提示条统一半透明（细节见 utils/app_snack_bar.dart）：这里给所有 SnackBar
+      // 兜底，以后即使有地方直接 new SnackBar 也是同样的观感。
+      snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
         elevation: 0,
+        backgroundColor: scheme.inverseSurface.withValues(
+          alpha: kSnackBarOpacity,
+        ),
       ),
       dividerTheme: const DividerThemeData(space: 1, thickness: 1),
     );
@@ -233,9 +239,14 @@ class _PolyFlixAppState extends State<PolyFlixApp> with WidgetsBindingObserver {
         backgroundColor: const Color(0xFF24232E),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
       ),
-      snackBarTheme: const SnackBarThemeData(
+      // 提示条统一半透明（细节见 utils/app_snack_bar.dart）：这里给所有 SnackBar
+      // 兜底，以后即使有地方直接 new SnackBar 也是同样的观感。
+      snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
         elevation: 0,
+        backgroundColor: scheme.inverseSurface.withValues(
+          alpha: kSnackBarOpacity,
+        ),
       ),
       dividerTheme: const DividerThemeData(space: 1, thickness: 1),
     );
