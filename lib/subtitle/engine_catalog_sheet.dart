@@ -15,6 +15,7 @@ import '../utils/app_toast.dart';
 import '../utils/platform_utils.dart';
 import 'download_links.dart';
 import 'engine_pack.dart';
+import 'netdisk_links_card.dart';
 
 /// 引擎包分组（键值用于把条目归到对应的小标题下）。
 enum EngineGroup {
@@ -239,7 +240,13 @@ class _EngineCatalogSheetState extends State<EngineCatalogSheet> {
               shrinkWrap: true,
               children: [
                 _statusCard(scheme),
-                _netdiskCard(scheme),
+                // 网盘入口：夸克 / 百度各一份，可复制也可直接打开
+                const NetdiskLinksCard(
+                  title: '引擎包网盘（whisper.cpp 官方 zip）',
+                  links: kEngineNetdiskLinks,
+                  emptyNote:
+                      '链接待补充：全部引擎包会放在网盘里，链接就绪后这里会显示。',
+                ),
                 _columnHeader(scheme),
                 for (final group in EngineGroup.values) ...[
                   _groupHeader(scheme, group.title),
@@ -293,59 +300,6 @@ class _EngineCatalogSheetState extends State<EngineCatalogSheet> {
               ),
             ),
           ),
-        ],
-      ),
-    );
-  }
-
-  Widget _netdiskCard(ColorScheme scheme) {
-    final url = kEngineNetdiskUrl.trim();
-    final code = kEngineNetdiskCode.trim();
-    final hasUrl = url.isNotEmpty;
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(20, 10, 20, 4),
-      padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
-      decoration: BoxDecoration(
-        color: scheme.primaryContainer.withValues(alpha: .35),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.cloud_outlined, size: 20, color: scheme.primary),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '引擎包网盘',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  hasUrl
-                      ? '$url${code.isEmpty ? '' : '    提取码：$code'}'
-                      : '链接待补充：全部引擎包会放在网盘里，链接就绪后这里会显示。',
-                  style: TextStyle(
-                    fontSize: 12,
-                    height: 1.45,
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (hasUrl)
-            IconButton(
-              tooltip: '复制链接',
-              icon: const Icon(Icons.copy_rounded, size: 18),
-              onPressed: () {
-                final text = code.isEmpty ? url : '$url 提取码：$code';
-                Clipboard.setData(ClipboardData(text: text));
-                AppToast.show(context, '已复制网盘信息');
-              },
-            ),
         ],
       ),
     );

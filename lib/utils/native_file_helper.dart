@@ -326,7 +326,10 @@ abstract final class NativeFileHelper {
       var totalBytes = 0;
       var fileCount = 0;
       for (final entity in dir.listSync()) {
-        if (entity is File && entity.path.endsWith('.json')) {
+        // `.progress.json` 是"识别断点"标记（不是字幕），不计入字幕缓存条目
+        if (entity is File &&
+            entity.path.endsWith('.json') &&
+            !entity.path.endsWith('.progress.json')) {
           fileCount++;
           try {
             totalBytes += entity.lengthSync();

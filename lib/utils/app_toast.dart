@@ -25,10 +25,12 @@ class AppToast {
   /// 在屏幕底部弹出一条提示，[isError] 为真时用红色底板。
   ///
   /// 同一时刻只保留一条：新提示会顶掉旧的，避免叠成一堆。
+  /// [duration] 不传时按时长自适应（3~8 秒），需要让人读完的长提示可指定。
   static void show(
     BuildContext context,
     String message, {
     bool isError = false,
+    Duration? duration,
   }) {
     final overlay = Overlay.maybeOf(context, rootOverlay: true);
     if (overlay == null) {
@@ -48,7 +50,7 @@ class AppToast {
 
     // 文案长（比如带失败原因与路径）时多留一会儿，方便读完
     final seconds = (3 + message.length ~/ 40).clamp(3, 8);
-    _timer = Timer(Duration(seconds: seconds), hide);
+    _timer = Timer(duration ?? Duration(seconds: seconds), hide);
   }
 
   /// 立即收起当前提示。

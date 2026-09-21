@@ -14,6 +14,7 @@ import '../utils/app_toast.dart';
 import '../utils/platform_utils.dart';
 import 'download_links.dart';
 import 'model_manager.dart';
+import 'netdisk_links_card.dart';
 
 /// 面板形态。
 enum ModelSheetMode {
@@ -177,7 +178,13 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
               padding: const EdgeInsets.only(bottom: 20),
               shrinkWrap: true,
               children: [
-                _netdiskCard(scheme),
+                // 网盘入口：夸克 / 百度各一份，可复制也可直接打开
+                const NetdiskLinksCard(
+                  title: '模型网盘（ggml-*.bin）',
+                  links: kModelNetdiskLinks,
+                  emptyNote:
+                      '链接待补充：全部 ggml-*.bin 文件会放在网盘里，链接就绪后这里会显示。',
+                ),
                 _modelChoiceGuide(scheme),
                 _groupHeader(scheme, '多语言模型（支持 99 种语言自动侦测）'),
                 _columnHeader(scheme),
@@ -190,60 +197,6 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
               ],
             ),
           ),
-        ],
-      ),
-    );
-  }
-
-  /// 网盘入口：链接由 [kModelNetdiskUrl] 提供，未填写时给出说明而不是留白。
-  Widget _netdiskCard(ColorScheme scheme) {
-    final url = kModelNetdiskUrl.trim();
-    final code = kModelNetdiskCode.trim();
-    final hasUrl = url.isNotEmpty;
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(20, 12, 20, 4),
-      padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
-      decoration: BoxDecoration(
-        color: scheme.primaryContainer.withValues(alpha: .35),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.cloud_outlined, size: 20, color: scheme.primary),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '模型网盘',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  hasUrl
-                      ? '$url${code.isEmpty ? '' : '    提取码：$code'}'
-                      : '链接待补充：全部 ggml-*.bin 文件会放在网盘里，链接就绪后这里会显示。',
-                  style: TextStyle(
-                    fontSize: 12,
-                    height: 1.45,
-                    color: scheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (hasUrl)
-            IconButton(
-              tooltip: '复制链接',
-              icon: const Icon(Icons.copy_rounded, size: 18),
-              onPressed: () {
-                final text = code.isEmpty ? url : '$url 提取码：$code';
-                Clipboard.setData(ClipboardData(text: text));
-                AppToast.show(context, '已复制网盘信息');
-              },
-            ),
         ],
       ),
     );

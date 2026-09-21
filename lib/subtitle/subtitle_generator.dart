@@ -70,6 +70,42 @@ class SubtitleEntry {
   String toString() => '[$start -> $end] $text';
 }
 
+/// 切片识别的结果：字幕条目 + 音频覆盖进度。
+///
+/// [coveredSeconds] 表示"已经识别到音频的第几秒"，[totalSeconds] 是音频总长。
+/// 用户在识别途中点「翻译已有」时，会在**分片边界**优雅停下（[stoppedEarly] 为 true），
+/// 已识别的部分照常返回；剩余部分可以稍后从 [coveredSeconds] 处续跑补上。
+class ChunkedTranscribeResult {
+  const ChunkedTranscribeResult({
+    required this.entries,
+    required this.coveredSeconds,
+    required this.totalSeconds,
+    this.stoppedEarly = false,
+  });
+
+  /// 空结果（取消 / 出错 / 音频为空时使用）。
+  const ChunkedTranscribeResult.empty({
+    this.coveredSeconds = 0,
+    this.totalSeconds = 0,
+  })  : entries = const <SubtitleEntry>[],
+        stoppedEarly = false;
+
+  /// 本轮产出的字幕条目。
+  ///
+  /// 首次跑完全程时是全部条目；续跑或提前停止时是**本轮新增**的条目
+  /// （追加式合并：已有段落的时间轴保持原样，由调用方拼接到原字幕后面）。
+  final List<SubtitleEntry> entries;
+
+  /// 已识别覆盖到的秒数（续跑起点）。
+  final int coveredSeconds;
+
+  /// 音频总秒数。
+  final int totalSeconds;
+
+  /// 是否在分片边界被提前叫停（不是跑完了全部音频）。
+  final bool stoppedEarly;
+}
+
 /// ASR 处理状态。
 enum AsrState {
   /// 空闲，未运行。
@@ -518,23 +554,34 @@ class SubtitleGenerator {
     return null;
   }
 
-  /// 分段切片识别（支持长视频进度透明化与随时优雅中断）。
-  Future<List<SubtitleEntry>> transcribeVideoChunked({
+  /// 分段切片识别（支持长视频进度透明化、随时优雅中断、以及中途停止后续跑）。
+  ///
+  /// [isStopRequested] 返回 true 时，会在**当前片段跑完后**停下来并照常返回
+  /// 已识别的部分（不会把半句话截断），调用方可据此先拿去做翻译；
+  /// [startSeconds] 大于 0 表示续跑：跳过之前的片段，只识别该时刻之后的内容，
+  /// 且已识别部分的时间轴保持原样（追加式合并）。
+  Future<ChunkedTranscribeResult> transcribeVideoChunked({
     required String videoPath,
     required String modelId,
     String language = 'auto',
     void Function(AsrState state, Duration processed, Duration total, double percent, String? message)? onProgress,
     void Function(List<SubtitleEntry> newEntries)? onNewEntries,
     bool Function()? isCancelled,
+    bool Function()? isStopRequested,
+    int startSeconds = 0,
   }) async {
     _cancelled = false;
     // 动态归属检测：只有当单例当前确属本次识别的视频时，才允许向单例写入条目或广播状态。
     // 识别流程通常耗时数十秒至数分钟，期间用户随时会切换并播放另一个视频，
     // 因此绝不能用初始布尔快照，必须在每个阶段实时求值。
     bool isCurrentVideo() => isSameVideoPath(_entriesVideoPath, videoPath);
+    // 续跑时保留已识别的部分，只把新片段追加在后面
+    final bool appendMode = startSeconds > 0;
 
     if (_entriesVideoPath == null || isCurrentVideo()) {
-      _entries.clear();
+      if (!appendMode) {
+        _entries.clear();
+      }
       _entriesVideoPath = videoPath;
       _entriesModelId = modelId;
       _updateState(AsrState.preparing, message: '正在准备模型…');
@@ -550,7 +597,9 @@ class SubtitleGenerator {
       throw StateError('模型未就绪，请先导入或下载 Whisper 模型');
     }
 
-    if (isCancelled?.call() == true || _cancelled) return [];
+    if (isCancelled?.call() == true || _cancelled) {
+      return const ChunkedTranscribeResult.empty();
+    }
 
     if (isCurrentVideo()) {
       _updateState(AsrState.preparing, message: '正在提取音频…');
@@ -578,7 +627,7 @@ class SubtitleGenerator {
         if (isCurrentVideo()) {
           _updateState(AsrState.idle, message: '已取消');
         }
-        return [];
+        return const ChunkedTranscribeResult.empty();
       }
       if (isCurrentVideo()) {
         _updateState(AsrState.error, message: '音频提取失败');
@@ -641,7 +690,7 @@ class SubtitleGenerator {
           _updateState(AsrState.idle, message: '已取消');
         }
         onProgress?.call(AsrState.idle, Duration.zero, totalDuration, 0.0, '已取消');
-        return [];
+        return const ChunkedTranscribeResult.empty();
       }
 
       final normalized = normalizeEntries(rawEntries, energyProfile: energyProfile);
@@ -658,7 +707,12 @@ class SubtitleGenerator {
         _updateState(AsrState.completed, percent: 100, message: finalMsg);
       }
       onProgress?.call(AsrState.completed, totalDuration, totalDuration, 1.0, finalMsg);
-      return List.unmodifiable(normalized);
+      // 短音频是整体一次性识别，没法在中间停下，所以永远是"跑完全程"
+      return ChunkedTranscribeResult(
+        entries: List.unmodifiable(normalized),
+        coveredSeconds: totalSeconds,
+        totalSeconds: totalSeconds,
+      );
     }
 
     // 长视频（> 120 秒）：分片时长 60 秒（60 * 32000 = 1,920,000 字节）
@@ -670,10 +724,16 @@ class SubtitleGenerator {
     final tempChunkPath = '${audioDir.path}${Platform.pathSeparator}chunk_${DateTime.now().millisecondsSinceEpoch}.wav';
 
     final rawAccumulated = <SubtitleEntry>[];
+    // 追加模式下本轮新识别的条目（续跑时旧条目由调用方持有）
+    final appendedEntries = <SubtitleEntry>[];
+    // 续跑：从上次覆盖到的时间点继续，前面的片段直接跳过
+    final startIndex = appendMode ? startSeconds ~/ chunkSeconds : 0;
+    var coveredSeconds = appendMode ? startSeconds : 0;
+    var stoppedEarly = false;
     RandomAccessFile? raf;
     try {
       raf = await wavFile.open(mode: FileMode.read);
-      for (int i = 0; i < chunkCount; i++) {
+      for (int i = startIndex; i < chunkCount; i++) {
         if (isCancelled?.call() == true || _cancelled) {
           if (isCurrentVideo()) {
             _updateState(AsrState.idle, message: '已取消');
@@ -733,10 +793,18 @@ class SubtitleGenerator {
         if (chunkEntries.isNotEmpty) {
           final normalizedChunk = normalizeEntries(chunkEntries);
           rawAccumulated.addAll(chunkEntries);
+          appendedEntries.addAll(normalizedChunk);
           if (isCurrentVideo()) {
             _entries.addAll(normalizedChunk);
           }
           onNewEntries?.call(normalizedChunk);
+        }
+
+        // 本片段已完整落库，这里才是安全的停止点：不会把半句话截断在文件里
+        coveredSeconds = min((i + 1) * chunkSeconds, totalSeconds);
+        if (isStopRequested?.call() == true) {
+          stoppedEarly = true;
+          break;
         }
       }
     } finally {
@@ -749,26 +817,54 @@ class SubtitleGenerator {
         _updateState(AsrState.idle, message: '已取消');
       }
       onProgress?.call(AsrState.idle, Duration.zero, totalDuration, 0.0, '已取消');
-      return [];
+      return const ChunkedTranscribeResult.empty();
     }
 
-    // 全量整体再次执行一次平滑校准，确保分段接缝处的时长自然过渡与静音校准
-    final fullyNormalized = normalizeEntries(rawAccumulated, energyProfile: energyProfile);
-    if (isCurrentVideo()) {
-      _entries.clear();
-      _entries.addAll(fullyNormalized);
-      final finalMsg = _entries.isNotEmpty
-          ? '识别完成 (共 ${_entries.length} 条字幕)'
+    // 首次跑完全程：全量整体再平滑校准一次，确保分段接缝处的时长自然过渡
+    if (!appendMode && !stoppedEarly) {
+      final fullyNormalized =
+          normalizeEntries(rawAccumulated, energyProfile: energyProfile);
+      if (isCurrentVideo()) {
+        _entries.clear();
+        _entries.addAll(fullyNormalized);
+        final finalMsg = _entries.isNotEmpty
+            ? '识别完成 (共 ${_entries.length} 条字幕)'
+            : '未检测到有效语音';
+        _updateState(AsrState.completed, percent: 100, message: finalMsg);
+      }
+
+      final finalMsg = fullyNormalized.isNotEmpty
+          ? '识别完成 (共 ${fullyNormalized.length} 条字幕)'
           : '未检测到有效语音';
+      onProgress?.call(
+          AsrState.completed, totalDuration, totalDuration, 1.0, finalMsg);
+
+      return ChunkedTranscribeResult(
+        entries: List.unmodifiable(fullyNormalized),
+        coveredSeconds: totalSeconds,
+        totalSeconds: totalSeconds,
+      );
+    }
+
+    // 提前停止 / 续跑：追加式合并。
+    // 已有段落的时间轴保持原样（这样之前翻译好的条目还能按原文精确复用），
+    // 只把本轮新识别的片段按时间排序后返回，由调用方拼到原字幕后面。
+    appendedEntries.sort((a, b) => a.start.compareTo(b.start));
+    final finalMsg = appendedEntries.isNotEmpty
+        ? '本轮新增 ${appendedEntries.length} 条字幕'
+        : '本轮未检测到有效语音';
+    if (isCurrentVideo()) {
       _updateState(AsrState.completed, percent: 100, message: finalMsg);
     }
+    onProgress?.call(AsrState.completed, Duration(seconds: coveredSeconds),
+        totalDuration, 1.0, finalMsg);
 
-    final finalMsg = fullyNormalized.isNotEmpty
-        ? '识别完成 (共 ${fullyNormalized.length} 条字幕)'
-        : '未检测到有效语音';
-    onProgress?.call(AsrState.completed, totalDuration, totalDuration, 1.0, finalMsg);
-
-    return List.unmodifiable(fullyNormalized);
+    return ChunkedTranscribeResult(
+      entries: List.unmodifiable(appendedEntries),
+      coveredSeconds: coveredSeconds,
+      totalSeconds: totalSeconds,
+      stoppedEarly: stoppedEarly,
+    );
   }
 
   /// 对字幕条目的显示区间进行智能优化：

@@ -547,6 +547,18 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
 
   Future<void> _deleteSubtitlesWithConfirm() async {
     final modelName = _selectedModel.toUpperCase();
+    // 翻译缓存是跟着原字幕一起没的（文件名里带 asr_{模型}），弹窗里必须说清楚，
+    // 否则用户只想重识别一下，结果发现译文也没了
+    final counts = await AiTaskManager.instance.countCachedFiles(
+      _cacheKey,
+      modelId: _selectedModel,
+    );
+    if (!mounted) return;
+    final detail = <String>[
+      '· $modelName 模型识别出的原文字幕（${counts.subtitle} 份）',
+      if (counts.translation > 0)
+        '· 基于这份字幕生成的翻译字幕（${counts.translation} 份，全部目标语言）',
+    ].join('\n');
     final confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -559,13 +571,26 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
             Text('删除字幕缓存', style: TextStyle(fontSize: 16, color: Colors.white)),
           ],
         ),
-        content: Text(
-          '确定要删除当前 $modelName 模型的字幕缓存吗？\n删除后可重新识别原音频。',
-          style: const TextStyle(
-            fontSize: 13,
-            color: Colors.white70,
-            height: 1.5,
-          ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '将删除以下内容：',
+              style: TextStyle(fontSize: 13, color: Colors.white, height: 1.5),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              detail,
+              style: const TextStyle(fontSize: 13, color: Colors.white70, height: 1.6),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              '内置字幕的翻译缓存不受影响。删除后可重新识别原音频，'
+              '翻译需要重新发起。',
+              style: TextStyle(fontSize: 12.5, color: Colors.white54, height: 1.5),
+            ),
+          ],
         ),
         actions: [
           TextButton(
@@ -649,7 +674,12 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         _statusMessage = null;
         _previewExpanded = false;
       });
-      AppToast.show(context, '已成功删除字幕缓存，可重新识别');
+      AppToast.show(
+        context,
+        counts.translation > 0
+            ? '已删除字幕缓存及 ${counts.translation} 份翻译，可重新识别'
+            : '已成功删除字幕缓存，可重新识别',
+      );
     }
   }
 

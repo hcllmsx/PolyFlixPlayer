@@ -10,6 +10,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 
+import '../settings/app_settings.dart';
 import '../utils/native_file_helper.dart';
 import 'model_manager.dart';
 import 'subtitle_generator.dart';
@@ -43,13 +44,68 @@ class AiTask extends ChangeNotifier {
 
   final String id;
   final AiTaskType taskType;
-  final String? targetLanguage;
   final String? sourceType;
-  final String? engineId;
+
+  /// 目标语言（翻译任务）。点「重试」时以当时的设置为准，所以可变。
+  String? targetLanguage;
+
+  /// 实际使用的翻译引擎 id。同样允许重试时按当时的设置替换，所以可变。
+  String? engineId;
 
   /// 若在 ASR 识别过程中预约了翻译，记录目标语言（如 'zh-Hans'）
   String? pendingTranslationLang;
   bool get hasPendingTranslation => pendingTranslationLang != null;
+
+  /// 仅用于翻译任务：本条翻译跑完后，自动续跑这条 id 对应的识别任务。
+  ///
+  /// 即用户点过「翻译已有」的完整流程：先翻已识别的一段，剩下的由程序自动补上，
+  /// 补完再做一次增量翻译，全程不用人盯。
+  String? autoResumeAfterTaskId;
+
+  /// 阶段翻译已完成，正在等待自动续跑剩余部分。
+  bool _autoResumeScheduled = false;
+  bool get autoResumeScheduled => _autoResumeScheduled;
+
+  /// 是否在中途被叫停（点过「翻译已有」）：已识别部分已落盘，剩余部分可续跑。
+  bool _earlyStopped = false;
+  bool get isEarlyStopped => _earlyStopped;
+
+  /// 已识别覆盖到的秒数（续跑起点）。
+  int _coveredSeconds = 0;
+  int get coveredSeconds => _coveredSeconds;
+
+  /// 音频总秒数（用于展示"已识别 47%"）。
+  int _audioTotalSeconds = 0;
+  int get audioTotalSeconds => _audioTotalSeconds;
+
+  /// 是否请求"当前片段跑完后就停下"（点「翻译已有」后由生成器在分片边界响应）。
+  bool _stopRequested = false;
+  bool get stopRequested => _stopRequested;
+
+  /// 点下「翻译已有」的时刻，用来在收尾等待期显示"已等 xx 秒"。
+  DateTime? _stopRequestedAt;
+  Duration get stopRequestedElapsed =>
+      _stopRequestedAt == null ? Duration.zero : DateTime.now().difference(_stopRequestedAt!);
+
+  /// 续跑起点（秒）。0 表示从头识别。
+  int get resumeFromSeconds => _earlyStopped ? _coveredSeconds : 0;
+
+  /// 处于"已停止识别、剩余部分可继续"的状态。
+  bool get canResume =>
+      _earlyStopped &&
+      !isRunning &&
+      !_isCancelled &&
+      _state != AsrState.completed &&
+      _state != AsrState.error;
+
+  /// 翻译记录已被后续翻译覆盖（产物已被同名缓存取代，列表里标灰保留）。
+  bool _superseded = false;
+  bool get isSuperseded => _superseded;
+
+  /// 已识别的百分比（0~1），仅提前停止时有意义。
+  double get coveredRatio => _audioTotalSeconds > 0
+      ? (_coveredSeconds / _audioTotalSeconds).clamp(0.0, 1.0)
+      : 0.0;
 
   /// 提取音频用的地址：本地文件路径，或 PFLX 本次会话的本地流地址。
   final String videoPath;
@@ -63,7 +119,10 @@ class AiTask extends ChangeNotifier {
 
   final String videoTitle;
   final String modelId;
-  final String language;
+  /// 识别语言（ASR 用）；翻译任务这里存的是目标语言，仅用于展示与落盘。
+  ///
+  /// 重试翻译时目标语言可能更换，所以不能是 final。
+  String language;
   final DateTime startTime;
 
   AsrState _state = AsrState.idle;
@@ -83,6 +142,20 @@ class AiTask extends ChangeNotifier {
 
   final List<SubtitleEntry> _entries = [];
   List<SubtitleEntry> get entries => List.unmodifiable(_entries);
+
+  /// 翻译任务专用的"待翻译原文"快照（纯原文，不含译文）。
+  ///
+  /// 留这份是为了「重试」：翻译成功后 `_entries` 装的是译文，原文就没了；失败时
+  /// `_entries` 又是空的。只有留住原文，改好 Key 之后才能原样再跑一遍。
+  /// 与 `_entries` 一样只在内存里，不落盘，重启后从缓存/内置字幕重新取。
+  List<SubtitleEntry> _translationSource = const [];
+  List<SubtitleEntry> get translationSource =>
+      List.unmodifiable(_translationSource);
+
+  /// 记下本次翻译的原文，供失败或取消后「重试」复用。
+  void cacheTranslationSource(List<SubtitleEntry> source) {
+    _translationSource = List.of(source);
+  }
 
   bool _isCancelled = false;
   bool get isCancelled => _isCancelled;
@@ -194,9 +267,113 @@ class AiTask extends ChangeNotifier {
     if (_isCancelled) return;
     _isCancelled = true;
     pendingTranslationLang = null;
+    _autoResumeScheduled = false;
+    _stopRequested = false;
+    _stopRequestedAt = null;
     _state = AsrState.idle;
     _statusMessage = '已取消';
     _endTime ??= DateTime.now();
+    notifyListeners();
+  }
+
+  /// 标记为"阶段翻译已完成，稍后自动续跑剩余识别"（识别任务侧的状态提示）。
+  void markAutoResumeScheduled() {
+    _autoResumeScheduled = true;
+    _statusMessage = '阶段任务已完成，稍后自动开始未完成的任务';
+    notifyListeners();
+  }
+
+  /// 点「翻译已有」：请求在当前片段跑完后停下，随后立刻拿已识别部分去翻译。
+  ///
+  /// 识别是一段一段推进的，中途硬停会丢掉正在处理的那一小段，所以这里不立刻停，
+  /// 而是等当前这段自然跑完再停（最长约一分钟）。等待期要有明确反馈，否则用户
+  /// 会以为按钮没点中。
+  void requestStopForTranslation() {
+    if (_stopRequested) return;
+    _stopRequested = true;
+    _stopRequestedAt = DateTime.now();
+    _statusMessage = '已收到，正在收尾：识别是一段一段跑的，中途打断会丢内容，'
+        '所以等当前这一段跑完就停（最长约 1 分钟），'
+        '然后立刻翻译已识别的 $entryCount 条字幕，剩余部分之后自动继续。';
+    notifyListeners();
+  }
+
+  /// 提前停止完成：记录断点，进入"可继续"状态。
+  void markEarlyStopped({required int coveredSeconds, required int totalSeconds}) {
+    _earlyStopped = true;
+    _stopRequested = false;
+    _stopRequestedAt = null;
+    _autoResumeScheduled = false;
+    _coveredSeconds = coveredSeconds;
+    _audioTotalSeconds = totalSeconds;
+    _state = AsrState.idle;
+    final total = Duration(seconds: totalSeconds);
+    final done = Duration(seconds: coveredSeconds);
+    _statusMessage = '已暂停识别：已识别 ${(coveredRatio * 100).toStringAsFixed(0)}%'
+        '（${AiTask.formatDuration(done)} / ${AiTask.formatDuration(total)}，共 $entryCount 条字幕）。'
+        '剩余部分将在翻译完成后自动继续，也可点「继续识别」立即开始。';
+    _endTime ??= DateTime.now();
+    notifyListeners();
+  }
+
+  /// 准备续跑：清掉终态标记，保留已识别的条目，从断点继续。
+  void prepareResume() {
+    _isCancelled = false;
+    _stopRequested = false;
+    _stopRequestedAt = null;
+    _autoResumeScheduled = false;
+    _state = AsrState.preparing;
+    _endTime = null;
+    _statusMessage = '正在从 ${AiTask.formatDuration(Duration(seconds: _coveredSeconds))} 处继续识别…';
+    notifyListeners();
+  }
+
+  /// 点「重试」：用当前设置（可能刚改过目标语言 / 翻译引擎）覆盖本条翻译任务。
+  void applyTranslationTargets({
+    required String targetLang,
+    String? engine,
+  }) {
+    targetLanguage = targetLang;
+    language = targetLang;
+    if (engine != null) engineId = engine;
+  }
+
+  /// 点「重试」：抹掉上一次的取消 / 中断 / 失败痕迹，回到"进行中"。
+  ///
+  /// 不复用 `prepareResume()`（那是识别续跑专用的，会顺带清覆盖秒数）。
+  void prepareRetry() {
+    _isCancelled = false;
+    _interrupted = false;
+    _errorMessage = null;
+    _percent = 0.0;
+    _completedUnits = 0;
+    _totalUnits = 0;
+    _endTime = null;
+    _state = AsrState.preparing;
+    _statusMessage = '正在重新发起翻译...';
+    notifyListeners();
+  }
+
+  /// 全部音频都已识别完（续跑跑完或首次跑完）：清除断点状态。
+  void markFullyRecognized() {
+    _earlyStopped = false;
+    _stopRequested = false;
+    _coveredSeconds = 0;
+    _audioTotalSeconds = 0;
+  }
+
+  /// 标记为"已被后续翻译取代"（列表里标灰保留，不再代表当前缓存内容）。
+  void markSuperseded() {
+    if (_superseded) return;
+    _superseded = true;
+    notifyListeners();
+  }
+
+  /// 用去重合并后的结果替换内存中的字幕条目（续跑接缝去重时用）。
+  void replaceEntries(List<SubtitleEntry> merged) {
+    _entries
+      ..clear()
+      ..addAll(merged);
     notifyListeners();
   }
 
@@ -227,6 +404,10 @@ class AiTask extends ChangeNotifier {
     'entryCount': entryCount,
     'percent': _percent,
     'cancelled': _isCancelled,
+    'earlyStopped': _earlyStopped,
+    'coveredSeconds': _coveredSeconds,
+    'audioTotalSeconds': _audioTotalSeconds,
+    'superseded': _superseded,
   };
 
   /// 从持久化数据恢复一条历史记录。数据损坏时返回 null（跳过这一条）。
@@ -267,6 +448,10 @@ class AiTask extends ChangeNotifier {
       task._statusMessage = json['statusMessage'] as String?;
       task._errorMessage = json['errorMessage'] as String?;
       task._isCancelled = (json['cancelled'] as bool?) ?? false;
+      task._earlyStopped = (json['earlyStopped'] as bool?) ?? false;
+      task._coveredSeconds = (json['coveredSeconds'] as num?)?.toInt() ?? 0;
+      task._audioTotalSeconds = (json['audioTotalSeconds'] as num?)?.toInt() ?? 0;
+      task._superseded = (json['superseded'] as bool?) ?? false;
       final stateName = json['state'] as String?;
       task._state = AsrState.values.firstWhere(
         (s) => s.name == stateName,
@@ -536,6 +721,10 @@ class AiTaskManager extends ChangeNotifier {
   }
 
   /// 启动字幕翻译任务（在全局后台执行，即使切换页面或返回首页也不中断）。
+  ///
+  /// [incremental] 为 true 时做增量翻译：先读回已有的译文缓存，原文相同的条目
+  /// 直接复用旧译文，只把新增的条目送去翻译引擎，最后整体覆盖回同一个缓存文件。
+  /// [supersedeExisting] 为 true 时，把同来源同语言的旧翻译记录标灰（产物已被覆盖）。
   Future<AiTask> startTranslationTask({
     required String videoPath,
     required String videoTitle,
@@ -544,6 +733,8 @@ class AiTaskManager extends ChangeNotifier {
     String? cacheKey,
     List<SubtitleEntry>? rawEntries,
     int? builtinTrackIndex,
+    bool incremental = false,
+    bool supersedeExisting = false,
   }) async {
     final existing = getTranslationTask(videoPath, sourceType: sourceType);
     if (existing != null && existing.isRunning) return existing;
@@ -565,20 +756,127 @@ class AiTaskManager extends ChangeNotifier {
       engineId: engine.id,
     );
 
+    if (supersedeExisting) {
+      for (final old in _tasks) {
+        if (old.taskType != AiTaskType.translation) continue;
+        if (old.sourceType != task.sourceType) continue;
+        if (old.targetLanguage != task.targetLanguage) continue;
+        if (!_isSamePath(old.videoPath, videoPath) &&
+            !_isSamePath(old.cacheKey, videoPath)) {
+          continue;
+        }
+        old.markSuperseded();
+      }
+    }
+
     _addTask(task);
 
     _runTranslationTask(
       task: task,
       rawEntries: rawEntries,
       builtinTrackIndex: builtinTrackIndex,
+      incremental: incremental,
     );
     return task;
+  }
+
+  /// 重试一条失败 / 被取消的翻译任务。
+  ///
+  /// 典型场景：翻译服务的 Key 填错 → 任务报失败 → 去设置页改好 Key，顺手换个目标
+  /// 语言 → 回到任务列表点「重试」。所以这里刻意**重新读一次当前设置**：目标语言
+  /// 和翻译引擎都以"点重试那一刻"的值为准，而不是沿用上次失败时的旧值。
+  ///
+  /// 重试用的还是同一批原文字幕（任务自己记着），已经翻好的条目按原文复用，
+  /// 不会重复消耗翻译额度。
+  ///
+  /// 引擎未配置、或原文已经找不回来时抛 [TranslationException]。
+  Future<AiTask> retryTranslationTask(AiTask task) async {
+    if (task.taskType != AiTaskType.translation) {
+      throw const TranslationException('只有翻译任务支持重试');
+    }
+    if (task.isRunning) return task;
+
+    final engine = TranslationService.instance.getActiveEngine();
+    if (!engine.isConfigured) {
+      throw TranslationException(
+          engine.configurationError ?? '未配置翻译服务凭据');
+    }
+
+    var entries = task.translationSource;
+    if (entries.isEmpty) {
+      // 应用重启过：内存里的原文快照没了，按来源把它找回来
+      try {
+        entries = await _resolveTranslationSource(task);
+      } catch (_) {
+        entries = const <SubtitleEntry>[];
+      }
+    }
+    if (entries.isEmpty) {
+      throw const TranslationException(
+          '找不到原字幕（缓存已被删除或视频不在了），请重新识别后再翻译');
+    }
+
+    final oldLang = task.targetLanguage;
+    final newLang = aiTranslationTargetLang.value;
+    task.applyTranslationTargets(targetLang: newLang, engine: engine.id);
+
+    // 「翻译已有」的闭环：预约语言也得跟着改，否则后续那段会被翻回旧语言
+    final resumeId = task.autoResumeAfterTaskId;
+    if (resumeId != null) {
+      for (final t in _tasks) {
+        if (t.id == resumeId) {
+          t.pendingTranslationLang = newLang;
+          break;
+        }
+      }
+    }
+
+    task.prepareRetry();
+    notifyListeners();
+
+    final langName = TranslationLanguage.findByCode(newLang).name;
+    if (oldLang != null && oldLang != newLang) {
+      final oldName = TranslationLanguage.findByCode(oldLang).name;
+      onInfo?.call(
+        '已改用新设置重试翻译：$oldName → $langName',
+        duration: const Duration(seconds: 6),
+      );
+    } else {
+      onInfo?.call('已重新发起翻译（目标语言：$langName）');
+    }
+
+    _runTranslationTask(
+      task: task,
+      rawEntries: entries,
+      incremental: true,
+    );
+    return task;
+  }
+
+  /// 重试时把原字幕找回来：识别字幕读缓存，内置字幕重新从视频里提取。
+  Future<List<SubtitleEntry>> _resolveTranslationSource(AiTask task) async {
+    final src = task.sourceType ?? '';
+    if (src.startsWith('builtin_')) {
+      final idx = int.tryParse(src.substring('builtin_'.length));
+      if (idx == null) return const <SubtitleEntry>[];
+      return BuiltInSubtitleExtractor.extractSubtitles(
+        videoPath: task.videoPath,
+        subtitleIndex: idx,
+      );
+    }
+    if (src.startsWith('asr_')) {
+      final modelId = src.substring('asr_'.length);
+      return (await loadCachedSubtitles(task.cacheKey, modelId: modelId)) ??
+          const <SubtitleEntry>[];
+    }
+    return const <SubtitleEntry>[];
   }
 
   Future<void> _runTranslationTask({
     required AiTask task,
     List<SubtitleEntry>? rawEntries,
     int? builtinTrackIndex,
+    bool incremental = false,
   }) async {
     final targetLang = task.targetLanguage ?? 'zh-Hans';
     final langName = TranslationLanguage.findByCode(targetLang).name;
@@ -616,30 +914,79 @@ class AiTaskManager extends ChangeNotifier {
       if (entries.isEmpty) {
         throw const TranslationException('待翻译字幕内容为空');
       }
+      // 留住纯原文，失败 / 取消后「重试」要用（此刻 entries 已剥离过译文）
+      task.cacheTranslationSource(entries);
+
+      // 增量翻译：读回已有译文缓存，原文相同的条目直接复用，只把新增的送去翻译
+      final reuseMap = <String, String>{};
+      if (incremental) {
+        final cached = await TranslationService.instance.loadTranslationCache(
+          sourceKey: task.cacheKey,
+          sourceType: task.sourceType ?? 'unknown',
+          targetLang: targetLang,
+          engineId:
+              task.engineId ?? TranslationService.instance.getActiveEngine().id,
+        );
+        for (final e in cached ?? const <SubtitleEntry>[]) {
+          final t = e.translatedText;
+          if (t == null || t.isEmpty) continue;
+          reuseMap.putIfAbsent(_normalizeForMatch(e.text), () => t);
+        }
+      }
+
+      final pending = reuseMap.isEmpty
+          ? entries
+          : entries
+              .where((e) => !reuseMap.containsKey(_normalizeForMatch(e.text)))
+              .toList();
+      final reusedCount = entries.length - pending.length;
 
       task.updateState(
         AsrState.processing,
-        message: '正在翻译为 $langName (0/${entries.length})...',
+        message: reusedCount > 0
+            ? '正在翻译为 $langName (复用已译 $reusedCount 条，待翻 ${pending.length} 条)...'
+            : '正在翻译为 $langName (0/${entries.length})...',
       );
-      task.updateTranslationProgress(0, entries.length);
+      task.updateTranslationProgress(0, pending.length);
 
-      final translatedEntries = await TranslationService.instance.translateEntries(
-        entries: entries,
-        targetLanguage: targetLang,
-        contextTitle: task.videoTitle,
-        onProgress: (cur, total) {
-          if (!task.isCancelled) {
-            task.updateTranslationProgress(
-              cur,
-              total,
-              message: '正在翻译为 $langName ($cur/$total)...',
+      final fresh = pending.isEmpty
+          ? const <SubtitleEntry>[]
+          : await TranslationService.instance.translateEntries(
+              entries: pending,
+              targetLanguage: targetLang,
+              contextTitle: task.videoTitle,
+              onProgress: (cur, total) {
+                if (!task.isCancelled) {
+                  task.updateTranslationProgress(
+                    cur,
+                    total,
+                    message: '正在翻译为 $langName ($cur/$total)...',
+                  );
+                }
+              },
+              isCancelled: () => task.isCancelled,
             );
-          }
-        },
-        isCancelled: () => task.isCancelled,
-      );
 
       if (task.isCancelled) return;
+
+      // 按顺序回填：复用的走 reuseMap，新翻的按顺序取（translateEntries 保持输入顺序）
+      final translatedEntries = <SubtitleEntry>[];
+      var freshIndex = 0;
+      for (final e in entries) {
+        final reused = reuseMap[_normalizeForMatch(e.text)];
+        String? translated;
+        if (reused != null) {
+          translated = reused;
+        } else if (freshIndex < fresh.length) {
+          translated = fresh[freshIndex++].translatedText;
+        }
+        translatedEntries.add(SubtitleEntry(
+          start: e.start,
+          end: e.end,
+          text: e.text,
+          translatedText: translated,
+        ));
+      }
 
       // 持久化翻译结果到磁盘缓存
       await TranslationService.instance.saveTranslationCache(
@@ -665,19 +1012,59 @@ class AiTaskManager extends ChangeNotifier {
       task.updateState(
         AsrState.completed,
         percent: 1.0,
-        message: '已成功翻译为 $langName (共 ${translatedEntries.length} 条)',
+        message: reusedCount > 0
+            ? '已成功翻译为 $langName (共 ${translatedEntries.length} 条，其中复用已译 $reusedCount 条)'
+            : '已成功翻译为 $langName (共 ${translatedEntries.length} 条)',
       );
+
+      // 阶段翻译完成：自动把剩下的识别续跑起来，跑完再做一次增量翻译
+      final resumeId = task.autoResumeAfterTaskId;
+      if (resumeId != null) {
+        task.autoResumeAfterTaskId = null;
+        try {
+          await _scheduleAutoResume(resumeId);
+        } catch (_) {
+          // 续跑拉不起来不该把已经成功的翻译打成错误态
+        }
+      }
     } catch (e) {
       if (!task.isCancelled) {
         task.updateState(
           AsrState.error,
           errorMessage: e.toString(),
-          message: '翻译失败: $e',
+          message: _translationFailureMessage(e),
         );
       }
     } finally {
       notifyListeners();
     }
+  }
+
+  /// 翻译失败的展示文案。
+  ///
+  /// 纯粹的报错原文用户看不懂也不知道接下来干嘛，所以凭据类问题（Key 没填、
+  /// 填错、过期、额度用尽）直接告诉他去哪儿改 + 改完点「重试」就行。
+  /// [errorMessage] 里仍保留原始异常，方便排查。
+  String _translationFailureMessage(Object e) {
+    final raw = e.toString();
+    const credentialHints = [
+      '未配置',
+      '凭据',
+      'Key',
+      '401',
+      '403',
+      '54003', // 百度：访问频率受限 / 鉴权失败
+      '52003', // 百度：未授权用户或无效参数
+      'Auth',
+      'auth',
+    ];
+    for (final hint in credentialHints) {
+      if (raw.contains(hint)) {
+        return '翻译失败: $e\n翻译服务的 Key 可能没填或不对：'
+            '到「设置 → 翻译服务」改好后，点这条任务的「重试」即可';
+      }
+    }
+    return '翻译失败: $e';
   }
 
   /// 取消指定视频的任务（兼容 ASR 与翻译任务）。
@@ -729,9 +1116,14 @@ class AiTaskManager extends ChangeNotifier {
   }
 
   /// 后台驱动切片识别流水线。
+  ///
+  /// 两种收尾：
+  ///  - 跑完全程（[ChunkedTranscribeResult.stoppedEarly] 为 false）；
+  ///  - 被「翻译已有」在分片边界叫停（为 true）：已识别部分照常落盘并立刻送去翻译，
+  ///    任务转为"可继续"状态，之后可从断点把剩余部分补上。
   Future<void> _runTask(AiTask task) async {
     try {
-      await SubtitleGenerator.instance.transcribeVideoChunked(
+      final result = await SubtitleGenerator.instance.transcribeVideoChunked(
         videoPath: task.videoPath,
         modelId: task.modelId,
         language: task.language,
@@ -750,42 +1142,19 @@ class AiTaskManager extends ChangeNotifier {
           notifyListeners();
         },
         isCancelled: () => task.isCancelled,
+        isStopRequested: () => task.stopRequested,
+        startSeconds: task.resumeFromSeconds,
       );
 
       if (task.isCancelled) {
         task.updateState(AsrState.idle, message: '任务已取消');
       } else if (task.state == AsrState.error) {
         // 内部已置为错误，保持错误状态，避免被识别完成覆盖
+      } else if (result.stoppedEarly &&
+          result.coveredSeconds < result.totalSeconds) {
+        await _stopEarlyAndTranslate(task, result);
       } else {
-        task.updateState(
-          AsrState.completed,
-          percent: 1.0,
-          message: '识别完成 (共 ${task.entries.length} 条字幕)',
-        );
-        // 保存字幕缓存（按模型区分，仅写高效 JSON 缓存，不自动生成冗余 srt）
-        // 用 cacheKey 而不是 videoPath：PFLX 的播放地址带随机端口，不能当身份
-        await saveCachedSubtitles(
-          task.cacheKey,
-          task.entries,
-          modelId: task.modelId,
-        );
-
-        // 检查是否有预约翻译：若有且任务未取消，在全量 ASR 识别落盘后自动无缝触发全量翻译
-        if (task.pendingTranslationLang != null &&
-            !task.isCancelled &&
-            task.entries.isNotEmpty) {
-          final targetLang = task.pendingTranslationLang!;
-          task.pendingTranslationLang = null;
-          // 异步拉起全量翻译任务
-          startTranslationTask(
-            videoPath: task.videoPath,
-            videoTitle: task.videoTitle,
-            targetLang: targetLang,
-            sourceType: 'asr_${task.modelId}',
-            cacheKey: task.cacheKey,
-            rawEntries: task.entries,
-          );
-        }
+        await _finishRecognition(task);
       }
     } catch (e) {
       final errorMsg = e is StateError ? e.message : e.toString();
@@ -797,6 +1166,246 @@ class AiTaskManager extends ChangeNotifier {
     } finally {
       notifyListeners();
     }
+  }
+
+  /// 提前停止收尾：保存已识别部分 → 落盘断点 → 立刻拿已识别的部分去翻译。
+  ///
+  /// 写的是**同一个**字幕缓存文件（不加后缀），续跑完成后再覆盖一次，
+  /// 所以整个视频始终只有一份字幕、一份译文，字幕管理也只需删一次。
+  Future<void> _stopEarlyAndTranslate(
+    AiTask task,
+    ChunkedTranscribeResult result,
+  ) async {
+    task.markEarlyStopped(
+      coveredSeconds: result.coveredSeconds,
+      totalSeconds: result.totalSeconds,
+    );
+    await saveCachedSubtitles(task.cacheKey, task.entries, modelId: task.modelId);
+    await _saveAsrProgress(task);
+
+    // 沿用已预约的语言；没预约过就用设置里的默认目标语言。
+    // 这里**不清空**预约：续跑跑完剩余部分后，还要靠它自动拉起增量翻译。
+    final targetLang = task.pendingTranslationLang ?? aiTranslationTargetLang.value;
+    task.pendingTranslationLang = targetLang;
+
+    if (task.entries.isNotEmpty) {
+      try {
+        // 记下"这条翻译跑完就自动续跑本任务"，形成
+        // 识别一段 → 翻译一段 → 自动续跑 → 增量翻译 的完整闭环
+        final translationTask = await startTranslationTask(
+          videoPath: task.videoPath,
+          videoTitle: task.videoTitle,
+          targetLang: targetLang,
+          sourceType: 'asr_${task.modelId}',
+          cacheKey: task.cacheKey,
+          rawEntries: task.entries,
+          supersedeExisting: true,
+        );
+        translationTask.autoResumeAfterTaskId = task.id;
+      } catch (_) {
+        // 翻译拉不起来（几率极低：引擎配置在按钮点击时已校验过）
+        // 不该把"已停止识别"的任务打成错误态，用户仍可手动续跑
+      }
+    }
+    notifyListeners();
+  }
+
+  /// 识别跑完全程的收尾：落盘 + 触发（增量）翻译。
+  Future<void> _finishRecognition(AiTask task) async {
+    final wasResumed = task.isEarlyStopped;
+    if (wasResumed) {
+      // 续跑：追加式合并，接缝处去掉重复的那一条
+      final merged = mergeWithSeamDedupe(task.entries);
+      if (merged.length != task.entries.length) {
+        task.replaceEntries(merged);
+      }
+    }
+    task.markFullyRecognized();
+    await _clearAsrProgress(task);
+
+    task.updateState(
+      AsrState.completed,
+      percent: 1.0,
+      message: '识别完成 (共 ${task.entries.length} 条字幕)',
+    );
+    // 保存字幕缓存（按模型区分，仅写高效 JSON 缓存，不自动生成冗余 srt）
+    // 用 cacheKey 而不是 videoPath：PFLX 的播放地址带随机端口，不能当身份
+    await saveCachedSubtitles(task.cacheKey, task.entries, modelId: task.modelId);
+
+    // 检查是否有预约翻译：若有且任务未取消，在全量 ASR 识别落盘后自动无缝触发翻译
+    if (task.pendingTranslationLang != null &&
+        !task.isCancelled &&
+        task.entries.isNotEmpty) {
+      final targetLang = task.pendingTranslationLang!;
+      task.pendingTranslationLang = null;
+      // 续跑完成的走增量翻译：已译过的条目按原文复用，只翻新增部分
+      startTranslationTask(
+        videoPath: task.videoPath,
+        videoTitle: task.videoTitle,
+        targetLang: targetLang,
+        sourceType: 'asr_${task.modelId}',
+        cacheKey: task.cacheKey,
+        rawEntries: task.entries,
+        incremental: wasResumed,
+        supersedeExisting: wasResumed,
+      );
+    }
+  }
+
+  /// 需要弹给用户的提示（如"阶段任务已完成，稍后自动开始未完成的任务"）。
+  ///
+  /// 任务是在后台跑的，跑到哪一步用户不一定盯着任务列表，所以既写进任务状态，
+  /// 也允许 UI 层注册这里弹一条浮层提示；[duration] 用于让长提示多留一会儿。
+  void Function(String message, {Duration? duration})? onInfo;
+
+  /// 让正在运行的识别任务在当前片段跑完后停下，并立刻用已识别的部分发起翻译。
+  ///
+  /// 翻译服务未配置时抛 [TranslationException]，由调用方提示用户。
+  /// 短音频（≤120 秒）是整体一次性识别，中途停不下来，UI 层不会给出该按钮。
+  void requestTranslateExisting(AiTask task) {
+    if (task.taskType != AiTaskType.transcription || !task.isRunning) return;
+    final engine = TranslationService.instance.getActiveEngine();
+    if (!engine.isConfigured) {
+      throw TranslationException(engine.configurationError ?? '未配置翻译服务凭据');
+    }
+    task.requestStopForTranslation();
+    // 收尾最长要等约一分钟，这里必须立刻给反馈，否则像没点中
+    onInfo?.call(
+      '已收到：识别是一段一段跑的，等当前这一段跑完就停（最长约 1 分钟），'
+      '然后立刻翻译已识别的 ${task.entryCount} 条字幕，剩余部分之后自动继续。',
+      duration: const Duration(seconds: 8),
+    );
+    notifyListeners();
+  }
+
+  /// 阶段翻译完成后自动续跑剩余识别。
+  ///
+  /// 先给识别任务挂上"稍后自动开始"的提示并弹一条浮层，留几秒缓冲：
+  /// 一是让用户看清提示，二是等翻译的收尾 I/O 落盘，三是这段时间内用户
+  /// 想立即开始可以直接点「继续识别」（点过就不会重复启动）。
+  Future<void> _scheduleAutoResume(String asrTaskId) async {
+    AiTask? asrTask;
+    for (final t in _tasks) {
+      if (t.id == asrTaskId) {
+        asrTask = t;
+        break;
+      }
+    }
+    if (asrTask == null || !asrTask.canResume) return;
+
+    asrTask.markAutoResumeScheduled();
+    notifyListeners();
+    onInfo?.call(
+      '阶段任务已完成，稍后自动开始未完成的任务',
+      duration: const Duration(seconds: 8),
+    );
+
+    await Future.delayed(const Duration(seconds: 5));
+    // 期间用户可能手动点了「继续识别」或取消了，这里再确认一次
+    if (!asrTask.canResume) return;
+    await resumeTask(asrTask);
+  }
+
+  /// 续跑：从上次停止的时间点把剩余部分识别完。
+  ///
+  /// 完成后会做接缝去重并覆盖同一个字幕缓存；若该任务预约过翻译，
+  /// 则只翻译新增的条目（已译过的按原文复用）。
+  Future<AiTask?> resumeTask(AiTask task) async {
+    if (!task.canResume) return null;
+    // 应用重启后内存里的条目已丢失（历史记录只存条数），
+    // 这里先把缓存里的前半段读回来，否则续跑会把前半段覆盖掉。
+    if (task.entries.isEmpty) {
+      final cached =
+          await loadCachedSubtitles(task.cacheKey, modelId: task.modelId);
+      if (cached != null && cached.isNotEmpty) {
+        task.addEntries(cached);
+      }
+    }
+    task.prepareResume();
+    notifyListeners();
+    _runTask(task);
+    return task;
+  }
+
+  /// 断点进度文件：与主字幕缓存同名 + `.progress.json`，
+  /// 清理字幕缓存时会被一并删掉（deleteCachedSubtitles 按前缀匹配 .json）。
+  File _progressFile(AiTask task) {
+    final dir = NativeFileHelper.desktopSubtitleCacheDir();
+    final cleanName = _extractCleanBaseName(task.cacheKey);
+    final fingerprint = _getVideoFingerprint(task.cacheKey);
+    final mId = task.modelId.isEmpty ? 'default' : task.modelId.toLowerCase();
+    return File(
+      '${dir.path}${Platform.pathSeparator}${cleanName}_${mId}_$fingerprint.progress.json',
+    );
+  }
+
+  Future<void> _saveAsrProgress(AiTask task) async {
+    try {
+      final dir = NativeFileHelper.desktopSubtitleCacheDir();
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      await _progressFile(task).writeAsString(jsonEncode({
+        'coveredSeconds': task.coveredSeconds,
+        'totalSeconds': task.audioTotalSeconds,
+        'modelId': task.modelId,
+        'updatedAt': DateTime.now().toIso8601String(),
+      }));
+    } catch (_) {}
+  }
+
+  Future<void> _clearAsrProgress(AiTask task) async {
+    try {
+      final file = _progressFile(task);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+
+  /// 追加式合并的接缝去重：删掉跨批次重复的那一条。
+  ///
+  /// 续跑时新片段的开头可能与上一段的结尾是同一句话（Whisper 的分片边界句），
+  /// 时间上重叠且文本高度相似时保留更早那条（上下文更完整）。
+  static List<SubtitleEntry> mergeWithSeamDedupe(List<SubtitleEntry> source) {
+    final sorted = [...source]..sort((a, b) => a.start.compareTo(b.start));
+    final out = <SubtitleEntry>[];
+    for (final e in sorted) {
+      if (out.isNotEmpty && _isSeamDuplicate(out.last, e)) continue;
+      out.add(e);
+    }
+    return out;
+  }
+
+  static bool _isSeamDuplicate(SubtitleEntry prev, SubtitleEntry next) {
+    final a = _normalizeForMatch(prev.text);
+    final b = _normalizeForMatch(next.text);
+    if (a.isEmpty || b.isEmpty) return false;
+    if (a == b) return true;
+    // 时间不重叠：视为两句不同的话，不处理
+    if (next.start >= prev.end) return false;
+    return _textSimilarity(a, b) >= 0.7;
+  }
+
+  /// 归一化文本，用于"原文是否相同"的匹配（忽略标点与空白差异）。
+  static String _normalizeForMatch(String text) =>
+      text.replaceAll(RegExp(r'[\s，。！？、,.!?;；:："“”‘’\)\(]'), '');
+
+  /// 简易文本相似度（字符二元组 Dice 系数），用于判断接缝重复。
+  static double _textSimilarity(String a, String b) {
+    if (a == b) return 1.0;
+    if (a.length < 2 || b.length < 2) return 0.0;
+    final gramsA = <String, int>{};
+    for (int i = 0; i < a.length - 1; i++) {
+      final g = a.substring(i, i + 2);
+      gramsA[g] = (gramsA[g] ?? 0) + 1;
+    }
+    var hits = 0;
+    for (int i = 0; i < b.length - 1; i++) {
+      final g = b.substring(i, i + 2);
+      final n = gramsA[g] ?? 0;
+      if (n > 0) {
+        gramsA[g] = n - 1;
+        hits++;
+      }
+    }
+    return (2 * hits) / ((a.length - 1) + (b.length - 1));
   }
 
   /// 提取易读且安全的文件名（过滤非法字符并控制长度）。
@@ -982,6 +1591,99 @@ class AiTaskManager extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// 缓存文件归属判定结果：不属于本视频 / 主字幕缓存 / 翻译缓存。
+  static const int _cacheKindNone = 0;
+  static const int _cacheKindSubtitle = 1;
+  static const int _cacheKindTranslation = 2;
+
+  /// 判定一个缓存文件名是否属于待清理目标（与 [deleteCachedSubtitles] 同一套规则）。
+  ///
+  /// 抽出来是为了让"删除"与"删除前统计数量"共用规则，避免两处各写一份、
+  /// 久而久之对不上（弹窗报 2 份、实际删 3 份这种）。
+  static int _classifyCacheFile(
+    String name, {
+    required String cleanName,
+    required String fingerprint,
+    required String pathHash6,
+    required String oldHash16,
+    String? mId,
+  }) {
+    if (mId != null) {
+      // 指定模型的主字幕缓存
+      // 规则 A: 包含同指纹+同模型: _${mId}_${fingerprint}.json
+      // 规则 B: 包含同短哈希+同模型: _${mId}_${pathHash6}.json
+      // 规则 C: 包含 cleanName+同模型: ${cleanName}_${mId}_
+      if (name.contains('_${mId}_$fingerprint.json') ||
+          name.contains('_${mId}_$pathHash6.json') ||
+          (name.startsWith('${cleanName}_${mId}_') && name.endsWith('.json'))) {
+        return _cacheKindSubtitle;
+      }
+      // 该模型识别字幕衍生出的翻译缓存: trans_*_asr_${mId}_*.json
+      if (name.startsWith('trans_') &&
+          name.contains('_asr_${mId}_') &&
+          (name.contains(cleanName) || name.contains(fingerprint))) {
+        return _cacheKindTranslation;
+      }
+      return _cacheKindNone;
+    }
+
+    // 未指定模型：该视频所有模型的缓存与翻译缓存
+    if (name.contains('_$fingerprint.json') ||
+        name.contains('_$pathHash6.json') ||
+        name.startsWith('${cleanName}_') ||
+        name == 'sub_$oldHash16.json') {
+      return _cacheKindSubtitle;
+    }
+    if (name.startsWith('trans_') &&
+        (name.contains(cleanName) || name.contains(fingerprint))) {
+      return _cacheKindTranslation;
+    }
+    return _cacheKindNone;
+  }
+
+  /// 统计"删除字幕缓存"会波及的文件数：主字幕缓存 [subtitle] 份、翻译缓存
+  /// [translation] 份。供确认弹窗把话说清楚（翻译是跟着原字幕一起没的）。
+  Future<({int subtitle, int translation})> countCachedFiles(
+    String videoPath, {
+    String? modelId,
+  }) async {
+    var subtitle = 0;
+    var translation = 0;
+    try {
+      final dir = NativeFileHelper.desktopSubtitleCacheDir();
+      if (!dir.existsSync()) return (subtitle: subtitle, translation: translation);
+
+      final cleanName = _extractCleanBaseName(videoPath);
+      final fingerprint = _getVideoFingerprint(videoPath);
+      final pathHash6 = md5.convert(utf8.encode(videoPath)).toString().substring(0, 6);
+      final oldHash16 = md5.convert(utf8.encode(videoPath)).toString().substring(0, 16);
+      final mId = (modelId != null && modelId.isNotEmpty)
+          ? modelId.toLowerCase()
+          : null;
+
+      for (final item in dir.listSync()) {
+        if (item is! File || !item.path.endsWith('.json')) continue;
+        final name = item.uri.pathSegments.last;
+        switch (_classifyCacheFile(
+          name,
+          cleanName: cleanName,
+          fingerprint: fingerprint,
+          pathHash6: pathHash6,
+          oldHash16: oldHash16,
+          mId: mId,
+        )) {
+          case _cacheKindSubtitle:
+            subtitle++;
+          case _cacheKindTranslation:
+            translation++;
+          default:
+            break;
+        }
+      }
+    } catch (_) {}
+    return (subtitle: subtitle, translation: translation);
+  }
+
   /// 删除指定视频的本地字幕缓存文件（全量扫盘清理主缓存与关联翻译缓存）。
   ///
   /// - 若提供 [modelId]，删除该模型下的主缓存与关联翻译缓存；
@@ -1015,45 +1717,20 @@ class AiTaskManager extends ChangeNotifier {
         if (item is! File || !item.path.endsWith('.json')) continue;
         final name = item.uri.pathSegments.last;
 
-        bool shouldDelete = false;
+        final kind = _classifyCacheFile(
+          name,
+          cleanName: cleanName,
+          fingerprint: fingerprint,
+          pathHash6: pathHash6,
+          oldHash16: oldHash16,
+          mId: mId,
+        );
+        if (kind == _cacheKindNone) continue;
 
-        if (mId != null) {
-          // 1. 指定模型的主字幕缓存
-          // 规则 A: 包含同指纹+同模型: _${mId}_${fingerprint}.json
-          // 规则 B: 包含同短哈希+同模型: _${mId}_${pathHash6}.json
-          // 规则 C: 包含 cleanName+同模型: ${cleanName}_${mId}_
-          if (name.contains('_${mId}_$fingerprint.json') ||
-              name.contains('_${mId}_$pathHash6.json') ||
-              (name.startsWith('${cleanName}_${mId}_') && name.endsWith('.json'))) {
-            shouldDelete = true;
-          }
-
-          // 2. 指定模型的 ASR 翻译缓存: trans_*_asr_${mId}_*.json
-          if (name.startsWith('trans_') && name.contains('_asr_${mId}_')) {
-            if (name.contains(cleanName) || name.contains(fingerprint)) {
-              shouldDelete = true;
-            }
-          }
-        } else {
-          // 未指定模型：清空当前视频所有模型的缓存与翻译缓存
-          if (name.contains('_$fingerprint.json') ||
-              name.contains('_$pathHash6.json') ||
-              name.startsWith('${cleanName}_') ||
-              name == 'sub_$oldHash16.json') {
-            shouldDelete = true;
-          }
-          if (name.startsWith('trans_') &&
-              (name.contains(cleanName) || name.contains(fingerprint))) {
-            shouldDelete = true;
-          }
-        }
-
-        if (shouldDelete) {
-          try {
-            await item.delete();
-            deletedCount++;
-          } catch (_) {}
-        }
+        try {
+          await item.delete();
+          deletedCount++;
+        } catch (_) {}
       }
     } catch (_) {}
     return deletedCount;

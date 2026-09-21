@@ -20,6 +20,7 @@ import '../settings/settings_page.dart';
 import '../settings/update_service.dart';
 import '../subtitle/ai_task_manager.dart';
 import '../utils/app_snack_bar.dart';
+import '../utils/app_toast.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'ai_task_panel.dart';
@@ -100,6 +101,8 @@ class _HomePageState extends State<HomePage> {
     _loadSavedLibrary();
     // "任务列表"选项卡由 AI 字幕总开关控制，设置里改动后首页要立刻同步
     aiSubtitleEnabled.addListener(_onAiSubtitleSettingChanged);
+    // 后台任务的阶段性提示（如"阶段任务已完成，稍后自动开始未完成的任务"）
+    AiTaskManager.instance.onInfo = _showTaskInfo;
     WidgetsBinding.instance.addPostFrameCallback((_) => _silentCheckUpdate());
   }
 
@@ -107,9 +110,18 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() {});
   }
 
+  /// 弹一条后台任务的提示（浮层，弹窗/播放页之上也能看到）。
+  void _showTaskInfo(String message, {Duration? duration}) {
+    if (!mounted) return;
+    AppToast.show(context, message, duration: duration);
+  }
+
   @override
   void dispose() {
     aiSubtitleEnabled.removeListener(_onAiSubtitleSettingChanged);
+    if (AiTaskManager.instance.onInfo == _showTaskInfo) {
+      AiTaskManager.instance.onInfo = null;
+    }
     super.dispose();
   }
 

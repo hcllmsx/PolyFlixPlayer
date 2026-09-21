@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 
 import '../subtitle/ai_task_manager.dart';
 import '../subtitle/subtitle_generator.dart';
+import '../utils/app_toast.dart';
 
 /// 任务列表面板（首页「任务列表」选项卡的内容）。
 class AiTaskPanel extends StatefulWidget {
@@ -211,6 +212,24 @@ class _AiTaskTile extends StatelessWidget {
         Icons.cancel_outlined,
         '已取消',
       ),
+      // 点过「翻译已有」：正在等当前这一段跑完就停（带等待秒数，免得像卡住了）
+      _ when task.stopRequested && running => (
+        Colors.amber.shade700,
+        Icons.hourglass_top_rounded,
+        '收尾中 · 已等 ${task.stopRequestedElapsed.inSeconds}s',
+      ),
+      // 阶段翻译已完成，正在等自动续跑剩余部分
+      _ when task.autoResumeScheduled => (
+        Colors.amber.shade700,
+        Icons.hourglass_bottom_rounded,
+        '待自动继续',
+      ),
+      // 点过「翻译已有」：识别停在断点上，剩余部分可以续跑
+      _ when task.canResume => (
+        Colors.amber.shade700,
+        Icons.pause_circle_outline_rounded,
+        '已暂停识别',
+      ),
       _ when task.state == AsrState.completed => (
         Colors.green,
         Icons.check_circle_rounded,
@@ -228,7 +247,7 @@ class _AiTaskTile extends StatelessWidget {
       ),
     };
 
-    return Container(
+    final card = Container(
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
       decoration: BoxDecoration(
         color: scheme.surfaceContainerHighest.withValues(alpha: .35),
@@ -242,25 +261,33 @@ class _AiTaskTile extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          // 状态标签可能同时挤着好几个（待自动继续 + 已预约翻译 + 模型名…），
+          // 小屏一行放不下会横向溢出，所以用 Wrap：放不下自动换到下一行。
+          Wrap(
+            spacing: 6,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              Icon(stateIcon, size: 16, color: stateColor),
-              const SizedBox(width: 6),
-              Text(
-                stateLabel,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: stateColor,
-                ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(stateIcon, size: 16, color: stateColor),
+                  const SizedBox(width: 6),
+                  Text(
+                    stateLabel,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: stateColor,
+                    ),
+                  ),
+                ],
               ),
-              const Spacer(),
-              if (task.hasPendingTranslation) ...[
+              if (task.hasPendingTranslation)
                 Builder(
                   builder: (context) {
                     final isDark = Theme.of(context).brightness == Brightness.dark;
                     return Container(
-                      margin: const EdgeInsets.only(right: 6),
                       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
                       decoration: BoxDecoration(
                         color: isDark
@@ -285,22 +312,52 @@ class _AiTaskTile extends StatelessWidget {
                     );
                   },
                 ),
-              ],
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: isTranslation
-                      ? Colors.deepPurple.withValues(alpha: .2)
-                      : scheme.primary.withValues(alpha: .14),
-                  borderRadius: BorderRadius.circular(4),
+              if (task.autoResumeScheduled)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                  decoration: BoxDecoration(
+                    color: Colors.amber.withValues(alpha: .18),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    '稍后自动继续',
+                    style: TextStyle(fontSize: 11, color: Colors.amber.shade800),
+                  ),
                 ),
-                child: Text(
-                  task.modelDisplayName,
-                  style: TextStyle(
-                    fontSize: 11,
+              if (task.isSuperseded)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    '已被新版本取代',
+                    style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                  ),
+                ),
+              // 徽章本身可能很长（翻译任务会带上"来源 → 目标语言"），限个宽，
+              // 超出省略，免得单个徽章就超过整行可用宽度
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 240),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
                     color: isTranslation
-                        ? Colors.deepPurpleAccent.shade100
-                        : scheme.primary,
+                        ? Colors.deepPurple.withValues(alpha: .2)
+                        : scheme.primary.withValues(alpha: .14),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    task.modelDisplayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: isTranslation
+                          ? Colors.deepPurpleAccent.shade100
+                          : scheme.primary,
+                    ),
                   ),
                 ),
               ),
@@ -345,10 +402,67 @@ class _AiTaskTile extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 4),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.end,
+          // 用 Wrap 而不是 Row：窄面板里按钮宁可换行也不要挤成溢出
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 4,
             children: [
-              if (running) ...[
+              // 已停在断点上：把剩余的音频继续识别完
+              if (task.canResume)
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  icon: const Icon(Icons.fast_forward_rounded, size: 16),
+                  label: const Text('继续识别'),
+                  onPressed: () => AiTaskManager.instance.resumeTask(task),
+                ),
+              // 点过「翻译已有」，正在等当前片段跑完：给一个明确的"已收到"信号，
+              // 否则按钮一消失、进度条正常在动，用户会以为没点中
+              if (task.stopRequested && running)
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  icon: const SizedBox(
+                    width: 15,
+                    height: 15,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  label: Text('收尾中 ${task.stopRequestedElapsed.inSeconds}s…'),
+                  onPressed: null,
+                ),
+              // 翻译没跑成的重来一次：先去设置页把 Key 改对，顺手也能换个目标语言
+              if (_canRetryTranslation(task))
+                Tooltip(
+                  message: '按当前设置重新翻译同一批字幕：\n'
+                      '· 目标语言取现在设置里的值，改过就按新的来\n'
+                      '· 已经翻好的条目按原文复用，不会重复消耗额度',
+                  child: TextButton.icon(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    icon: const Icon(Icons.refresh_rounded, size: 16),
+                    label: const Text('重试'),
+                    onPressed: () => _onRetryTranslation(context, task),
+                  ),
+                ),
+              // 识别途中：停止后续识别，先拿已识别的部分去翻译
+              if (_canTranslateExisting(task))
+                Tooltip(
+                  message: '先用已识别的 ${task.entryCount} 条字幕开始翻译：'
+                      '识别是一段一段跑的，等当前这一段跑完就停（最长约 1 分钟）；'
+                      '剩余部分之后会自动继续识别',
+                  child: TextButton.icon(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    icon: const Icon(Icons.g_translate_rounded, size: 16),
+                    label: const Text('翻译已有'),
+                    onPressed: () => _onTranslateExisting(context, task),
+                  ),
+                ),
+              if (running)
                 TextButton.icon(
                   style: TextButton.styleFrom(
                     visualDensity: VisualDensity.compact,
@@ -358,9 +472,8 @@ class _AiTaskTile extends StatelessWidget {
                   label: const Text('取消'),
                   onPressed: () =>
                       AiTaskManager.instance.cancelTask(task.videoPath),
-                ),
-                const SizedBox(width: 4),
-              ] else ...[
+                )
+              else
                 TextButton.icon(
                   style: TextButton.styleFrom(
                     visualDensity: VisualDensity.compact,
@@ -370,8 +483,6 @@ class _AiTaskTile extends StatelessWidget {
                   label: const Text('删除'),
                   onPressed: onRemove,
                 ),
-                const SizedBox(width: 4),
-              ],
               FilledButton.tonalIcon(
                 style: FilledButton.styleFrom(
                   visualDensity: VisualDensity.compact,
@@ -388,6 +499,75 @@ class _AiTaskTile extends StatelessWidget {
         ],
       ),
     );
+
+    // 已被后续翻译覆盖的记录：标灰保留，供回看但不代表当前缓存内容
+    if (task.isSuperseded) {
+      return Opacity(opacity: 0.5, child: card);
+    }
+    return card;
+  }
+
+  /// 是否给出「翻译已有」按钮。
+  ///
+  /// 短音频（≤120 秒）是整体一次性识别，中途停不下来，所以不给这个按钮；
+  /// 另外音频总时长要等进度回调上来才知道，开头几秒同样不显示。
+  static bool _canTranslateExisting(AiTask task) =>
+      task.taskType == AiTaskType.transcription &&
+      task.isRunning &&
+      !task.stopRequested &&
+      task.entryCount > 0 &&
+      task.totalDuration.inSeconds > 120;
+
+  /// 翻译失败 / 被取消 / 被退出打断的记录允许重试。
+  ///
+  /// 已被后续翻译取代的记录不给：它的产物早被覆盖，重试没有意义。
+  static bool _canRetryTranslation(AiTask task) =>
+      task.taskType == AiTaskType.translation &&
+      !task.isRunning &&
+      !task.isSuperseded &&
+      (task.state == AsrState.error || task.isCancelled || task.isInterrupted);
+
+  /// 翻译 Key 填错是最常见的失败原因，提示里直接指到设置页，省得用户自己猜。
+  static String _describeTranslationError(Object e) {
+    final raw = e.toString();
+    if (raw.contains('未配置') || raw.contains('凭据')) {
+      return '翻译服务还没配好：请到「设置 → 翻译服务」填写正确的 Key 后重试';
+    }
+    return '重试失败：$raw';
+  }
+
+  static Future<void> _onTranslateExisting(
+    BuildContext context,
+    AiTask task,
+  ) async {
+    try {
+      AiTaskManager.instance.requestTranslateExisting(task);
+      // 浮层提示由 requestTranslateExisting 里的 onInfo 统一弹出（AppToast 同一
+      // 时刻只保留一条，这里再弹会把那条带秒数说明的长提示顶掉）。
+    } catch (e) {
+      if (context.mounted) {
+        AppToast.show(context, _describeTranslationError(e), isError: true);
+      }
+    }
+  }
+
+  static Future<void> _onRetryTranslation(
+    BuildContext context,
+    AiTask task,
+  ) async {
+    try {
+      await AiTaskManager.instance.retryTranslationTask(task);
+      // 成功 / 语言变更的反馈由管理器里的 onInfo 统一弹
+    } catch (e) {
+      if (context.mounted) {
+        AppToast.show(
+          context,
+          _describeTranslationError(e),
+          isError: true,
+          duration: const Duration(seconds: 8),
+        );
+      }
+    }
   }
 
   static String _hhmm(DateTime t) =>

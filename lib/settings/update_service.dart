@@ -9,10 +9,17 @@ import 'package:url_launcher/url_launcher.dart';
 import '../utils/platform_utils.dart';
 
 abstract final class UpdateChecker {
+  /// 主链接：gh-proxy 加速。
+  ///
+  /// 用法是在完整的 GitHub 链接前拼代理域名（见
+  /// <https://gh-proxy.com/docs/github-accelerator>），官方 raw 在国内有时会连不上，
+  /// 所以让它走前面：绝大多数用户这里就能秒回。
   static const String primaryUrl =
-      'https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION';
-  static const String backupUrl =
       'https://gh-proxy.com/https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION';
+
+  /// 副链接：GitHub 官方 raw，gh-proxy 挂了或被限流时兜底。
+  static const String backupUrl =
+      'https://raw.githubusercontent.com/hcllmsx/PolyFlixPlayer/main/VERSION';
   static const String releaseUrl =
       'https://github.com/hcllmsx/PolyFlixPlayer/releases';
 
