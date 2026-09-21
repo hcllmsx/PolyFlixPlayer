@@ -182,8 +182,6 @@ class _ModelCatalogSheetState extends State<ModelCatalogSheet> {
                 const NetdiskLinksCard(
                   title: '模型网盘（ggml-*.bin）',
                   links: kModelNetdiskLinks,
-                  emptyNote:
-                      '链接待补充：全部 ggml-*.bin 文件会放在网盘里，链接就绪后这里会显示。',
                 ),
                 _modelChoiceGuide(scheme),
                 _groupHeader(scheme, '多语言模型（支持 99 种语言自动侦测）'),

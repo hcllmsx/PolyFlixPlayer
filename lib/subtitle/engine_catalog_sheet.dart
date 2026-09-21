@@ -244,8 +244,6 @@ class _EngineCatalogSheetState extends State<EngineCatalogSheet> {
                 const NetdiskLinksCard(
                   title: '引擎包网盘（whisper.cpp 官方 zip）',
                   links: kEngineNetdiskLinks,
-                  emptyNote:
-                      '链接待补充：全部引擎包会放在网盘里，链接就绪后这里会显示。',
                 ),
                 _columnHeader(scheme),
                 for (final group in EngineGroup.values) ...[

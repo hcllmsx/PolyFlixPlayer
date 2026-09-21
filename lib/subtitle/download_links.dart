@@ -8,7 +8,6 @@
 /// 所以模型与引擎各自挂**一组**链接，而不是单个链接。要增删就在下面的列表里改：
 /// [kModelNetdiskLinks] 是模型，[kEngineNetdiskLinks] 是引擎包，
 /// 界面会把它们渲染成可复制、可一键打开的卡片（[NetdiskLinksCard]）。
-/// 列表为空时界面显示补充说明，不会报错也不会留白。
 library;
 
 /// 一条网盘分享。
@@ -16,21 +15,13 @@ class NetdiskLink {
   const NetdiskLink({
     required this.name,
     required this.url,
-    this.extractCode = '',
   });
 
   /// 网盘名（如 `夸克网盘`），界面上作为标签显示。
   final String name;
 
-  /// 分享链接。
+  /// 分享链接；都是直达链接，不需要提取码。
   final String url;
-
-  /// 提取码；目前这两份分享都免提取码，留空即可。
-  final String extractCode;
-
-  /// 复制给别人 / 贴到浏览器时用的文本：有提取码时带上，没有就只有链接。
-  String get clipboardText =>
-      extractCode.isEmpty ? url : '$url 提取码：$extractCode';
 }
 
 /// 语音模型（ggml-*.bin）的网盘；两个盘内容一样，挑一个下载就行。

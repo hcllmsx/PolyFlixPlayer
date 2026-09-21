@@ -13,14 +13,11 @@ import '../utils/app_toast.dart';
 import 'download_links.dart';
 
 /// 一组网盘分享：标题 + 链接列表。
-///
-/// [links] 为空时不报错，显示 [emptyNote]（"链接待补充"之类的说明）。
 class NetdiskLinksCard extends StatelessWidget {
   const NetdiskLinksCard({
     super.key,
     required this.title,
     required this.links,
-    required this.emptyNote,
     this.multipleNote = '两个网盘内容一样，挑顺手的下载即可',
   });
 
@@ -29,16 +26,12 @@ class NetdiskLinksCard extends StatelessWidget {
 
   final List<NetdiskLink> links;
 
-  /// 还没提供链接时显示的说明。
-  final String emptyNote;
-
   /// 有多个网盘时的说明，单个网盘时不显示。
   final String multipleNote;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final hasLinks = links.isNotEmpty;
 
     return Container(
       margin: const EdgeInsets.fromLTRB(20, 12, 20, 4),
@@ -64,16 +57,7 @@ class NetdiskLinksCard extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: 3),
-                if (!hasLinks)
-                  Text(
-                    emptyNote,
-                    style: TextStyle(
-                      fontSize: 12,
-                      height: 1.45,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ),
-                if (hasLinks && links.length > 1)
+                if (links.length > 1)
                   Text(
                     multipleNote,
                     style: TextStyle(
@@ -82,7 +66,7 @@ class NetdiskLinksCard extends StatelessWidget {
                       color: scheme.onSurfaceVariant,
                     ),
                   ),
-                if (hasLinks) const SizedBox(height: 6),
+                const SizedBox(height: 6),
                 // 一条一行：窄屏也不会把链接挤成溢出
                 for (final link in links) _linkRow(context, scheme, link),
               ],
@@ -147,17 +131,12 @@ class NetdiskLinksCard extends StatelessWidget {
             },
           ),
           IconButton(
-            tooltip: link.extractCode.isEmpty ? '复制链接' : '复制链接与提取码',
+            tooltip: '复制链接',
             visualDensity: VisualDensity.compact,
             icon: const Icon(Icons.copy_rounded, size: 18),
             onPressed: () {
-              Clipboard.setData(ClipboardData(text: link.clipboardText));
-              AppToast.show(
-                context,
-                link.extractCode.isEmpty
-                    ? '已复制链接，粘贴到浏览器打开即可下载'
-                    : '已复制链接与提取码',
-              );
+              Clipboard.setData(ClipboardData(text: link.url));
+              AppToast.show(context, '已复制链接，粘贴到浏览器打开即可下载');
             },
           ),
         ],
