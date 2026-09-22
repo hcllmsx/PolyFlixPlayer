@@ -126,38 +126,23 @@ class BuiltInSubtitleExtractor {
     final tempFile = File(tempSrtPath);
 
     try {
-      if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
-        final ffmpegArgs = '-y -i "$videoPath" -map 0:s:$subtitleIndex -f srt "$tempSrtPath"';
-        final session = await FFmpegKit.execute(ffmpegArgs);
-        final returnCode = await session.getReturnCode();
+      // 全平台统一走内置 FFmpegKit（Windows/Linux 的原生库由插件在构建期提供）。
+      // 用参数列表而非命令行字符串，避免路径含空格/中文时还要自己转义。
+      final session = await FFmpegKit.executeWithArguments([
+        '-y',
+        '-i',
+        videoPath,
+        '-map',
+        '0:s:$subtitleIndex',
+        '-f',
+        'srt',
+        tempSrtPath,
+      ]);
+      final returnCode = await session.getReturnCode();
+
+      if (!ReturnCode.isSuccess(returnCode)) {
         final logs = await session.getAllLogsAsString();
-
-        if (!ReturnCode.isSuccess(returnCode)) {
-          final errorMsg = _analyzeFfmpegError(logs ?? '');
-          throw TranslationException(errorMsg);
-        }
-      } else {
-        final ffmpegCmd = _resolveFfmpegCmd();
-        final result = await Process.run(
-          ffmpegCmd,
-          [
-            '-y',
-            '-i',
-            videoPath,
-            '-map',
-            '0:s:$subtitleIndex',
-            '-f',
-            'srt',
-            tempSrtPath,
-          ],
-          runInShell: Platform.isWindows,
-        );
-
-        if (result.exitCode != 0) {
-          final stderr = result.stderr.toString();
-          final errorMsg = _analyzeFfmpegError(stderr);
-          throw TranslationException(errorMsg);
-        }
+        throw TranslationException(_analyzeFfmpegError(logs ?? ''));
       }
 
       if (!await tempFile.exists() || await tempFile.length() == 0) {
@@ -203,22 +188,4 @@ class BuiltInSubtitleExtractor {
     return '提取内置字幕失败，格式可能不支持。';
   }
 
-  static String _resolveFfmpegCmd() {
-    if (!Platform.isWindows) return 'ffmpeg';
-    final appData = Platform.environment['APPDATA'];
-    if (appData != null && appData.isNotEmpty) {
-      final roamingDir = Directory('$appData\\FFmpeg');
-      if (roamingDir.existsSync()) {
-        try {
-          final candidates = roamingDir
-              .listSync(recursive: true)
-              .where((e) => e is File && e.path.toLowerCase().endsWith('ffmpeg.exe'));
-          if (candidates.isNotEmpty) {
-            return candidates.first.path;
-          }
-        } catch (_) {}
-      }
-    }
-    return 'ffmpeg.exe';
-  }
 }

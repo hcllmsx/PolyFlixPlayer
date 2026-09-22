@@ -52,6 +52,8 @@
 | **Windows** | 下载 `PolyFlixPlayer-v*.zip`，解压后直接运行 `PolyFlixPlayer.exe`（绿色免安装） |
 | **Android** | 下载 `PolyFlixPlayer-v*.apk`，直接在手机上安装 |
 
+> Windows 端为绿色免安装：字幕识别所需的音频处理组件（FFmpeg）已内置于软件中，**无需另行安装 FFmpeg、无需配置 PATH 或任何环境变量**，解压即用。
+
 ---
 
 ## 从源码构建
@@ -80,6 +82,51 @@ flutter build apk --release         # Android 通用 APK
 flutter build apk --split-per-abi   # Android 架构分包 APK
 ```
 
+### 离线构建（可选）
+
+构建期默认会从 GitHub 拉取若干预编译产物（Windows：FFmpegKit 原生库、media_kit 的 `libmpv` / `ANGLE`；Android：4 个 libmpv jar）。若构建机网络受限，可预先下载并按下述结构放到 `_temp/prebuilt/`，构建时**自动复用、不再联网**；某处缺失时自动回退为联网下载，不影响普通构建。（`_temp/` 已被 gitignore，不会进版本库。）
+
+```
+_temp/prebuilt/
+├─ ffmpeg_kit/                        # Windows：FFmpegKit 原生库（构建后随应用分发）
+│  ├─ ffmpeg-kit-windows-x86_64-min-8.1.2.zip
+│  └─ bundle/                         # 解压后的 bin/libffmpegkit.dll + include/
+├─ media_kit/                         # Windows：libmpv / ANGLE
+│  ├─ mpv-dev-x86_64-20230924-git-652a1dd.7z
+│  └─ ANGLE.7z
+└─ media_kit_android/                 # Android：libmpv 的 jar（按版本分目录）
+   ├─ v1.1.11/                        # 当前使用的版本
+   │  ├─ default-arm64-v8a.jar
+   │  ├─ default-armeabi-v7a.jar
+   │  ├─ default-x86.jar
+   │  └─ default-x86_64.jar
+   └─ v1.1.7/                         # 旧版本，仅作回滚备用
+```
+
+归档下载地址：
+
+- FFmpegKit：`https://github.com/sk3llo/ffmpeg_kit_flutter/releases/download/8.1.2-min/ffmpeg-kit-windows-x86_64-min-8.1.2.zip`
+- libmpv（Windows）：`https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z`
+- ANGLE：`https://github.com/alexmercerind/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE.7z`
+- libmpv（Android）：`https://github.com/media-kit/libmpv-android-video-build/releases/download/v1.1.11/default-<abi>.jar`（`<abi>` 为 `arm64-v8a` / `armeabi-v7a` / `x86` / `x86_64`）
+
+> Android 的 jar 有 `default-` 与 `full-` 两种变体。本项目与 media_kit 保持一致，**必须用 `default-`**；`full-` 含更多编解码器，混用会让不同 CPU 架构的行为不一致。
+
+---
+
+### 本地 vendor 的插件（`third_party/`）
+
+有两个插件必须修改上游代码才能在本项目里正常工作，因此直接 vendor 进仓库，并在 `pubspec.yaml` 里用 `dependency_overrides` 指向本地路径：
+
+| 包 | 改动 | 原因 |
+|---|---|---|
+| `whisper_ggml` | `android/build.gradle`：`compileSdk 34 → 36`；`pubspec.yaml`：`ffmpeg_kit` 约束 `^2.1.0 → ^3.6.2` | 它的依赖链上有要求 `compileSdk >= 35` 的 `ffmpeg_kit_flutter_new_min`，不改就过不了 AGP 的 AAR 元数据校验 |
+| `media_kit_libs_android_video` | libmpv jar `v1.1.7 → v1.1.11`（含 MD5）；下载前优先复用 `_temp/prebuilt/media_kit_android/<版本>/` | 用上最新 libmpv，并让 Android 构建可以离线完成 |
+
+> 这两个包的**版权归其各自作者所有**（均为 MIT 许可），本仓库只是内置了它们的源码副本；各自的 `LICENSE` 与版权声明已随源码一并保留在 `third_party/<包名>/` 下，未作改动。
+
+两处改动都在文件内用 **【本仓库补丁】** 标注。**升级上游版本时请把这些补丁一并移植过去。**
+
 ---
 
 ## 反馈与交流
@@ -102,3 +149,6 @@ flutter build apk --split-per-abi   # Android 架构分包 APK
 - [media_kit](https://github.com/media-kit/media-kit) - 基于 libmpv 的全平台媒体播放引擎
 - [libmpv](https://mpv.io/) / [FFmpeg](https://ffmpeg.org/) - 核心音视频解码与流媒体处理
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) / [whisper_ggml](https://pub.dev/packages/whisper_ggml) - 本地 Whisper 语音识别推理
+- [FFmpegKit](https://github.com/sk3llo/ffmpeg_kit_flutter) / [ffmpeg_kit_flutter_new_min](https://pub.dev/packages/ffmpeg_kit_flutter_new_min) - 音频提取与内置字幕流提取（LGPL-3.0，采用不含 GPL 编解码器的 `min` 变体）
+
+其中 [`whisper_ggml`](https://github.com/sk3llo/whisper_ggml) 与 [`media_kit_libs_android_video`](https://github.com/media-kit/media-kit) 的**源码副本**被内置在本仓库的 [`third_party/`](third_party) 目录下，并作了小幅修改（改动点见上文「本地 vendor 的插件」一节）。两者的版权分别归 **Hrvoje Cukman** 与 **Hitesh Kumar Saini** 所有，均为 MIT 许可，原始 `LICENSE` 与版权声明已随源码一并保留。

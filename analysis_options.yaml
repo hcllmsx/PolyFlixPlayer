@@ -18,6 +18,8 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # 本地 vendor 的第三方插件（各自用上游的 analysis_options，不该受本项目规则约束）
+    - third_party/**
 
 linter:
   # The lint rules applied to this project can be customized in the

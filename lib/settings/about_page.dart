@@ -111,6 +111,29 @@ class _AboutPageState extends State<AboutPage> {
     );
   }
 
+  /// 展示本软件用到的全部开源组件许可。
+  ///
+  /// 不需要手工维护这份清单：Flutter 在构建时会把所有依赖（含 `third_party/`
+  /// 下本地 vendor 的包）的 LICENSE 汇总成 `NOTICES.Z` 打进应用包，
+  /// `LicensePage` 直接读取并渲染，以后新增依赖会自动出现在里面。
+  void _showLicenses() {
+    showLicensePage(
+      context: context,
+      applicationName: '影现播放器',
+      applicationVersion: 'v$_currentVersion',
+      applicationIcon: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.asset(
+          'assets/images/logo.png',
+          width: 44,
+          height: 44,
+          fit: BoxFit.cover,
+        ),
+      ),
+      applicationLegalese: 'PolyFlixPlayer · by hcllmsx\n本项目基于 GPL-3.0 协议开源',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -206,6 +229,23 @@ class _AboutPageState extends State<AboutPage> {
                 color: scheme.onSurfaceVariant.withValues(alpha: .7),
                 fontSize: 12,
                 height: 1.5,
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Center(
+            child: InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: _showLicenses,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                child: Text(
+                  '开源软件许可',
+                  style: TextStyle(
+                    color: scheme.onSurfaceVariant.withValues(alpha: .7),
+                    fontSize: 12,
+                  ),
+                ),
               ),
             ),
           ),

@@ -137,6 +137,23 @@ class AsrProgress {
   final String? message;
 }
 
+/// 音频提取的结果。
+///
+/// 这里不用 `null` 表示失败，是因为提取失败有多种互不相同的原因
+/// （视频根本没有音轨 / 文件损坏 / 编码不受支持 / 组件异常 …）。
+/// 过去它们全部收敛成一句"请检查视频是否有有效音轨或格式"，会把真正的原因
+/// 掩盖掉，让用户误以为是自己的视频有问题，也无从排查。
+class AudioExtractionResult {
+  const AudioExtractionResult.ok(this.wavPath) : error = null;
+  const AudioExtractionResult.failed(this.error) : wavPath = null;
+
+  /// 提取出的 16kHz 单声道 WAV 路径；失败时为 null。
+  final String? wavPath;
+
+  /// 面向用户的失败原因；成功时为 null。
+  final String? error;
+}
+
 /// 字幕生成器。
 ///
 /// 使用 whisper_ggml 包进行语音识别，输出带时间戳的字幕条目。
@@ -226,7 +243,7 @@ class SubtitleGenerator {
 
       // 2. 提取音频为 WAV 文件（上报进度，避免长时间黑盒等待）
       _updateState(AsrState.preparing, message: '正在提取音频…');
-      final wavPath = await _extractAudioToWav(
+      final extract = await _extractAudioToWav(
         videoPath,
         onProgress: (fraction, _, _) {
           final overall = fraction * _kExtractProgressShare;
@@ -237,8 +254,10 @@ class SubtitleGenerator {
           );
         },
       );
+      final wavPath = extract.wavPath;
       if (wavPath == null) {
-        _updateState(AsrState.error, message: '音频提取失败');
+        if (_cancelled) return [];
+        _updateState(AsrState.error, message: extract.error ?? '音频提取失败');
         return [];
       }
 
@@ -496,11 +515,10 @@ class SubtitleGenerator {
   /// 停止当前 ASR 任务。
   void cancel() {
     _cancelled = true;
-    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
-      try {
-        FFmpegKit.cancel();
-      } catch (_) {}
-    }
+    // 全平台都有内置 FFmpegKit（Windows/Linux 的原生库由插件提供），统一取消
+    try {
+      FFmpegKit.cancel();
+    } catch (_) {}
     _updateState(AsrState.idle, message: '已取消');
   }
 
@@ -606,7 +624,7 @@ class SubtitleGenerator {
     }
     onProgress?.call(
         AsrState.preparing, Duration.zero, Duration.zero, 0.0, '正在提取音频…');
-    final wavPath = await _extractAudioToWav(
+    final extract = await _extractAudioToWav(
       videoPath,
       isCancelled: isCancelled,
       onProgress: (fraction, processed, total) {
@@ -622,6 +640,7 @@ class SubtitleGenerator {
         onProgress?.call(AsrState.preparing, processed, total, overall, msg);
       },
     );
+    final wavPath = extract.wavPath;
     if (wavPath == null) {
       if (isCancelled?.call() == true || _cancelled) {
         if (isCurrentVideo()) {
@@ -629,11 +648,13 @@ class SubtitleGenerator {
         }
         return const ChunkedTranscribeResult.empty();
       }
+      // 用真实原因取代过去那句笼统的"请检查视频是否有有效音轨或格式"
+      final reason = extract.error ?? '音频提取失败';
       if (isCurrentVideo()) {
-        _updateState(AsrState.error, message: '音频提取失败');
+        _updateState(AsrState.error, message: reason);
       }
-      onProgress?.call(AsrState.error, Duration.zero, Duration.zero, 0.0, '音频提取失败');
-      throw StateError('音频提取失败，请检查视频是否有有效音轨或格式');
+      onProgress?.call(AsrState.error, Duration.zero, Duration.zero, 0.0, reason);
+      throw StateError(reason);
     }
 
     final wavFile = File(wavPath);
@@ -1252,9 +1273,10 @@ class SubtitleGenerator {
 
   /// 从视频文件中提取音频为 16kHz mono WAV。
   ///
-  /// Android / iOS / macOS 上使用内置原生 FFmpegKit，Windows 上使用系统 FFmpeg。
-  /// 返回临时 WAV 文件路径，调用方负责清理。
-  Future<String?> _extractAudioToWav(
+  /// 全平台统一走内置的 FFmpegKit（ffmpeg_kit_flutter_new_min ≥3.2.0 提供
+  /// Windows/Linux 原生库），不再依赖用户自行安装系统 ffmpeg。
+  /// 结果里带 WAV 路径或**具体的失败原因**，由调用方决定如何提示用户。
+  Future<AudioExtractionResult> _extractAudioToWav(
     String videoPath, {
     void Function(double fraction, Duration processed, Duration total)?
         onProgress,
@@ -1273,102 +1295,41 @@ class SubtitleGenerator {
       final existing = File(wavPath);
       if (await existing.exists() && await existing.length() > 1024) {
         onProgress?.call(1.0, Duration.zero, Duration.zero);
-        return wavPath;
+        return AudioExtractionResult.ok(wavPath);
       }
 
-      // 先问出视频时长，用来把 ffmpeg 的进度换算成百分比
-      final totalSeconds = await _probeDurationSeconds(videoPath);
-      final totalDuration =
-          totalSeconds > 0 ? Duration(seconds: totalSeconds.round()) : Duration.zero;
+      // 先探测一次：既拿到时长用于进度换算，也能提前判定"这个视频压根没有音轨"，
+      // 从而直接给出准确提示，而不必等 FFmpeg 跑完再靠猜。
+      final probe = await _probeMedia(videoPath);
+      final totalSeconds = probe.durationSeconds;
+      final totalDuration = totalSeconds > 0
+          ? Duration(seconds: totalSeconds.round())
+          : Duration.zero;
 
-      if (isCancelled?.call() == true || _cancelled) return null;
-
-      if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
-        return await _extractAudioWithFFmpegKit(
-          videoPath: videoPath,
-          wavPath: wavPath,
-          totalSeconds: totalSeconds,
-          totalDuration: totalDuration,
-          onProgress: onProgress,
-          isCancelled: isCancelled,
-        );
+      if (probe.available && !probe.hasAudioStream) {
+        return const AudioExtractionResult.failed(
+            '该视频没有可用的音轨，无法进行语音识别');
       }
 
-      final ffmpegCmd = Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg';
-      final process = await Process.start(
-        ffmpegCmd,
-        [
-          '-y',
-          // 只取音频、丢掉字幕与数据流；-map 0:a:0 只挑第一条音轨，少做无用解码
-          '-i', videoPath,
-          '-map', '0:a:0?',
-          '-vn', '-sn', '-dn',
-          '-acodec', 'pcm_s16le',
-          '-ar', '16000',
-          '-ac', '1',
-          // 结构化进度输出到 stdout，便于解析
-          '-progress', 'pipe:1',
-          '-nostats',
-          '-loglevel', 'error',
-          wavPath,
-        ],
-        runInShell: false,
+      if (isCancelled?.call() == true || _cancelled) {
+        return const AudioExtractionResult.failed('已取消');
+      }
+
+      return await _extractAudioWithFFmpegKit(
+        videoPath: videoPath,
+        wavPath: wavPath,
+        totalSeconds: totalSeconds,
+        totalDuration: totalDuration,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
       );
-
-      // 解析进度：out_time_us=<微秒>。
-      // 注意 stdout / stderr 都是单订阅流，只能 listen 一次，也不能再 drain，
-      // 否则会抛 StateError 被外层 catch 吞掉（表现成"音频提取失败"）。
-      var lastReportedPercent = -1;
-      final progressSub = process.stdout
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen(
-        (line) {
-          if (isCancelled?.call() == true || _cancelled) {
-            process.kill();
-            return;
-          }
-          if (totalSeconds <= 0) return;
-          final match = RegExp(r'^out_time_us=(\d+)').firstMatch(line.trim());
-          if (match == null) return;
-          final micros = int.tryParse(match.group(1)!) ?? 0;
-          if (micros <= 0) return;
-          final processed = Duration(microseconds: micros);
-          final fraction = (processed.inMicroseconds / (totalSeconds * 1000000))
-              .clamp(0.0, 1.0);
-          final percent = (fraction * 100).round();
-          if (percent == lastReportedPercent) return;
-          lastReportedPercent = percent;
-          onProgress?.call(fraction, processed, totalDuration);
-        },
-        onError: (_) {},
-      );
-      // stderr 也必须消费，否则管道写满会卡住子进程
-      final stderrSub = process.stderr.listen((_) {}, onError: (_) {});
-
-      final exitCode = await process.exitCode;
-      await progressSub.cancel();
-      await stderrSub.cancel();
-
-      if (exitCode != 0) {
-        // FFmpeg 不可用或视频没有音轨
-        return null;
-      }
-
-      final wavFile = File(wavPath);
-      if (!await wavFile.exists() || await wavFile.length() < 1024) {
-        return null;
-      }
-
-      onProgress?.call(1.0, totalDuration, totalDuration);
-      return wavPath;
-    } catch (_) {
-      return null;
+    } catch (e) {
+      return AudioExtractionResult.failed('音频提取时发生异常：$e');
     }
   }
 
-  /// 使用 FFmpegKit 提取音频（适用于 Android / iOS / macOS 原生集成环境）
-  Future<String?> _extractAudioWithFFmpegKit({
+  /// 使用 FFmpegKit 提取音频（全平台统一：Android / iOS / macOS / Windows / Linux）
+  Future<AudioExtractionResult> _extractAudioWithFFmpegKit({
     required String videoPath,
     required String wavPath,
     required double totalSeconds,
@@ -1377,6 +1338,11 @@ class SubtitleGenerator {
         onProgress,
     bool Function()? isCancelled,
   }) async {
+    // FFmpeg 的日志是判定失败原因的唯一依据。只保留尾部一小段，
+    // 既不无限增长内存，又足以覆盖错误信息。
+    const maxLogChars = 8192;
+    final logBuffer = StringBuffer();
+
     try {
       final arguments = [
         '-y',
@@ -1402,7 +1368,8 @@ class SubtitleGenerator {
           }
         },
         (log) {
-          // 日志回调
+          if (logBuffer.length >= maxLogChars) return;
+          logBuffer.write(log.getMessage());
         },
         (statistics) {
           if (isCancelled?.call() == true || _cancelled) {
@@ -1430,56 +1397,91 @@ class SubtitleGenerator {
       currentSessionId = session.getSessionId();
 
       final success = await completer.future;
+
+      // 取消要走"已取消"而不是"失败"：调用方会先判 isCancelled，
+      // 这里返回的原因只是兜底，不会再弹给用户。
+      if (isCancelled?.call() == true || _cancelled) {
+        return const AudioExtractionResult.failed('已取消');
+      }
+
       if (!success) {
-        return null;
+        return AudioExtractionResult.failed(
+          _describeExtractionFailure(logBuffer.toString()),
+        );
       }
 
       final wavFile = File(wavPath);
       if (!await wavFile.exists() || await wavFile.length() < 1024) {
-        return null;
+        return const AudioExtractionResult.failed('未能从该视频中提取到有效音频数据');
       }
 
       onProgress?.call(1.0, totalDuration, totalDuration);
-      return wavPath;
-    } catch (_) {
-      return null;
+      return AudioExtractionResult.ok(wavPath);
+    } catch (e) {
+      return AudioExtractionResult.failed('音频提取组件（FFmpegKit）调用失败：$e');
     }
   }
 
-  /// 用 ffprobe / FFprobeKit 读取媒体总时长（秒）；失败返回 0。
+  /// 用 FFprobeKit 探测媒体信息：时长、是否含音轨、容器能否读取。
   ///
   /// 只读头部信息，毫秒级完成，不会像"猜一个进度"那样让进度条骗人。
-  Future<double> _probeDurationSeconds(String videoPath) async {
-    if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
-      try {
-        final session = await FFprobeKit.getMediaInformation(videoPath);
-        final info = session.getMediaInformation();
-        final durationStr = info?.getDuration();
-        if (durationStr != null) {
-          final d = double.tryParse(durationStr);
-          if (d != null && d > 0) return d;
-        }
-      } catch (_) {}
-      return 0;
-    }
-
-    final ffprobeCmd = Platform.isWindows ? 'ffprobe.exe' : 'ffprobe';
+  /// 全平台共用内置 FFprobe，不再依赖系统 PATH 上的 ffprobe。
+  ///
+  /// [available] 为 false 表示连容器信息都读不出来（文件不存在 / 损坏 / 无权限），
+  /// 这时**不能**断言"视频没有音轨"，交给 FFmpeg 报出更具体的原因。
+  Future<({double durationSeconds, bool hasAudioStream, bool available})>
+      _probeMedia(String videoPath) async {
     try {
-      final result = await Process.run(
-        ffprobeCmd,
-        [
-          '-v', 'error',
-          '-show_entries', 'format=duration',
-          '-of', 'default=noprint_wrappers=1:nokey=1',
-          videoPath,
-        ],
-        runInShell: false,
+      final session = await FFprobeKit.getMediaInformation(videoPath);
+      final info = session.getMediaInformation();
+      if (info == null) {
+        return (durationSeconds: 0.0, hasAudioStream: false, available: false);
+      }
+
+      final duration = double.tryParse(info.getDuration() ?? '') ?? 0.0;
+      final hasAudio = info
+          .getStreams()
+          .any((s) => (s.getType() ?? '').toLowerCase() == 'audio');
+
+      return (
+        durationSeconds: duration > 0 ? duration : 0.0,
+        hasAudioStream: hasAudio,
+        available: true,
       );
-      if (result.exitCode != 0) return 0;
-      return double.tryParse(result.stdout.toString().trim()) ?? 0;
     } catch (_) {
-      return 0;
+      return (durationSeconds: 0.0, hasAudioStream: false, available: false);
     }
+  }
+
+  /// 把 FFmpeg 的失败日志翻译成用户看得懂、且据此能采取行动的具体原因。
+  ///
+  /// 都匹配不上时保留一句兜底文案，不把原始日志直接甩给用户。
+  static String _describeExtractionFailure(String logs) {
+    final l = logs.toLowerCase();
+    bool hit(List<String> keys) => keys.any(l.contains);
+
+    if (hit(['does not contain any stream', 'matches no streams', 'stream map'])) {
+      return '该视频没有可用的音轨，无法进行语音识别';
+    }
+    if (hit(['no such file or directory', 'error opening input'])) {
+      return '找不到该视频文件，它可能已被移动、重命名或删除';
+    }
+    if (hit(['permission denied'])) {
+      return '没有读取该视频文件的权限，请检查文件权限或换个位置再试';
+    }
+    if (hit(['moov atom not found', 'invalid data found when processing input'])) {
+      return '无法读取该视频文件，文件可能已损坏或不完整';
+    }
+    if (hit(['decoder', 'codec']) && hit(['not found', 'unsupported', 'invalid'])) {
+      return '该视频的音轨编码格式不受支持，无法提取音频';
+    }
+    if (hit(['no space left on device'])) {
+      return '磁盘空间不足，无法写入提取出的音频';
+    }
+    if (hit(['ffmpegkit', 'failed to load', 'cannot open shared object'])) {
+      return '音频提取组件加载失败，请重启软件后再试';
+    }
+    return '音频提取失败，视频格式可能不受支持或文件已损坏';
   }
 
   void _cleanupTempFile(String path) {
