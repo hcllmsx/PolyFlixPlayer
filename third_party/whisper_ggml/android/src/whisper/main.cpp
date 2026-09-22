@@ -1,0 +1,773 @@
+#include "main.h"
+#include "whisper.cpp/include/whisper.h"
+
+#define DR_WAV_IMPLEMENTATION
+#include "whisper.cpp/examples/dr_wav.h"
+
+#include <cstdio>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <algorithm>
+#include <cstdlib>
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <stdio.h>
+#include "json/json.hpp"
+
+using json = nlohmann::json;
+
+char *jsonToChar(json jsonData) noexcept
+{
+    // Whisper can emit text that splits a multi-byte UTF-8 character at a
+    // token boundary; dump() would throw type_error.316 and abort the app
+    // across the FFI boundary. Replace invalid bytes with U+FFFD instead.
+    std::string result =
+        jsonData.dump(-1, ' ', false, json::error_handler_t::replace);
+    // malloc, not new[]: callers across the FFI boundary free this
+    // with the C allocator (Dart's malloc.free).
+    char *ch = (char *)malloc(result.size() + 1);
+    strcpy(ch, result.c_str());
+    return ch;
+}
+
+struct whisper_params
+{
+    int32_t seed = -1; // RNG seed, not used currently
+    int32_t n_threads = std::min(4, (int32_t)std::thread::hardware_concurrency());
+
+    int32_t n_processors = 1;
+    int32_t offset_t_ms = 0;
+    int32_t offset_n = 0;
+    int32_t duration_ms = 0;
+    int32_t max_context = -1;
+    int32_t max_len = 0;
+    int32_t best_of = 5;
+    int32_t beam_size = -1;
+
+    float word_thold = 0.01f;
+    float entropy_thold = 2.40f;
+    float logprob_thold = -1.00f;
+
+    bool verbose = false;
+    bool print_special_tokens = false;
+    bool speed_up = false;
+    bool translate = false;
+    bool diarize = false;
+    bool no_fallback = false;
+    bool output_txt = false;
+    bool output_vtt = false;
+    bool output_srt = false;
+    bool output_wts = false;
+    bool output_csv = false;
+    bool print_special = false;
+    bool print_colors = false;
+    bool print_progress = false;
+    bool no_timestamps = false;
+    bool split_on_word = false;
+    // whisper_full_params.no_context: disable cross-segment text conditioning.
+    bool no_context = false;
+    // whisper_full_params.suppress_non_speech_tokens: drop [BLANK_AUDIO]-style annotations.
+    bool suppress_nst = false;
+
+    // Address of a Dart NativeCallable<Void Function(Int32)>; 0 = none.
+    uint64_t progress_cb_addr = 0;
+
+    // Park the loaded model in g_model_cache after this request instead of
+    // freeing it, so the next request with the same model file skips the
+    // multi-second load (issue #26). Off = load-per-request, as always.
+    bool keep_model_loaded = false;
+
+    std::string language = "auto";
+    std::string prompt;
+    std::string model = "models/ggml-tiny.bin";
+    std::string audio = "samples/jfk.wav";
+    std::vector<std::string> fname_inp = {};
+    std::vector<std::string> fname_outp = {};
+};
+
+struct whisper_print_user_data
+{
+    const whisper_params *params;
+
+    const std::vector<std::vector<float>> *pcmf32s;
+};
+
+// ---------------------------------------------------------------------------
+// Resident model cache (issue #26). transcribe() normally frees its context
+// when the request finishes, so every request pays the full model load
+// (seconds for the small models and up). A request with keep_model_loaded
+// parks its context here instead; the next request with the same model path
+// picks it up and skips the load.
+//
+// Checkout semantics: a request *takes* the parked context (the slot goes
+// empty) and parks it again when done, so the mutex is held only for the
+// swap — never during a decode. Concurrent requests keep running in
+// parallel, each on its own context, exactly as without the cache. The lock
+// matters because Dart issues requests from short-lived worker isolates,
+// i.e. from changing threads.
+// ---------------------------------------------------------------------------
+static struct
+{
+    struct whisper_context *ctx = nullptr; // parked context; nullptr = empty
+    std::string model;                     // model path ctx was loaded from
+    std::mutex mutex;
+} g_model_cache;
+
+json release_model() noexcept
+{
+    struct whisper_context *parked = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_model_cache.mutex);
+        parked = g_model_cache.ctx;
+        g_model_cache.ctx = nullptr;
+        g_model_cache.model.clear();
+    }
+    if (parked != nullptr)
+    {
+        whisper_free(parked);
+    }
+    json jsonResult;
+    jsonResult["@type"] = "releaseModel";
+    jsonResult["released"] = parked != nullptr;
+    return jsonResult;
+}
+
+json transcribe(json jsonBody) noexcept
+{
+    whisper_params params;
+
+    params.n_threads = jsonBody["threads"];
+    params.verbose = jsonBody["is_verbose"];
+    params.translate = jsonBody["is_translate"];
+    params.language = jsonBody["language"];
+    params.print_special_tokens = jsonBody["is_special_tokens"];
+    params.no_timestamps = jsonBody["is_no_timestamps"];
+    params.model = jsonBody["model"];
+    params.audio = jsonBody["audio"];
+    params.split_on_word = jsonBody["split_on_word"];
+    params.diarize = jsonBody["diarize"];
+
+    // Optional fields: absent / null / empty leaves whisper.cpp defaults.
+    if (jsonBody.contains("initial_prompt") && jsonBody["initial_prompt"].is_string())
+    {
+        params.prompt = jsonBody["initial_prompt"].get<std::string>();
+    }
+    if (jsonBody.contains("no_context") && jsonBody["no_context"].is_boolean())
+    {
+        params.no_context = jsonBody["no_context"].get<bool>();
+    }
+    if (jsonBody.contains("suppress_non_speech_tokens") && jsonBody["suppress_non_speech_tokens"].is_boolean())
+    {
+        params.suppress_nst = jsonBody["suppress_non_speech_tokens"].get<bool>();
+    }
+    if (jsonBody.contains("progress_callback") && jsonBody["progress_callback"].is_number_unsigned())
+    {
+        params.progress_cb_addr = jsonBody["progress_callback"].get<uint64_t>();
+    }
+    if (jsonBody.contains("keep_model_loaded") && jsonBody["keep_model_loaded"].is_boolean())
+    {
+        params.keep_model_loaded = jsonBody["keep_model_loaded"].get<bool>();
+    }
+    json jsonResult;
+    jsonResult["@type"] = "transcribe";
+
+    if (params.language != "" && params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1)
+    {
+        jsonResult["@type"] = "error";
+        jsonResult["message"] = "error: unknown language = " + params.language;
+        return jsonResult;
+    }
+
+    if (params.seed < 0)
+    {
+        params.seed = time(NULL);
+    }
+
+    // whisper init: take the parked context when the model path matches
+    // (leaving the cache empty while it is in use), otherwise load from disk.
+    bool reused_ctx = false;
+    struct whisper_context *ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_model_cache.mutex);
+        if (g_model_cache.ctx != nullptr && g_model_cache.model == params.model)
+        {
+            ctx = g_model_cache.ctx;
+            g_model_cache.ctx = nullptr;
+            g_model_cache.model.clear();
+            reused_ctx = true;
+        }
+    }
+    if (ctx == nullptr)
+    {
+        struct whisper_context_params cparams = whisper_context_default_params();
+        cparams.use_gpu = false; // CPU-only build
+        ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+    }
+    if (ctx == nullptr)
+    {
+        // Without this check a missing/corrupt model file crashes in
+        // whisper_full instead of surfacing an error response.
+        jsonResult["@type"] = "error";
+        jsonResult["message"] = "failed to load model " + params.model;
+        return jsonResult;
+    }
+    // Park or free the context on every exit path (including WAV validation
+    // errors: a bad file must not cost the next request a model reload).
+    auto release_ctx = [&]() noexcept
+    {
+        if (!params.keep_model_loaded)
+        {
+            whisper_free(ctx);
+            return;
+        }
+        struct whisper_context *displaced = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_model_cache.mutex);
+            displaced = g_model_cache.ctx;
+            g_model_cache.ctx = ctx;
+            g_model_cache.model = params.model;
+        }
+        // A concurrent request may have parked its own context while this
+        // one was decoding; only one can stay resident.
+        if (displaced != nullptr)
+        {
+            whisper_free(displaced);
+        }
+    };
+    std::string text_result = "";
+    const auto fname_inp = params.audio;
+    // WAV input
+    std::vector<float> pcmf32;
+    {
+        drwav wav;
+        if (!drwav_init_file(&wav, fname_inp.c_str(), NULL))
+        {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = " failed to open WAV file ";
+            release_ctx();
+            return jsonResult;
+        }
+
+        if (wav.channels != 1 && wav.channels != 2)
+        {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "must be mono or stereo";
+            drwav_uninit(&wav);
+            release_ctx();
+            return jsonResult;
+        }
+
+        if (wav.sampleRate != WHISPER_SAMPLE_RATE)
+        {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "WAV file  must be 16 kHz";
+            drwav_uninit(&wav);
+            release_ctx();
+            return jsonResult;
+        }
+
+        if (wav.bitsPerSample != 16)
+        {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "WAV file  must be 16 bit";
+            drwav_uninit(&wav);
+            release_ctx();
+            return jsonResult;
+        }
+
+        int n = wav.totalPCMFrameCount;
+
+        std::vector<int16_t> pcm16;
+        pcm16.resize(n * wav.channels);
+        drwav_read_pcm_frames_s16(&wav, n, pcm16.data());
+        drwav_uninit(&wav);
+
+        // convert to mono, float
+        pcmf32.resize(n);
+        if (wav.channels == 1)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                pcmf32[i] = float(pcm16[i]) / 32768.0f;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+            {
+                pcmf32[i] = float(pcm16[2 * i] + pcm16[2 * i + 1]) / 65536.0f;
+            }
+        }
+    }
+
+    {
+        if (params.language == "" && params.language == "auto")
+        {
+            params.language = "auto";
+            params.translate = false;
+        }
+    }
+    // run the inference
+    {
+        whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+
+        wparams.print_realtime = false;
+        wparams.print_progress = false;
+        wparams.print_timestamps = !params.no_timestamps;
+        // wparams.print_special_tokens = params.print_special_tokens;
+        wparams.translate = params.translate;
+        wparams.language = params.language.c_str();
+        wparams.n_threads = params.n_threads;
+        wparams.split_on_word = params.split_on_word;
+        // tinydiarize speaker-turn detection; needs a *-tdrz model to
+        // emit turns, harmless with regular models.
+        wparams.tdrz_enable = params.diarize;
+
+        // params.prompt outlives whisper_full(), so the pointer stays valid.
+        if (!params.prompt.empty()) {
+            wparams.initial_prompt = params.prompt.c_str();
+        }
+        // A reused context still holds the previous request's decoded text
+        // as conditioning history (whisper clears prompt_past only when
+        // no_context is set), so force the clear on reuse: a warm request
+        // must transcribe exactly like a cold one. initial_prompt is
+        // unaffected — whisper re-applies it after the clear.
+        wparams.no_context = params.no_context || reused_ctx;
+        wparams.suppress_nst = params.suppress_nst;
+
+        if (params.split_on_word) {
+            wparams.max_len = 1;
+            wparams.token_timestamps = true;
+        }
+
+        if (params.progress_cb_addr) {
+            // NativeCallable.listener is safe to invoke from whisper's
+            // worker thread: it posts to the owning Dart isolate.
+            wparams.progress_callback = [](struct whisper_context *, struct whisper_state *, int progress, void * user_data) {
+                ((void (*)(int32_t))user_data)((int32_t)progress);
+            };
+            wparams.progress_callback_user_data = (void *)(uintptr_t)params.progress_cb_addr;
+        }
+
+        if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0)
+        {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "failed to process audio";
+            release_ctx();
+            return jsonResult;
+        }
+
+        
+
+        // print result;
+        if (!wparams.print_realtime)
+        {
+
+            const int n_segments = whisper_full_n_segments(ctx);
+
+            std::vector<json> segmentsJson = {};
+
+            for (int i = 0; i < n_segments; ++i)
+            {
+                const char *text = whisper_full_get_segment_text(ctx, i);
+
+                std::string str(text);
+                text_result += str;
+                if (params.no_timestamps)
+                {
+                    // printf("%s", text);
+                    // fflush(stdout);
+                } else {
+                    json jsonSegment;
+                    const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
+                    const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
+
+                    // printf("[%s --> %s]  %s\n", to_timestamp(t0).c_str(), to_timestamp(t1).c_str(), text);
+
+                    jsonSegment["from_ts"] = t0;
+                    jsonSegment["to_ts"] = t1;
+                    jsonSegment["text"] = text;
+                    jsonSegment["speaker_turn_next"] =
+                        whisper_full_get_segment_speaker_turn_next(ctx, i);
+
+                    segmentsJson.push_back(jsonSegment);
+                }
+            }
+
+            if (!params.no_timestamps) {
+                jsonResult["segments"] = segmentsJson;
+            }
+        }
+    }
+    jsonResult["text"] = text_result;
+
+    release_ctx();
+    return jsonResult;
+}
+extern "C"
+{
+    FUNCTION_ATTRIBUTE
+    char *request(char *body)
+    {
+        try
+        {
+            json jsonBody = json::parse(body);
+            json jsonResult;
+
+            if (jsonBody["@type"] == "getTextFromWavFile")
+            {
+                try
+                {
+                    return jsonToChar(transcribe(jsonBody));
+                }
+                catch (const std::exception &e)
+                {
+                    jsonResult["@type"] = "error";
+                    jsonResult["message"] = e.what();
+                    return jsonToChar(jsonResult);
+                }
+            }
+            if (jsonBody["@type"] == "releaseModel")
+            {
+                return jsonToChar(release_model());
+            }
+            if (jsonBody["@type"] == "getVersion")
+            {
+                jsonResult["@type"] = "version";
+                jsonResult["message"] = "lib version: v1.0.1";
+                return jsonToChar(jsonResult);
+            }
+
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "method not found";
+            return jsonToChar(jsonResult);
+        }
+        catch (const std::exception &e)
+        {
+            json jsonResult;
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = e.what();
+            return jsonToChar(jsonResult);
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Live (streaming) transcription.
+//
+// Unlike request()/transcribe(), which load the model on every call, a stream
+// keeps one whisper_context alive for the whole session:
+//
+//   stream_start(json)          -> loads the model (or borrows a parked one
+//                                  from g_model_cache), resets state
+//   stream_feed(pcm, n)         -> appends 16 kHz mono float samples; re-runs
+//                                  inference when >= ~1.5 s of new audio has
+//                                  accumulated and returns the partial text
+//   stream_stop()               -> final text; frees the context, or parks it
+//                                  in g_model_cache when the session was
+//                                  started with keep_model_loaded or borrowed
+//                                  a parked context (issue #26)
+//
+// Partials re-decode the whole current window with no_context = true, so a
+// wrong early partial does not condition later ones. When the window grows
+// past ~25 s its text is committed and the buffer restarts, keeping memory
+// and inference time bounded (a word straddling the commit boundary may be
+// clipped — acceptable for a draft).
+//
+// An RMS energy gate tracks the last voiced sample: inference only runs
+// when new voiced audio has arrived, and the decoded window is trimmed
+// shortly after the last voiced sample. Without this, whisper hallucinates
+// over trailing silence (repeating earlier text or inventing phrases).
+// ---------------------------------------------------------------------------
+
+struct whisper_stream_state
+{
+    struct whisper_context *ctx = nullptr;
+    std::vector<float> pcmf32;   // samples of the current window
+    size_t n_transcribed = 0;    // window samples covered by the last run
+    size_t n_voiced = 0;         // end of the last chunk with speech energy
+    float noise_floor = 0.005f;  // adaptive ambient RMS estimate
+    float gate_rms_min = 0.0015f;   // absolute minimum speech RMS
+    float gate_ratio = 2.5f;        // voiced thold = ratio * noise_floor
+    float gate_floor_cap = 0.01f;   // noise_floor cap (loud rooms)
+    std::string committed;       // text of windows already committed
+    std::string last_text;       // text of the current window's last run
+    std::string language = "en";
+    std::string prompt;
+    std::string model;           // model path ctx was loaded from
+    int n_threads = 4;
+    bool translate = false;
+    bool suppress_nst = false;
+    // Park ctx into g_model_cache when the session ends: set when the
+    // session asked for keep_model_loaded or borrowed a parked context.
+    bool park_on_stop = false;
+    std::mutex mutex;
+};
+
+static whisper_stream_state g_stream;
+
+// Hand the session context back: park it in g_model_cache when the session
+// asked for that (keep_model_loaded) or borrowed the context from there,
+// free it otherwise. Caller must hold g_stream.mutex; lock order is
+// g_stream.mutex -> g_model_cache.mutex, never the reverse anywhere.
+static void stream_dispose_ctx()
+{
+    if (g_stream.ctx == nullptr) {
+        return;
+    }
+    if (g_stream.park_on_stop) {
+        struct whisper_context *displaced = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_model_cache.mutex);
+            displaced = g_model_cache.ctx;
+            g_model_cache.ctx = g_stream.ctx;
+            g_model_cache.model = g_stream.model;
+        }
+        if (displaced != nullptr) {
+            whisper_free(displaced);
+        }
+    } else {
+        whisper_free(g_stream.ctx);
+    }
+    g_stream.ctx = nullptr;
+    g_stream.model.clear();
+    g_stream.park_on_stop = false;
+}
+
+static const size_t STREAM_STEP_SAMPLES   = (size_t)(1.5 * WHISPER_SAMPLE_RATE);
+static const size_t STREAM_COMMIT_SAMPLES = (size_t)(25.0 * WHISPER_SAMPLE_RATE);
+// Decode this much audio past the last voiced sample (trailing consonants).
+static const size_t STREAM_VOICE_PAD      = (size_t)(0.2 * WHISPER_SAMPLE_RATE);
+
+// Runs whisper_full over the current window. Caller must hold g_stream.mutex.
+static json stream_run_inference()
+{
+    json result;
+    result["@type"] = "streamPartial";
+
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_realtime   = false;
+    wparams.print_progress   = false;
+    wparams.print_timestamps = false;
+    wparams.translate        = g_stream.translate;
+    wparams.language         = g_stream.language.c_str();
+    wparams.n_threads        = g_stream.n_threads;
+    wparams.no_context       = true;
+    wparams.suppress_nst = g_stream.suppress_nst;
+    if (!g_stream.prompt.empty()) {
+        wparams.initial_prompt = g_stream.prompt.c_str();
+    }
+
+    // Trim trailing silence from the decode window; decoding it makes
+    // whisper hallucinate (repeats or invented phrases).
+    const size_t n_decode =
+        std::min(g_stream.pcmf32.size(), g_stream.n_voiced + STREAM_VOICE_PAD);
+    if (n_decode < (size_t)WHISPER_SAMPLE_RATE / 2) {
+        result["text"] = g_stream.committed + g_stream.last_text;
+        return result;
+    }
+
+    if (whisper_full(g_stream.ctx, wparams, g_stream.pcmf32.data(),
+                     (int)n_decode) != 0) {
+        result["@type"] = "error";
+        result["message"] = "failed to process audio";
+        return result;
+    }
+
+    std::string text;
+    const int n_segments = whisper_full_n_segments(g_stream.ctx);
+    for (int i = 0; i < n_segments; ++i) {
+        text += whisper_full_get_segment_text(g_stream.ctx, i);
+    }
+
+    g_stream.last_text = text;
+    g_stream.n_transcribed = n_decode;
+
+    if (n_decode >= STREAM_COMMIT_SAMPLES) {
+        g_stream.committed += text;
+        g_stream.last_text.clear();
+        g_stream.pcmf32.erase(g_stream.pcmf32.begin(),
+                              g_stream.pcmf32.begin() + n_decode);
+        g_stream.n_transcribed = 0;
+        g_stream.n_voiced -= std::min(g_stream.n_voiced, n_decode);
+    }
+
+    result["text"] = g_stream.committed + g_stream.last_text;
+    return result;
+}
+
+extern "C"
+{
+    // body: {"model": path, "language": "en", "threads": 4,
+    //        "is_translate": false, "initial_prompt": "...",
+    //        "keep_model_loaded": false}
+    FUNCTION_ATTRIBUTE
+    char *stream_start(char *body)
+    {
+        std::lock_guard<std::mutex> lock(g_stream.mutex);
+        json jsonResult;
+
+        json jsonBody = json::parse(body, nullptr, false);
+        if (jsonBody.is_discarded() || !jsonBody.contains("model")) {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "stream_start: invalid request body";
+            return jsonToChar(jsonResult);
+        }
+
+        if (g_stream.ctx != nullptr) {
+            // Dispose per the *previous* session's policy before the new
+            // session's fields overwrite it.
+            stream_dispose_ctx();
+        }
+        g_stream.pcmf32.clear();
+        g_stream.n_transcribed = 0;
+        g_stream.n_voiced = 0;
+        g_stream.noise_floor = 0.005f;
+        g_stream.committed.clear();
+        g_stream.last_text.clear();
+
+        std::string model;
+        bool keep_model_loaded = false;
+        try {
+            g_stream.language  = jsonBody.value("language", "en");
+            g_stream.n_threads = jsonBody.value("threads", 4);
+            g_stream.translate = jsonBody.value("is_translate", false);
+            g_stream.suppress_nst = jsonBody.value("suppress_non_speech_tokens", false);
+            g_stream.gate_rms_min   = (float)jsonBody.value("gate_rms_min", 0.0015);
+            g_stream.gate_ratio     = (float)jsonBody.value("gate_voice_ratio", 2.5);
+            g_stream.gate_floor_cap = (float)jsonBody.value("gate_floor_cap", 0.01);
+            g_stream.prompt.clear();
+            if (jsonBody.contains("initial_prompt") && jsonBody["initial_prompt"].is_string()) {
+                g_stream.prompt = jsonBody["initial_prompt"].get<std::string>();
+            }
+            keep_model_loaded = jsonBody.value("keep_model_loaded", false);
+            model = jsonBody["model"].get<std::string>();
+        } catch (const json::exception &e) {
+            // A C++ exception escaping extern "C" into FFI would be
+            // std::terminate; convert type errors to an error response.
+            jsonResult["@type"] = "error";
+            jsonResult["message"] =
+                std::string("stream_start: bad request: ") + e.what();
+            return jsonToChar(jsonResult);
+        }
+
+        // Take the parked context when the model path matches (leaving the
+        // cache empty while the session uses it), otherwise load from disk.
+        // Fresh-session semantics come for free: every stream decode runs
+        // with no_context = true, which clears whisper's rolling text
+        // history.
+        bool borrowed = false;
+        {
+            std::lock_guard<std::mutex> cache_lock(g_model_cache.mutex);
+            if (g_model_cache.ctx != nullptr && g_model_cache.model == model) {
+                g_stream.ctx = g_model_cache.ctx;
+                g_model_cache.ctx = nullptr;
+                g_model_cache.model.clear();
+                borrowed = true;
+            }
+        }
+        if (g_stream.ctx == nullptr) {
+            whisper_context_params cparams = whisper_context_default_params();
+            cparams.use_gpu = false; // CPU-only build
+            g_stream.ctx = whisper_init_from_file_with_params(model.c_str(), cparams);
+        }
+        if (g_stream.ctx == nullptr) {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "stream_start: failed to load model " + model;
+            return jsonToChar(jsonResult);
+        }
+        g_stream.model = model;
+        // A borrowed context must go back on stop — the caller that parked
+        // it with keep_model_loaded must not silently lose it.
+        g_stream.park_on_stop = borrowed || keep_model_loaded;
+
+        jsonResult["@type"] = "streamStarted";
+        return jsonToChar(jsonResult);
+    }
+
+    // pcm: 16 kHz mono float32 samples in [-1, 1].
+    FUNCTION_ATTRIBUTE
+    char *stream_feed(const float *pcm, int32_t n_samples)
+    {
+        std::lock_guard<std::mutex> lock(g_stream.mutex);
+        json jsonResult;
+
+        if (g_stream.ctx == nullptr) {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "stream_feed: stream not started";
+            return jsonToChar(jsonResult);
+        }
+        if (pcm != nullptr && n_samples > 0) {
+            double sum2 = 0.0;
+            for (int32_t i = 0; i < n_samples; ++i) {
+                sum2 += (double)pcm[i] * pcm[i];
+            }
+            g_stream.pcmf32.insert(g_stream.pcmf32.end(), pcm, pcm + n_samples);
+
+            // Adaptive noise floor: falls quickly, rises slowly, so it
+            // tracks room tone without absorbing speech. A chunk is
+            // voiced only when clearly above the floor.
+            const float rms = (float)std::sqrt(sum2 / n_samples);
+            if (rms < g_stream.noise_floor) {
+                g_stream.noise_floor += 0.5f * (rms - g_stream.noise_floor);
+            } else {
+                g_stream.noise_floor += 0.0005f * (rms - g_stream.noise_floor);
+            }
+            g_stream.noise_floor =
+                std::min(g_stream.noise_floor, g_stream.gate_floor_cap);
+            const float voice_thold = std::max(
+                g_stream.gate_ratio * g_stream.noise_floor,
+                g_stream.gate_rms_min);
+            if (rms >= voice_thold) {
+                g_stream.n_voiced = g_stream.pcmf32.size();
+            }
+        }
+
+        // Run only when new *voiced* audio arrived — silence alone
+        // never triggers a decode.
+        if (g_stream.n_voiced > g_stream.n_transcribed &&
+            g_stream.pcmf32.size() - g_stream.n_transcribed >= STREAM_STEP_SAMPLES) {
+            return jsonToChar(stream_run_inference());
+        }
+
+        jsonResult["@type"] = "streamPartial";
+        jsonResult["text"] = g_stream.committed + g_stream.last_text;
+        return jsonToChar(jsonResult);
+    }
+
+    FUNCTION_ATTRIBUTE
+    char *stream_stop()
+    {
+        std::lock_guard<std::mutex> lock(g_stream.mutex);
+        json jsonResult;
+
+        if (g_stream.ctx == nullptr) {
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "stream_stop: stream not started";
+            return jsonToChar(jsonResult);
+        }
+
+        // Cover voiced audio that arrived after the last run; a silent
+        // tail is dropped rather than decoded.
+        const size_t n_tail = std::min(g_stream.pcmf32.size(),
+                                       g_stream.n_voiced + STREAM_VOICE_PAD);
+        if (g_stream.n_voiced > g_stream.n_transcribed &&
+            n_tail >= (size_t)WHISPER_SAMPLE_RATE / 2) {
+            stream_run_inference();
+        }
+
+        jsonResult["@type"] = "streamFinal";
+        jsonResult["text"] = g_stream.committed + g_stream.last_text;
+
+        stream_dispose_ctx();
+        g_stream.pcmf32.clear();
+        g_stream.pcmf32.shrink_to_fit();
+        g_stream.n_transcribed = 0;
+        g_stream.n_voiced = 0;
+        g_stream.committed.clear();
+        g_stream.last_text.clear();
+
+        return jsonToChar(jsonResult);
+    }
+}

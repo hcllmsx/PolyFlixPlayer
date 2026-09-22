@@ -1,0 +1,53 @@
+name: whisper_ggml
+description: OpenAI Whisper ASR (Automatic Speech Recognition) for Flutter
+version: 2.6.0
+repository: https://github.com/sk3llo/whisper_ggml
+
+environment:
+  sdk: '>=3.7.0 <4.0.0'
+  flutter: ">=3.29.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  ffi: ^2.1.4
+  # 【本仓库补丁，勿删】上游卡在 ^2.1.0，而 2.x 没有 Windows 实现。它引用
+  # ffmpeg_kit 只用于 Dart 层的音频转码（whisper_audio_convert.dart），且我们传入的
+  # 本来就是 16kHz 单声道 WAV，那条路径永远不会被触发，所以放开到 3.x，
+  # 让整个工程共用同一份（带 Windows 原生库的）依赖。
+  ffmpeg_kit_flutter_new_min: ^3.6.2
+  freezed_annotation: ^3.0.0
+  json_annotation: ^4.9.0
+  plugin_platform_interface: ^2.1.8
+  universal_io: ^2.2.2
+  path_provider: ^2.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  build_runner: ^2.4.15
+  ffigen: ^18.1.0
+  freezed: ^3.0.6
+  json_serializable: ^6.9.5
+  very_good_analysis: ^7.0.0
+
+topics:
+  - 'ggml'
+  - 'artificial-intelligence'
+  - 'machine-learning'
+
+flutter:
+  uses-material-design: true
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true
+      linux:
+        ffiPlugin: true

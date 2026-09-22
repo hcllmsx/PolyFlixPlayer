@@ -1,0 +1,55 @@
+// GENERATED CODE - DO NOT MODIFY BY HAND
+
+part of 'transcribe_request_dto.dart';
+
+// **************************************************************************
+// JsonSerializableGenerator
+// **************************************************************************
+
+_TranscribeRequestDto _$TranscribeRequestDtoFromJson(
+  Map<String, dynamic> json,
+) => _TranscribeRequestDto(
+  audio: json['audio'] as String,
+  model: json['model'] as String,
+  isTranslate: json['is_translate'] as bool,
+  threads: (json['threads'] as num).toInt(),
+  isVerbose: json['is_verbose'] as bool,
+  language: json['language'] as String,
+  isSpecialTokens: json['is_special_tokens'] as bool,
+  isNoTimestamps: json['is_no_timestamps'] as bool,
+  nProcessors: (json['n_processors'] as num).toInt(),
+  splitOnWord: json['split_on_word'] as bool,
+  noFallback: json['no_fallback'] as bool,
+  isRealtime: json['is_realtime'] as bool,
+  diarize: json['diarize'] as bool,
+  speedUp: json['speed_up'] as bool,
+  initialPrompt: json['initial_prompt'] as String?,
+  noContext: json['no_context'] as bool? ?? false,
+  suppressNonSpeechTokens: json['suppress_non_speech_tokens'] as bool? ?? false,
+  progressCallback: (json['progress_callback'] as num?)?.toInt(),
+  keepModelLoaded: json['keep_model_loaded'] as bool? ?? false,
+);
+
+Map<String, dynamic> _$TranscribeRequestDtoToJson(
+  _TranscribeRequestDto instance,
+) => <String, dynamic>{
+  'audio': instance.audio,
+  'model': instance.model,
+  'is_translate': instance.isTranslate,
+  'threads': instance.threads,
+  'is_verbose': instance.isVerbose,
+  'language': instance.language,
+  'is_special_tokens': instance.isSpecialTokens,
+  'is_no_timestamps': instance.isNoTimestamps,
+  'n_processors': instance.nProcessors,
+  'split_on_word': instance.splitOnWord,
+  'no_fallback': instance.noFallback,
+  'is_realtime': instance.isRealtime,
+  'diarize': instance.diarize,
+  'speed_up': instance.speedUp,
+  'initial_prompt': instance.initialPrompt,
+  'no_context': instance.noContext,
+  'suppress_non_speech_tokens': instance.suppressNonSpeechTokens,
+  'progress_callback': instance.progressCallback,
+  'keep_model_loaded': instance.keepModelLoaded,
+};
