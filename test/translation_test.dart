@@ -56,14 +56,22 @@ Second subtitle entry.
       expect(bilingual.contains('1\n00:00:01,000 --> 00:00:03,000\n你好世界\nHello world'), isTrue);
       expect(bilingual.contains('2\n00:00:04,000 --> 00:00:06,000\n再见\nGoodbye'), isTrue);
 
-      // 头部注释：播放器不显示，文本打开可见
+      // 头部注释：以单帧时间戳的合法条目形式写在文件开头与末尾，文本打开可见
       final withHeader = SrtParser.serialize(
         entries,
         bilingual: false,
         headerComment: '导出说明',
       );
-      expect(withHeader.startsWith('导出说明\n\n1\n'), isTrue);
-      expect(SrtParser.parse(withHeader).length, 2);
+      expect(
+        withHeader.startsWith('1\n00:00:00,000 --> 00:00:00,001\n导出说明\n\n2\n'),
+        isTrue,
+      );
+      // 末尾再附一次同样的备注条目（紧接最后一条字幕的结束时间）
+      expect(
+        withHeader.endsWith('4\n00:00:06,000 --> 00:00:06,001\n导出说明\n\n'),
+        isTrue,
+      );
+      expect(SrtParser.parse(withHeader).length, 4);
 
       final translationOnly = SrtParser.serialize(entries, translationOnly: true);
       expect(translationOnly.contains('1\n00:00:01,000 --> 00:00:03,000\n你好世界'), isTrue);

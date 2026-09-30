@@ -60,12 +60,21 @@ class SrtParser {
     return entries;
   }
 
+  /// 备注条目占用的时间跨度（「一帧」）。
+  ///
+  /// SRT 时间戳的最高精度为毫秒，这里以 1 毫秒代表一帧，
+  /// 既满足「每条内容都必须带时间戳」的格式要求，
+  /// 又短到在播放器中几乎不产生可见闪烁。
+  static const Duration commentCueDuration = Duration(milliseconds: 1);
+
   /// 序列化为 SRT 格式。
   ///
   /// [bilingual]: 是否输出双语（译文 + 换行 + 原文）
   /// [translationOnly]: 是否仅输出译文（当译文为空时回退原文）
-  /// [headerComment]: 写在文件开头（第一条字幕之前）的说明文字，
-  /// 播放器会忽略第一条字幕前的内容，不会显示；用文本编辑器打开可见。
+  /// [headerComment]: 导出备注文字。它会以「一帧时间戳」的合法字幕条目形式
+  /// 分别写在文件开头（00:00:00,000 起）和文件末尾（最后一条字幕之后），
+  /// 这样既能在文本编辑器中看到，也不会让要求「条目必须带时间戳」的
+  /// SRT 读取软件解析报错。
   static String serialize(
     List<SubtitleEntry> entries, {
     bool bilingual = false,
@@ -73,13 +82,22 @@ class SrtParser {
     String? headerComment,
   }) {
     final buffer = StringBuffer();
-
-    if (headerComment != null && headerComment.trim().isNotEmpty) {
-      buffer.writeln(headerComment.trim());
-      buffer.writeln();
-    }
+    final comment = headerComment?.trim() ?? '';
+    final hasComment = comment.isNotEmpty;
 
     int index = 1;
+
+    // 文件开头：备注包裹成带一帧时间戳的合法条目。
+    if (hasComment) {
+      buffer.writeln(index);
+      buffer.writeln(
+        '${_formatTimestamp(Duration.zero)} --> '
+        '${_formatTimestamp(commentCueDuration)}',
+      );
+      buffer.writeln(comment);
+      buffer.writeln();
+      index++;
+    }
 
     for (final entry in entries) {
       String display;
@@ -98,6 +116,18 @@ class SrtParser {
       buffer.writeln(display);
       buffer.writeln();
       index++;
+    }
+
+    // 文件末尾：同样以单帧时间戳再附一次备注。
+    if (hasComment) {
+      final start = entries.isEmpty ? commentCueDuration : entries.last.end;
+      buffer.writeln(index);
+      buffer.writeln(
+        '${_formatTimestamp(start)} --> '
+        '${_formatTimestamp(start + commentCueDuration)}',
+      );
+      buffer.writeln(comment);
+      buffer.writeln();
     }
 
     return buffer.toString();

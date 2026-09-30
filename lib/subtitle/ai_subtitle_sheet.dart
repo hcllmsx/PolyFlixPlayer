@@ -32,7 +32,8 @@ enum SubtitleExportMode {
 /// AI 语音识别与字幕翻译控制面板。
 ///
 /// 支持配置识别模型、源语言选择、视频内置字幕提取、目标语言翻译及双语字幕导出。
-/// 写入 SRT 文件开头的导出信息（播放器不显示，文本编辑器打开可见）。
+/// 导出信息，以「一帧时间戳」的合法 SRT 条目形式写在文件开头与末尾，
+/// 播放器几乎不会显示，用文本编辑器打开可见。
 const String kSrtHeaderComment =
     '本字幕由 影现播放器（PolyFlixPlayer）导出\n'
     '作者B站：火车啦啦 https://space.bilibili.com/255947051';

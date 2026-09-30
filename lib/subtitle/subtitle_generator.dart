@@ -1195,33 +1195,6 @@ class SubtitleGenerator {
     return merged;
   }
 
-  /// 将字幕条目列表转换为标准的 SRT 格式文本。
-  static String convertToSrt(List<SubtitleEntry> entries) {
-    final buffer = StringBuffer();
-    for (int i = 0; i < entries.length; i++) {
-      final entry = entries[i];
-      buffer.writeln('${i + 1}');
-      buffer.writeln(
-        '${_formatSrtTimestamp(entry.start)} --> ${_formatSrtTimestamp(entry.end)}',
-      );
-      buffer.writeln(entry.text);
-      if (entry.translatedText != null &&
-          entry.translatedText!.trim().isNotEmpty) {
-        buffer.writeln(entry.translatedText!.trim());
-      }
-      buffer.writeln();
-    }
-    return buffer.toString();
-  }
-
-  static String _formatSrtTimestamp(Duration d) {
-    final hours = d.inHours.toString().padLeft(2, '0');
-    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    final millis = d.inMilliseconds.remainder(1000).toString().padLeft(3, '0');
-    return '$hours:$minutes:$seconds,$millis';
-  }
-
   static String _formatDuration(Duration d) {
     final hours = d.inHours;
     final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
