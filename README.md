@@ -84,7 +84,7 @@ flutter build apk --split-per-abi   # Android 架构分包 APK
 
 ### 离线构建（可选）
 
-构建期默认会从 GitHub 拉取若干预编译产物（Windows：FFmpegKit 原生库、media_kit 的 `libmpv` / `ANGLE`；Android：4 个 libmpv jar）。若构建机网络受限，可预先下载并按下述结构放到 `_temp/prebuilt/`，构建时**自动复用、不再联网**；某处缺失时自动回退为联网下载，不影响普通构建。（`_temp/` 已被 gitignore，不会进版本库。）
+构建期默认会从 GitHub 拉取若干预编译产物（Windows：FFmpegKit 原生库、media_kit 的 `libmpv` / `ANGLE`、增强内核 libmpv；Android：4 个 libmpv jar）。若构建机网络受限，可预先下载并按下述结构放到 `_temp/prebuilt/`，构建时**自动复用、不再联网**；某处缺失时自动回退为联网下载，不影响普通构建。（`_temp/` 已被 gitignore，不会进版本库。）
 
 ```
 _temp/prebuilt/
@@ -94,6 +94,8 @@ _temp/prebuilt/
 ├─ media_kit/                         # Windows：libmpv / ANGLE
 │  ├─ mpv-dev-x86_64-20230924-git-652a1dd.7z
 │  └─ ANGLE.7z
+├─ libmpv_pgs/                        # Windows：增强内核（支持 PGS/VobSub 图形字幕）
+│  └─ mpv-dev-lgpl-x86_64-20260930-git-3186d369f9.7z
 └─ media_kit_android/                 # Android：libmpv 的 jar（按版本分目录）
    ├─ v1.1.11/                        # 当前使用的版本
    │  ├─ default-arm64-v8a.jar
@@ -106,9 +108,12 @@ _temp/prebuilt/
 归档下载地址：
 
 - FFmpegKit：`https://github.com/sk3llo/ffmpeg_kit_flutter/releases/download/8.1.2-min/ffmpeg-kit-windows-x86_64-min-8.1.2.zip`
-- libmpv（Windows）：`https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z`
+- libmpv（Windows，media_kit 裁剪版）：`https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z`
+- libmpv（Windows，**增强内核**）：`https://github.com/zhongfly/mpv-winbuild/releases/download/2026-09-30-3186d369f9/mpv-dev-lgpl-x86_64-20260930-git-3186d369f9.7z`（MD5 `aa37a7093a33fcbdab33c8d0bd00ab34`）
 - ANGLE：`https://github.com/alexmercerind/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE.7z`
 - libmpv（Android）：`https://github.com/media-kit/libmpv-android-video-build/releases/download/v1.1.11/default-<abi>.jar`（`<abi>` 为 `arm64-v8a` / `armeabi-v7a` / `x86` / `x86_64`）
+
+> **Windows 增强播放内核**：media_kit 自带的 libmpv 是 media-kit 自己裁剪过的构建，**既没有 `sup` 解复用器、也没有 `hdmv_pgs_subtitle` 解码器**，所以外挂 `.sup` 与视频内置的 PGS/VobSub 字幕在这台内核上都显示不出来（mpv 日志：`Can not open external file` / `Could not find subtitle decoder`）。本项目默认换成 zhongfly 的 **LGPL 全量构建**（mpv v0.41 + 完整 ffmpeg + libass/libplacebo/d3d11，安装目录里 `libmpv-2.dll` 约 96 MB，而裁剪版是 28 MB）。想要小体积、不需要图形字幕时，配置阶段传 `-DPFLX_LIBMPV_ENHANCED=OFF` 即可退回裁剪版内核。
 
 > Android 的 jar 有 `default-` 与 `full-` 两种变体。本项目与 media_kit 保持一致，**必须用 `default-`**；`full-` 含更多编解码器，混用会让不同 CPU 架构的行为不一致。
 

@@ -49,6 +49,29 @@ abstract final class NativeFileHelper {
         .toList();
   }
 
+  /// 选择一个外挂字幕文件；用户取消时返回 null。
+  ///
+  /// [allowedExtensions] 只用于桌面端的对话框过滤（选择器里直接只列字幕文件）。
+  /// Android 的 SAF 对 `.ass` / `.ssa` 这类扩展名经常给不出 MIME 类型，
+  /// 按扩展名过滤会把文件整片置灰根本选不中，所以移动端改成"不过滤"，
+  /// 选完由调用方自行校验后缀。
+  ///
+  /// 返回的 [name] 用于界面显示；[path] 是可直接读取的本地路径
+  /// （Android 上 file_picker 会把非文件协议的内容拷进应用缓存目录）。
+  static Future<({String path, String name})?> pickSubtitleFile({
+    required List<String> allowedExtensions,
+  }) async {
+    final isAndroid = Platform.isAndroid;
+    final picked = await FilePicker.pickFile(
+      dialogTitle: '选择字幕文件',
+      type: isAndroid ? FileType.any : FileType.custom,
+      allowedExtensions: isAndroid ? null : allowedExtensions,
+    );
+    final path = picked?.path;
+    if (picked == null || path == null || path.isEmpty) return null;
+    return (path: path, name: picked.name);
+  }
+
   // ─────────────────────────────────────────────────
   // 目录结构（Windows）：
   //

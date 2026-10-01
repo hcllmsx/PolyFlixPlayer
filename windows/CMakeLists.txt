@@ -95,6 +95,77 @@ foreach(_pflx_archive
   endif()
 endforeach()
 
+# ── 增强播放内核：带图形字幕（PGS / VobSub）解码能力的 libmpv ────────────────
+# media_kit_libs_windows_video 自带的是 media-kit 自己裁剪过的 libmpv（28 MB）：
+# 它既没有 sup 解复用器、也没有 hdmv_pgs_subtitle 解码器，于是外挂 `.sup` 与视频
+# 内置的 PGS 字幕都会"静默不显示"（实测 mpv 日志：Can not open external file /
+# Could not find subtitle decoder for format 'hdmv_pgs_subtitle'）。
+#
+# 这里换成 zhongfly 的 LGPL 全量构建（mpv v0.41 + 完整 ffmpeg，libass /
+# libplacebo / d3d11 渲染链齐全），并在安装阶段替换掉 media_kit 那一份，
+# 让 media_kit 按默认名字（libmpv-2.dll）直接加载到它，Dart 侧零改动。
+# 代价是 DLL 从 28 MB 变成约 96 MB（安装包/安装目录相应变大）。
+#
+# 想要小体积、不要图形字幕时：cmake 时传 -DPFLX_LIBMPV_ENHANCED=OFF 即可退回
+# media_kit 自带的裁剪版内核。
+#
+# 离线构建：把归档放到 _temp/prebuilt/libmpv_pgs/ 下即可跳过联网（见 README）。
+option(PFLX_LIBMPV_ENHANCED
+  "使用支持 PGS/VobSub 图形字幕的增强 libmpv（关闭则用 media_kit 自带裁剪版）" ON)
+
+set(PFLX_LIBMPV_ARCHIVE_NAME "mpv-dev-lgpl-x86_64-20260930-git-3186d369f9.7z")
+set(PFLX_LIBMPV_URL
+  "https://github.com/zhongfly/mpv-winbuild/releases/download/2026-09-30-3186d369f9/${PFLX_LIBMPV_ARCHIVE_NAME}")
+set(PFLX_LIBMPV_MD5 "aa37a7093a33fcbdab33c8d0bd00ab34")
+set(PFLX_LIBMPV_PREBUILT_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../_temp/prebuilt/libmpv_pgs")
+set(PFLX_LIBMPV_SRC_DIR "${CMAKE_BINARY_DIR}/libmpv_pgs")
+set(PFLX_LIBMPV_DLL "${PFLX_LIBMPV_SRC_DIR}/libmpv-2.dll")
+
+if(PFLX_LIBMPV_ENHANCED AND NOT EXISTS "${PFLX_LIBMPV_DLL}")
+  set(_pflx_libmpv_archive "${CMAKE_BINARY_DIR}/${PFLX_LIBMPV_ARCHIVE_NAME}")
+
+  if(EXISTS "${PFLX_LIBMPV_PREBUILT_DIR}/${PFLX_LIBMPV_ARCHIVE_NAME}")
+    message(STATUS "PolyFlixPlayer: 复用本地 ${PFLX_LIBMPV_ARCHIVE_NAME}")
+    file(COPY "${PFLX_LIBMPV_PREBUILT_DIR}/${PFLX_LIBMPV_ARCHIVE_NAME}"
+      DESTINATION "${CMAKE_BINARY_DIR}")
+  elseif(NOT EXISTS "${_pflx_libmpv_archive}")
+    message(STATUS "PolyFlixPlayer: 下载增强 libmpv（支持 PGS 图形字幕）...")
+    file(DOWNLOAD "${PFLX_LIBMPV_URL}" "${_pflx_libmpv_archive}" STATUS _pflx_dl_status)
+    list(GET _pflx_dl_status 0 _pflx_dl_code)
+    if(NOT _pflx_dl_code EQUAL 0)
+      message(FATAL_ERROR
+        "下载增强 libmpv 失败（错误码 ${_pflx_dl_code}）。\n"
+        "可手动下载 ${PFLX_LIBMPV_URL}\n"
+        "放到 ${PFLX_LIBMPV_PREBUILT_DIR}/ 后重新构建。")
+    endif()
+  endif()
+
+  file(MD5 "${_pflx_libmpv_archive}" _pflx_libmpv_archive_md5)
+  if(NOT _pflx_libmpv_archive_md5 STREQUAL PFLX_LIBMPV_MD5)
+    file(REMOVE "${_pflx_libmpv_archive}")
+    message(FATAL_ERROR
+      "增强 libmpv 归档校验失败（MD5 ${_pflx_libmpv_archive_md5}），已删除，请重新构建。")
+  endif()
+
+  # 下载成功的归档回填到离线预置目录：这样 flutter clean 之后不必再下一次
+  if(NOT EXISTS "${PFLX_LIBMPV_PREBUILT_DIR}/${PFLX_LIBMPV_ARCHIVE_NAME}")
+    file(MAKE_DIRECTORY "${PFLX_LIBMPV_PREBUILT_DIR}")
+    file(COPY "${_pflx_libmpv_archive}" DESTINATION "${PFLX_LIBMPV_PREBUILT_DIR}")
+    message(STATUS "PolyFlixPlayer: 已回填离线预置 -> ${PFLX_LIBMPV_PREBUILT_DIR}")
+  endif()
+
+  file(MAKE_DIRECTORY "${PFLX_LIBMPV_SRC_DIR}")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" -E tar xzf "${_pflx_libmpv_archive}"
+    WORKING_DIRECTORY "${PFLX_LIBMPV_SRC_DIR}"
+    RESULT_VARIABLE _pflx_libmpv_extract_code)
+  if(NOT _pflx_libmpv_extract_code EQUAL 0 OR NOT EXISTS "${PFLX_LIBMPV_DLL}")
+    message(FATAL_ERROR "解压增强 libmpv 失败（${_pflx_libmpv_extract_code}）。")
+  endif()
+  message(STATUS "PolyFlixPlayer: 增强 libmpv 就绪 -> ${PFLX_LIBMPV_DLL}")
+endif()
+
 # Flutter library and tool build rules.
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
@@ -135,7 +206,19 @@ install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 if(PLUGIN_BUNDLED_LIBRARIES)
+  if(PFLX_LIBMPV_ENHANCED)
+    # media_kit 自带的那份裁剪版 libmpv 不安装：由下面 PFLX_LIBMPV_DLL（增强内核，
+    # 支持 PGS / VobSub 图形字幕）接替，避免两份同名 DLL 打架、也省掉 28 MB 冗余。
+    list(FILTER PLUGIN_BUNDLED_LIBRARIES EXCLUDE REGEX "libmpv-2\\.dll$")
+  endif()
   install(FILES "${PLUGIN_BUNDLED_LIBRARIES}"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+endif()
+
+# 增强播放内核（替换 media_kit 裁剪版 libmpv，见文件开头说明）
+if(PFLX_LIBMPV_ENHANCED)
+  install(FILES "${PFLX_LIBMPV_DLL}"
     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
     COMPONENT Runtime)
 endif()

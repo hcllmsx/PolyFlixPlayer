@@ -25,14 +25,17 @@ import '../main.dart';
 import '../pflx/pflx.dart';
 import '../pflx/pflx_stream_server.dart';
 import '../settings/app_settings.dart';
+import '../settings/external_subtitle_store.dart';
 import '../settings/playback_progress.dart';
 import '../subtitle/ai_subtitle_sheet.dart';
 import '../subtitle/ai_task_manager.dart';
+import '../subtitle/external_subtitle.dart';
 import '../subtitle/model_manager.dart';
 import '../subtitle/subtitle_generator.dart';
 import '../subtitle/subtitle_overlay.dart';
 import '../subtitle/translation/builtin_subtitle_extractor.dart';
 import '../subtitle/translation/translation_service.dart';
+import '../utils/native_file_helper.dart';
 import '../utils/platform_media_helper.dart';
 import '../utils/platform_utils.dart';
 
@@ -114,6 +117,13 @@ bool _isVideoPath(String path) {
 
 String _fileNameOf(String path) => path.replaceAll('\\', '/').split('/').last;
 
+/// 时间轴偏移的显示文本：`+1.5s` / `-0.5s` / `0`。
+String _formatOffsetLabel(int ms) {
+  if (ms == 0) return '0';
+  final seconds = (ms / 1000).toStringAsFixed(1);
+  return ms > 0 ? '+${seconds}s' : '${seconds}s';
+}
+
 class PlayerPage extends StatefulWidget {
   const PlayerPage({
     super.key,
@@ -169,14 +179,74 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   bool _closing = false;
 
   // ---------------- 主/副字幕状态 ----------------
-  /// 当前主字幕源 ID（'none', 'ai_translation', 'ai_original', 'builtin_0', ...）。
+  /// 当前主字幕源 ID。
+  ///
+  /// 取值：`none` / `ai_translation` / `ai_original` / `builtin_下标`
+  /// （内置轨原生渲染）/ `builtin_下标_text`（内置轨文本化后走叠层）/
+  /// `external_uid`（外挂字幕，渲染方式由该条目的模式决定）。
   String _primarySubId = 'none';
 
-  /// 当前副字幕源 ID（'none', 'ai_translation', 'ai_original', 'builtin_0', ...）。
+  /// 当前副字幕源 ID（取值同 [_primarySubId]，但原生渲染的源不能当副字幕）。
   String _secondarySubId = 'none';
 
   /// 内置字幕文本解析缓存（以字幕轨序号为 key）。
   final Map<int, List<SubtitleEntry>> _builtinTracksCache = {};
+
+  /// 已加载的外挂字幕（用户手动选的 + 同目录同名自动匹配到的）。
+  final List<_ExternalSub> _externalSubs = [];
+
+  /// 第一次往 mpv 挂外挂轨之前，视频自带字幕轨的 id 快照。
+  ///
+  /// 外挂轨的识别全靠它（标题不可靠，见 [_isBuiltinSubtitleTrack]）。
+  /// 换片时清空，因为 mpv 会连同外挂轨一起丢掉。
+  Set<String>? _builtinSubtitleIdsSnapshot;
+
+  /// 本次播放源的外挂字幕计划（在打开播放源前就打探好，见 [_planExternalSubtitles]）。
+  ///
+  /// 非 null 表示"这次会自动挂外挂字幕"，内嵌 / AI 字幕的自动选择据此主动让位：
+  /// 否则两者会各发一条 mpv 命令抢 `sid`，谁后到谁赢——表现就是"面板里勾着外挂
+  /// 字幕、画面却是内置字幕"。
+  ({ExternalSubtitleMemory memory, List<String> paths, bool fromMemory})?
+      _externalPlan;
+
+  /// mpv 实际的字幕轨 id（读 `sid` 得到，用于核对外挂轨到底挂上没有）。
+  String _lastMpvSid = '';
+
+  /// 最近一条 mpv 错误日志。
+  ///
+  /// media_kit 把 `sub-add` 的失败只写进日志（不抛异常），挂外挂字幕失败时
+  /// 靠它把 mpv 的原话带出来，免得只能回一句"挂不上"。
+  String? _lastMpvError;
+
+  /// 本机这份 mpv 是否已证实渲染不了图形位图字幕（PGS / VobSub）。
+  ///
+  /// 实测 media_kit 在 Windows 上自带的 libmpv 没编译 PGS 解码器，mpv 会直接报
+  /// `Could not find subtitle decoder for format 'hdmv_pgs_subtitle'` 并把轨丢掉。
+  /// 一旦撞上就记住，后续同类字幕直接快速失败，不再白试。
+  ///
+  /// 默认构建用的是支持 PGS 的增强内核（见 windows/CMakeLists.txt），所以这条
+  /// 只在用 `-DPFLX_LIBMPV_ENHANCED=OFF` 退回裁剪版内核时才会触发；
+  /// 留着它是为了让那种构建给出"快速失败 + 说明原因"，而不是静默挂不上。
+  bool _bitmapSubtitleUnsupported = false;
+
+  /// 当前播放内核的 mpv 版本号（懒读一次，只用于排障提示）。
+  ///
+  /// 出问题时"到底是哪份 libmpv 在跑"最难判断：裁剪版和增强版 DLL 同名，
+  /// 构建产物没更新时表现一模一样。把版本号带进提示里，一眼就能对上号。
+  String? _mpvVersion;
+  bool _mpvVersionQueried = false;
+
+  /// 自增的外挂字幕编号，用作稳定 ID。
+  ///
+  /// 不能用列表下标当 ID：移掉一份外挂字幕后其余下标会整体前移，
+  /// 已经选在主/副通道上的那个 ID 就会指到别人身上。
+  int _externalUidSeq = 0;
+
+  /// 当前播放源是否已经尝试过"自动恢复/匹配外挂字幕"。
+  bool _externalRestoreApplied = false;
+
+  /// 是否正在选字幕文件（防止重复弹出选择器）。
+  bool _externalPicking = false;
 
 
   /// AI 字幕是否正在显示（主或副选了 AI 字幕）。
@@ -466,8 +536,16 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   }
 
   Future<void> _initPlayer() async {
-    _player = Player();
+    // 字幕必须由 mpv 真正画出来：media_kit 的默认配置（libass: false）会把 mpv
+    // 设成 `sub-visibility=no` —— 按 mpv 手册的说法是"只选中与解码，但不显示"
+    //（"Can be used to disable display of subtitles, but still select and decode
+    // them"）。本项目把内置字幕与原生外挂字幕（ASS 特效、PGS 图形）都交给 mpv
+    // 渲染，所以必须开这个模式；走 Flutter 叠层那几条路（AI 字幕、文本化字幕）
+    // 各自会用 setSubtitleTrack(no()) 关掉 mpv 字幕，不受影响。
+    _player = Player(configuration: const PlayerConfiguration(libass: true));
     _controller = VideoController(_player);
+    // 再加一道保险：即使 media_kit 日后改了默认值，也确保字幕显示开关是开的。
+    await _forceMpvSubtitleVisible();
     if (isMobilePlatform) {
       // 移动端音频由系统媒体音量全权驱动，确保播放器自身始终为 100% 全额输出
       await _player.setVolume(100.0);
@@ -517,6 +595,12 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _player.stream.track.listen((value) {
       if (mounted) setState(() => _currentTrack = value);
     });
+    // 留一条 mpv 的错误原文：挂外挂字幕失败时能把真正的原因带出来
+    _player.stream.log.listen((event) {
+      if (event.level != 'error' && event.level != 'fatal') return;
+      _lastMpvError = '${event.prefix}: ${event.text}';
+      _noteUnsupportedBitmapSubtitle(event.text);
+    });
 
     await _openSource(_sourcePath, _sourceIsPflx ? _sourceInfo : null);
 
@@ -527,6 +611,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
 
   /// 打开播放源：PFLX 产物走本地 HTTP Range 流（不落盘），普通文件直接播放。
   Future<void> _openSource(String path, PflxInfo? info) async {
+    // 先认下新播放源：拖放换片时调用方要等本方法返回才更新 _sourcePath，
+    // 而下面那些异步动作（外挂字幕恢复、落盘）都用它当身份，晚了会写到上一个视频头上。
+    _sourcePath = path;
     _autoSubtitleApplied = false;
     _windowFitApplied = false;
     _aiCacheChecked = false;
@@ -534,6 +621,12 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _primarySubId = 'none';
     _secondarySubId = 'none';
     _builtinTracksCache.clear();
+    // 外挂字幕是跟着播放源走的：换片后整批丢掉，由下面重新恢复/匹配
+    _externalSubs.clear();
+    _builtinSubtitleIdsSnapshot = null;
+    _externalRestoreApplied = false;
+    _externalPlan = null;
+    _lastMpvSid = '';
     _aiRestoreDebounce?.cancel();
     _restartHintTimer?.cancel();
     _showRestartButton = false;
@@ -543,6 +636,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     // 传入 Media(start: resumePos) 让底层 mpv 原生从目标点解封装，从源头避免从 0 播起
     _pendingResume = await PlaybackProgressStore.resumePositionOf(path);
     final resumePos = _pendingResume;
+    // 起播前先打探"这个视频有没有可用的外挂字幕"：只查记忆与同目录同名，
+    // 不读字幕内容、不外呼 ffmpeg（代价是一次 JSON 读 + 一次目录列举）。
+    // 有了这个结论，内嵌 / AI 字幕的自动选择才知道该让位。
+    _externalPlan = await _planExternalSubtitles(path);
     await _streamServer?.stop();
     _streamServer = null;
     if (info != null) {
@@ -551,6 +648,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     } else {
       await _player.open(Media(path, start: resumePos));
     }
+    // 外挂字幕（记忆恢复 / 同目录同名匹配）不阻塞起播：媒体已经在放了，
+    // 字幕文件读完后自己挂上去即可。这里显式传 path：拖放换片时
+    // [_sourcePath] 要等本方法返回后才更新，不能读它。
+    unawaited(_maybeAutoLoadExternalSubtitles(path));
   }
 
   /// 拖放换片：识别新文件并直接切换播放，不离开播放页。
@@ -676,10 +777,31 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       .where((t) => t.id != 'auto' && t.id != 'no')
       .toList(growable: false);
 
-  /// 真实可切换的字幕轨。
-  List<SubtitleTrack> get _subtitleTracks => _tracks.subtitle
+  /// 真实可切换的**内置**字幕轨。
+  ///
+  /// 必须把我们自己 `sub-add` 上去的外挂轨排除掉：下面所有"内置轨下标"都要和
+  /// ffmpeg 的 `0:s:下标` 一一对齐（提取文本、翻译都靠它），而外挂轨并不属于
+  /// 输入文件，混进来会让下标整体错位、提取到错误的字幕流。
+  List<SubtitleTrack> get _subtitleTracks =>
+      _allSubtitleTracks.where(_isBuiltinSubtitleTrack).toList(growable: false);
+
+  /// mpv 实际报上来的全部字幕轨（含外挂轨）。
+  List<SubtitleTrack> get _allSubtitleTracks => _tracks.subtitle
       .where((t) => t.id != 'auto' && t.id != 'no')
       .toList(growable: false);
+
+  /// 这条轨是不是视频**自带的**字幕轨。
+  ///
+  /// 判定不看轨道标题：`.ass` 文件自带 `Title:` 元数据时，mpv 可能拿它盖掉我们
+  /// `sub-add` 时给的标题。改为在"第一次挂外挂轨之前"给内置轨拍一张快照
+  /// （见 [_builtinSubtitleIdsSnapshot]），快照之外的必然是外挂轨。
+  bool _isBuiltinSubtitleTrack(SubtitleTrack track) {
+    if (ExternalSubtitleLoader.isExternalTrack(track)) return false;
+    final snapshot = _builtinSubtitleIdsSnapshot;
+    // 还没挂过任何外挂轨：列表里不可能有外挂轨，全部按内置处理
+    if (snapshot == null) return true;
+    return snapshot.contains(track.id);
+  }
 
   /// 当前实际在播放的音轨 id。
   ///
@@ -735,8 +857,110 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   bool get _hasAnyActiveSubtitle =>
       _primarySubId != 'none' || _secondarySubId != 'none';
 
-  /// 主字幕是否为视频内置字幕（由底层 mpv 直接原生渲染）。
-  bool get _isBuiltinPrimary => _primarySubId.startsWith('builtin_');
+  /// 主字幕是否由底层 mpv 原生渲染（内置轨，或原生模式的特效外挂字幕）。
+  bool get _isNativePrimary {
+    final builtin = _parseBuiltinId(_primarySubId);
+    if (builtin != null) return !builtin.text;
+    final ext = _externalById(_primarySubId);
+    return ext != null && ext.rendersNatively;
+  }
+
+  /// 主字幕是否为"特效 / 图形"类原生字幕。
+  ///
+  /// 这类字幕由 mpv 直接画在画面上（带样式、定位、特效或整幅位图），再叠一层
+  /// AI 字幕必然互相遮挡，所以此时 AI 字幕一律置灰，只在面板里给一句说明。
+  bool get _isExclusivePrimary {
+    final builtin = _parseBuiltinId(_primarySubId);
+    if (builtin != null) {
+      if (builtin.text) return false;
+      if (builtin.index < 0 || builtin.index >= _subtitleTracks.length) {
+        return false;
+      }
+      final track = _subtitleTracks[builtin.index];
+      return BuiltInSubtitleExtractor.isGraphicSubtitle(track) ||
+          _isEffectsCodec(track.codec);
+    }
+    final ext = _externalById(_primarySubId);
+    return ext != null && ext.rendersNatively;
+  }
+
+  /// 当前主字幕能否"降级成纯文本"（图形位图字幕做不到，只能原生渲染）。
+  bool get _canConvertPrimaryToText {
+    final builtin = _parseBuiltinId(_primarySubId);
+    if (builtin != null) {
+      if (builtin.text) return false;
+      if (builtin.index < 0 || builtin.index >= _subtitleTracks.length) {
+        return false;
+      }
+      return !BuiltInSubtitleExtractor.isGraphicSubtitle(
+        _subtitleTracks[builtin.index],
+      );
+    }
+    final ext = _externalById(_primarySubId);
+    // 图形位图字幕（.sup / VobSub）抽不出文字，没有"转文本"这条路
+    return ext != null &&
+        ext.rendersNatively &&
+        ext.kind == ExternalSubtitleKind.effects;
+  }
+
+  /// 特效 / 图形主字幕的说明文案。
+  String get _exclusivePrimaryHint {
+    const graphicsHint = '该字幕是图形位图字幕（PGS / VobSub），只能由底层原生渲染，'
+        '也无法转成文本，因此不能与 AI 字幕同时显示。';
+    final builtin = _parseBuiltinId(_primarySubId);
+    if (builtin != null &&
+        builtin.index >= 0 &&
+        builtin.index < _subtitleTracks.length &&
+        BuiltInSubtitleExtractor.isGraphicSubtitle(_subtitleTracks[builtin.index])) {
+      return '该内置$graphicsHint';
+    }
+    final ext = _externalById(_primarySubId);
+    if (ext != null && ext.kind == ExternalSubtitleKind.graphics) {
+      return '该外挂$graphicsHint';
+    }
+    return '该字幕带特效 / 定位，为保真交由底层原生渲染，'
+        '与 AI 字幕同屏会互相遮挡，因此 AI 字幕暂不可选。';
+  }
+
+  /// 编码是否属于"带特效"的字幕格式（ASS / SSA）。
+  static bool _isEffectsCodec(String? codec) {
+    final c = (codec ?? '').toLowerCase();
+    return c.contains('ass') || c.contains('ssa');
+  }
+
+  /// 解析内置字幕轨 ID：`builtin_2`（原生渲染）/ `builtin_2_text`（文本化）。
+  ({int index, bool text})? _parseBuiltinId(String id) {
+    if (!id.startsWith('builtin_')) return null;
+    final rest = id.substring(8);
+    final text = rest.endsWith('_text');
+    final index = int.tryParse(
+      text ? rest.substring(0, rest.length - '_text'.length) : rest,
+    );
+    if (index == null) return null;
+    return (index: index, text: text);
+  }
+
+  /// 外挂字幕的稳定 ID（用自增编号，不用列表下标，见 [_externalUidSeq]）。
+  String _externalIdOf(_ExternalSub ext) => 'external_${ext.uid}';
+
+  /// 按 ID 找外挂字幕；不是外挂字幕或找不着时返回 null。
+  _ExternalSub? _externalById(String id) {
+    if (!id.startsWith('external_')) return null;
+    final uid = int.tryParse(id.substring('external_'.length));
+    if (uid == null) return null;
+    for (final ext in _externalSubs) {
+      if (ext.uid == uid) return ext;
+    }
+    return null;
+  }
+
+  /// 是否已经有外挂字幕占着主字幕位。
+  bool get _hasExternalPrimary => _externalById(_primarySubId) != null;
+
+  /// 是否已经有外挂字幕挂在主或副通道上。
+  bool get _hasExternalActive =>
+      _externalById(_primarySubId) != null ||
+      _externalById(_secondarySubId) != null;
 
   /// 根据字幕源 ID 检索当前对应的文本条目列表。
   List<SubtitleEntry>? _getEntriesForSubId(String id) {
@@ -757,16 +981,16 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
             : e.text,
       )).toList();
     }
-    if (id.startsWith('builtin_')) {
-      final idx = int.tryParse(id.substring(8));
-      if (idx != null && _builtinTracksCache.containsKey(idx)) {
-        return _builtinTracksCache[idx];
-      }
+    // 内置轨的"文本化"变体与副字幕通道共用同一份提取缓存
+    final builtin = _parseBuiltinId(id);
+    if (builtin != null) {
+      return _builtinTracksCache[builtin.index];
     }
-    return null;
+    // 外挂字幕：只有纯文本模式才有条目，原生模式的由 mpv 直接画
+    return _externalById(id)?.displayEntries;
   }
 
-  /// 提取并缓存指定的内置字幕轨（用于作为副字幕或供外部调用）。
+  /// 提取并缓存指定的内置字幕轨（用于作为副字幕、主字幕文本化或翻译）。
   Future<void> _ensureBuiltinTrackLoaded(int idx) async {
     if (_builtinTracksCache.containsKey(idx)) return;
     if (idx < 0 || idx >= _subtitleTracks.length) return;
@@ -796,8 +1020,18 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _primarySubId = id;
     _aiSubtitleActive = _primarySubId.startsWith('ai_') || _secondarySubId.startsWith('ai_');
 
+    // 主字幕换成原生渲染的"特效/图形"字幕时，同屏的 AI 副字幕必须先摘掉：
+    // 两者叠在同一片画面上就是互相遮挡，不如只留一条干净的。
+    var droppedAiSecondary = false;
+    if (_isExclusivePrimary && _secondarySubId.startsWith('ai_')) {
+      _secondarySubId = 'none';
+      _aiSubtitleActive = false;
+      droppedAiSecondary = true;
+    }
+
     if (id == 'none') {
       await _player.setSubtitleTrack(SubtitleTrack.no());
+      await _syncMpvSubtitleDelay();
       if (mounted) {
         setState(() {});
         if (showOsd) _showOsd('已关闭主字幕');
@@ -805,29 +1039,348 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       return;
     }
 
-    if (id.startsWith('builtin_')) {
-      final idx = int.tryParse(id.substring(8)) ?? 0;
-      if (idx >= 0 && idx < _subtitleTracks.length) {
-        final track = _subtitleTracks[idx];
-        // 关键修复：内置字幕直接交由底层 mpv 原生渲染！
+    final builtin = _parseBuiltinId(id);
+    final ext = _externalById(id);
+    final isNative = (builtin != null && !builtin.text) ||
+        (ext != null && ext.rendersNatively);
+
+    if (isNative) {
+      if (builtin != null) {
+        if (builtin.index < 0 || builtin.index >= _subtitleTracks.length) {
+          // 轨道列表变了（换片/轨道消失）：别把字幕停在一个已经不存在的下标上
+          _primarySubId = 'none';
+          if (mounted) setState(() {});
+          return;
+        }
+        final track = _subtitleTracks[builtin.index];
+        // 关键：内置字幕直接交由底层 mpv 原生渲染！
         // 0 延迟、100% 格式兼容（SRT/ASS/PGS/VobSub），彻底避免提取延迟或失败导致黑屏无字幕
         await _player.setSubtitleTrack(track);
+        _lastMpvSid = track.id;
+      } else if (ext != null) {
+        final attached = await _attachExternalTrackToMpv(ext);
+        if (!attached) {
+          // 挂不上就如实回退：面板状态必须和画面一致
+          await _handleExternalAttachFailed(ext);
+          return;
+        }
+      }
+      await _syncMpvSubtitleDelay();
+      if (mounted) {
+        setState(() {});
+        if (showOsd) {
+          _showOsd(
+            '主字幕：${_primarySubtitleLabel()}${droppedAiSecondary ? '（已关闭同屏 AI 字幕）' : ''}',
+          );
+        }
+      }
+      unawaited(_persistExternalSubtitles());
+      return;
+    }
+
+    // 叠层渲染：AI 字幕 / 文本化内置轨 / 纯文本外挂字幕。
+    // 统一关掉底层 mpv 原生字幕，避免两套渲染叠在一起。
+    await _player.setSubtitleTrack(SubtitleTrack.no());
+    await _syncMpvSubtitleDelay();
+
+    if (builtin != null && builtin.text) {
+      await _ensureBuiltinTrackLoaded(builtin.index);
+      if (!_builtinTracksCache.containsKey(builtin.index)) {
+        // 提取失败（图形字幕/损坏）：别把下拉停在一个永远不显示的项上
+        _primarySubId = 'none';
         if (mounted) {
           setState(() {});
-          if (showOsd) _showOsd('主字幕：${_subtitleLabel(track)}');
+          if (showOsd) _showOsd('该内置字幕无法转为文本显示');
+        }
+        return;
+      }
+    } else if (ext != null) {
+      final ok = await _ensureExternalTextLoaded(ext);
+      if (!ok) {
+        _primarySubId = 'none';
+        if (mounted) {
+          setState(() {});
+          if (showOsd) _showOsd('外挂字幕加载失败：${ext.name}');
         }
         return;
       }
     }
 
-    // AI 识别或翻译字幕：关闭底层 mpv 原生字幕，统一由 Flutter 叠层渲染
-    await _player.setSubtitleTrack(SubtitleTrack.no());
     if (mounted) {
       setState(() {});
       if (showOsd) {
-        final label = id == 'ai_translation' ? 'AI 翻译字幕' : 'AI 语音原字幕';
-        _showOsd('主字幕：$label');
+        _showOsd(
+          '主字幕：${_primarySubtitleLabel()}${droppedAiSecondary ? '（已关闭同屏 AI 字幕）' : ''}',
+        );
       }
+    }
+    unawaited(_persistExternalSubtitles());
+  }
+
+  /// 主字幕的显示名（OSD / 提示用）。
+  String _primarySubtitleLabel() {
+    final id = _primarySubId;
+    if (id == 'ai_translation') return 'AI 翻译字幕';
+    if (id == 'ai_original') return 'AI 语音原字幕';
+    final builtin = _parseBuiltinId(id);
+    if (builtin != null) {
+      final label = builtin.index >= 0 && builtin.index < _subtitleTracks.length
+          ? _subtitleLabel(_subtitleTracks[builtin.index])
+          : '内置字幕 ${builtin.index}';
+      return builtin.text ? '$label（纯文本）' : label;
+    }
+    final ext = _externalById(id);
+    // 外挂字幕只报文件名：文件名本身已经说明它是哪一份，再缀"原生特效/纯文本"
+    // 只是噪音（用户明确提过不要这类提示）
+    if (ext != null) return ext.name;
+    return '无';
+  }
+
+  /// 把外挂原生字幕（特效 `.ass` / 图形 `.sup`、VobSub）交给 mpv 渲染。
+  ///
+  /// 返回 false 表示**没真正挂上**（格式不受内核支持等），调用方要如实回退。
+  ///
+  /// 这里要绕开两个坑：
+  ///  1. media_kit 的 `sub-add` 出错时**只写日志、不抛异常**（见其 `_command`），
+  ///     光看"调用没报错"完全靠不住——必须回读 mpv 的 `sid` 核对；
+  ///  2. media_kit 每次 `setSubtitleTrack(SubtitleTrack.uri(...))` 都会重新
+  ///     `sub-add`，同名文件反复切换会挂出一堆重复轨，所以先查是否已经挂过。
+  Future<bool> _attachExternalTrackToMpv(_ExternalSub ext) async {
+    // 本机内核已证实渲染不了图形位图字幕：直接失败，别再白试一遍
+    if (ext.kind == ExternalSubtitleKind.graphics && _bitmapSubtitleUnsupported) {
+      return false;
+    }
+
+    // 已经挂过 → 只切 sid，不重复添加
+    final existing = _findAttachedExternalTrack(ext);
+    if (existing != null) {
+      try {
+        await _player.setSubtitleTrack(existing);
+        _lastMpvSid = existing.id;
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // 第一次挂外挂轨：先把当前的字幕轨拍成"内置快照"，之后靠它区分内外
+    _snapshotBuiltinSubtitleIds();
+    _lastMpvError = null;
+    _lastMpvSid = '';
+
+    final path = ext.mpvPath ??=
+        await ExternalSubtitleLoader.ensureMpvReadable(ext.path);
+
+    // 1. 原文件：裸路径 → Windows 长路径写法（视频自己也是这么打开的）
+    //    核对窗口给到约 0.9 秒：图形字幕（.sup 几十 MB）在新内核上要建索引，
+    //    慢了半拍就误判成"挂不上"会把能用的字幕冤枉掉。
+    for (final uri in ExternalSubtitleLoader.uriCandidates(path)) {
+      if (await _tryAttachExternalUri(ext, uri, attempts: 6)) return true;
+    }
+
+    // 2. 文件可能已经进去了、只是 sid 没落到它身上（被内置轨抢了）→ 显式再选一次
+    final attached = _findAttachedExternalTrack(ext);
+    if (attached != null) {
+      try {
+        await _player.setSubtitleTrack(attached);
+        if (await _verifyExternalSubtitleSelected(attempts: 4)) {
+          ext.mpvTrackId = _lastMpvSid;
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  /// 用给定地址发一次 `sub-add` 并核对是否真的选中；成功返回 true。
+  Future<bool> _tryAttachExternalUri(
+    _ExternalSub ext,
+    String uri, {
+    required int attempts,
+  }) async {
+    try {
+      await _player.setSubtitleTrack(
+        SubtitleTrack.uri(
+          uri,
+          title: ExternalSubtitleLoader.trackTitleFor(ext.path),
+          language: 'external',
+        ),
+      );
+    } catch (_) {
+      return false;
+    }
+    if (!await _verifyExternalSubtitleSelected(attempts: attempts)) return false;
+    ext.mpvTrackId = _lastMpvSid;
+    return true;
+  }
+
+  /// 拍一次"内置字幕轨 id"快照（只在第一次挂外挂轨前拍，之后不再变）。
+  ///
+  /// 轨道还没报全（快照为空）时宁可不拍：否则后面才报上来的内置轨会被当成外挂轨。
+  void _snapshotBuiltinSubtitleIds() {
+    if (_builtinSubtitleIdsSnapshot != null) return;
+    final ids = _allSubtitleTracks.map((t) => t.id).toSet();
+    if (ids.isNotEmpty) _builtinSubtitleIdsSnapshot = ids;
+  }
+
+  /// 找出这个外挂文件已经挂到 mpv 上的那条轨（没有则 null）。
+  ///
+  /// 优先用上次成功挂载时记下的轨 id；退一步按标题找（标题可能被 mpv 用 ASS 自带的
+  /// `Title:` 元数据盖掉）。
+  SubtitleTrack? _findAttachedExternalTrack(_ExternalSub ext) {
+    final id = ext.mpvTrackId;
+    if (id != null && id.isNotEmpty) {
+      final byId = _allSubtitleTracks.where((t) => t.id == id).firstOrNull;
+      if (byId != null) return byId;
+      ext.mpvTrackId = null; // 轨没了（换过片源等）
+    }
+    final title = ExternalSubtitleLoader.trackTitleFor(ext.path);
+    return _allSubtitleTracks.where((t) => t.title == title).firstOrNull;
+  }
+
+  /// 核对 mpv 是不是真的选中了外挂轨（读 `sid` 对账）。
+  ///
+  /// 判据：sid 指向的轨不在"内置快照"里 ⇒ 那就是刚挂上去的外挂轨。
+  /// 读不到属性时按成功处理，避免把能用的情况误判成失败。
+  Future<bool> _verifyExternalSubtitleSelected({int attempts = 5}) async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return true;
+    final snapshot = _builtinSubtitleIdsSnapshot ?? const <String>{};
+
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      if (!mounted) return true;
+      String sid;
+      try {
+        sid = (await platform.getProperty('sid')).trim();
+      } catch (_) {
+        return true;
+      }
+      if (sid.isEmpty) return true;
+      _lastMpvSid = sid;
+      if (sid == 'no' || sid == 'auto') continue;
+      // 视频本来一条字幕都没有（快照为空）时，能报出 id 的只可能是我们刚挂的那条
+      if (!snapshot.contains(sid)) return true;
+    }
+    return false;
+  }
+
+  /// mpv 报出"图形字幕没解码器"时记下来（本机内核渲染不了 PGS / VobSub）。
+  ///
+  /// 记下之后同类字幕直接快速失败，并在用户正看着这类字幕时当场说明原因，
+  /// 免得他对着一个永远不出现的字幕反复点。
+  void _noteUnsupportedBitmapSubtitle(String text) {
+    if (!text.contains('subtitle decoder') &&
+        !text.contains('subtitle converter')) {
+      return;
+    }
+    if (_bitmapSubtitleUnsupported) return;
+    _bitmapSubtitleUnsupported = true;
+    debugPrint('[PolyFlix][external-subtitle] 本机 mpv 缺少图形字幕解码器：$text');
+    if (!mounted) return;
+    if (_isGraphicPrimary) {
+      _showOsd('本机内核不支持图形位图字幕（PGS / VobSub）');
+    }
+  }
+
+  /// 当前主字幕是否为图形位图字幕（内置 PGS/VobSub，或外挂图形字幕）。
+  bool get _isGraphicPrimary {
+    final builtin = _parseBuiltinId(_primarySubId);
+    if (builtin != null) {
+      return builtin.index >= 0 &&
+          builtin.index < _subtitleTracks.length &&
+          BuiltInSubtitleExtractor.isGraphicSubtitle(_subtitleTracks[builtin.index]);
+    }
+    final ext = _externalById(_primarySubId);
+    return ext != null && ext.kind == ExternalSubtitleKind.graphics;
+  }
+
+  /// 确保 mpv 的字幕显示开关是打开的。
+  ///
+  /// `sub-visibility=no` 时 mpv 会"只解码不显示"，画面里不会有任何字幕，
+  /// 而其它状态（sid、sub-start、sub-text）看起来都正常，极难排查。
+  Future<void> _forceMpvSubtitleVisible() async {
+    try {
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        await platform.setProperty('sub-visibility', 'yes');
+        // 回读一次记进日志：这条状态一旦是 no，任何字幕都不会出现在画面上，
+        // 而其它迹象（sid / sub-start / sub-text）全都正常，极难排查。
+        final vis = (await platform.getProperty('sub-visibility')).trim();
+        debugPrint('[PolyFlix][subtitle] mpv sub-visibility=$vis');
+      }
+    } catch (_) {
+      // 设置失败不拦播放：最坏就是回到 media_kit 的默认行为
+    }
+  }
+
+  /// 读一次当前内核的 mpv 版本号（拿不到就返回 null）。
+  Future<String?> _resolveMpvVersion() async {
+    if (_mpvVersionQueried) return _mpvVersion;
+    _mpvVersionQueried = true;
+    try {
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        final value = (await platform.getProperty('mpv-version')).trim();
+        if (value.isNotEmpty) _mpvVersion = value;
+      }
+    } catch (_) {
+      // 读不到就不带版本号，不影响其它逻辑
+    }
+    return _mpvVersion;
+  }
+
+  /// 外挂字幕没能真正挂上时的善后。
+  ///
+  /// 关键是别让界面骗人：面板里勾着外挂字幕、画面却是原来那条字幕，
+  /// 比直接报一句错更让人摸不着头脑。
+  Future<void> _handleExternalAttachFailed(_ExternalSub ext) async {
+    // 把面板对齐到 mpv 的真实情况：它现在显示哪条内置轨就选哪条
+    var restored = 'none';
+    for (var i = 0; i < _subtitleTracks.length; i++) {
+      if (_subtitleTracks[i].id == _lastMpvSid) {
+        restored = 'builtin_$i';
+        break;
+      }
+    }
+    _primarySubId = restored;
+    // mpv 的原话打到控制台：OSD 上只报一句，细节留给排查
+    final version = await _resolveMpvVersion();
+    final versionTag = version == null ? '' : '（当前内核 $version）';
+    debugPrint(
+      '[PolyFlix][external-subtitle] "${ext.name}" 挂载失败，'
+      'sid=$_lastMpvSid，'
+      '内核=${version ?? '未知'}，'
+      'mpv 报错：${_lastMpvError ?? '（无）'}',
+    );
+    if (mounted) {
+      setState(() {});
+      // 图形位图字幕挂不上基本只有一种原因（内核没有 PGS/VobSub 解码器），
+      // 这时给一句能照做的建议 + 当前内核版本，比"无法播放"有用得多
+      _showOsd(
+        ext.kind == ExternalSubtitleKind.graphics
+            ? '本机内核$versionTag不支持图形位图字幕（PGS / VobSub），'
+                '请改用 .srt / .ass 字幕'
+            : '该外挂字幕无法播放：${ext.name}$versionTag',
+      );
+    }
+    unawaited(_persistExternalSubtitles());
+  }
+
+  /// 把当前主字幕的时间轴偏移同步给 mpv。
+  ///
+  /// 原生渲染的字幕由 mpv 自己排版，偏移只能靠 `sub-delay` 生效；
+  /// 叠层渲染的字幕是我们在条目上直接加偏移的，这里要把它复位成 0。
+  Future<void> _syncMpvSubtitleDelay() async {
+    final ext = _externalById(_primarySubId);
+    final seconds = (ext != null && ext.rendersNatively) ? ext.offsetMs / 1000.0 : 0.0;
+    try {
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        await platform.setProperty('sub-delay', seconds.toString());
+      }
+    } catch (_) {
+      // 设置失败不影响播放：最坏就是偏移不生效
     }
   }
 
@@ -845,11 +1398,13 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     }
 
     if (id.startsWith('builtin_')) {
-      final idx = int.tryParse(id.substring(8)) ?? 0;
+      final builtin = _parseBuiltinId(id);
+      final idx = builtin?.index ?? -1;
       if (idx >= 0 && idx < _subtitleTracks.length) {
         final track = _subtitleTracks[idx];
+        // 副字幕只能走叠层渲染，所以这里一律按"文本化"处理（样式丢失）
         if (!_builtinTracksCache.containsKey(idx)) {
-          _ensureBuiltinTrackLoaded(idx);
+          await _ensureBuiltinTrackLoaded(idx);
         }
         if (mounted) {
           setState(() {});
@@ -857,6 +1412,37 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         }
         return;
       }
+    }
+
+    // 外挂字幕作副字幕：同样只支持纯文本模式（原生特效字幕独占画面，不当副字幕）
+    final ext = _externalById(id);
+    if (ext != null) {
+      if (ext.rendersNatively) return;
+      final ok = await _ensureExternalTextLoaded(ext);
+      if (!ok) {
+        _secondarySubId = 'none';
+        if (mounted) {
+          setState(() {});
+          if (showOsd) _showOsd('外挂字幕加载失败：${ext.name}');
+        }
+        return;
+      }
+      if (mounted) {
+        setState(() {});
+        if (showOsd) _showOsd('副字幕：${ext.name}');
+      }
+      unawaited(_persistExternalSubtitles());
+      return;
+    }
+
+    // AI 字幕作副字幕时，如果主字幕是特效/图形字幕，两者会同屏打架，直接拒绝
+    if (id.startsWith('ai_') && _isExclusivePrimary) {
+      _secondarySubId = 'none';
+      if (mounted) {
+        setState(() {});
+        if (showOsd) _showOsd(_exclusivePrimaryHint);
+      }
+      return;
     }
 
     if (mounted) {
@@ -874,9 +1460,402 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _secondarySubId = 'none';
     _aiSubtitleActive = false;
     await _player.setSubtitleTrack(SubtitleTrack.no());
+    await _syncMpvSubtitleDelay();
     if (mounted) {
       setState(() {});
       _showOsd('已关闭全部字幕');
+    }
+    // 一并记下"这次一条都没挂"：下次打开同一个视频不要自作主张再弹出来
+    unawaited(_persistExternalSubtitles());
+  }
+
+  // ---------------- 外挂字幕（加载 / 模式 / 偏移 / 记忆） ----------------
+
+  /// 确保外挂字幕的文本条目已解析出来（首次会读文件，必要时外呼 ffmpeg 转码）。
+  Future<bool> _ensureExternalTextLoaded(_ExternalSub ext) async {
+    if (ext.displayEntries != null) return true;
+    try {
+      final entries = await ExternalSubtitleLoader.loadEntries(ext.path);
+      if (entries.isEmpty) return false;
+      ext.baseEntries = entries;
+      _applyExternalOffset(ext);
+      if (mounted) setState(() {});
+      return true;
+    } catch (e) {
+      if (mounted) _showOsd('外挂字幕解析失败：${ext.name}（$e）');
+      return false;
+    }
+  }
+
+  /// 按当前偏移重建外挂字幕的显示条目。
+  ///
+  /// 叠层每帧都要拿这份列表做二分查找，所以偏移一变就整批算好缓存下来，
+  /// 不在渲染路径上做逐条加减。
+  void _applyExternalOffset(_ExternalSub ext) {
+    final base = ext.baseEntries;
+    if (base == null) {
+      ext.displayEntries = null;
+      return;
+    }
+    ext.displayEntries = ExternalSubtitleLoader.applyOffset(
+      base,
+      Duration(milliseconds: ext.offsetMs),
+    );
+  }
+
+  /// 加载一份外挂字幕；同一路径只会留一份。
+  Future<_ExternalSub?> _loadExternalSubtitle(
+    String rawPath, {
+    bool plainText = false,
+    int offsetMs = 0,
+  }) async {
+    if (!ExternalSubtitleLoader.isSupported(rawPath)) {
+      if (mounted) {
+        _showOsd('不支持的字幕格式：${ExternalSubtitleLoader.fileNameOf(rawPath)}');
+      }
+      return null;
+    }
+
+    // VobSub 递过来 `.sub` 时换成同名的 `.idx`（mpv 要的是索引文件）
+    final path = await ExternalSubtitleLoader.resolveCompanion(rawPath);
+
+    for (final ext in _externalSubs) {
+      if (ext.path == path) return ext;
+    }
+
+    final ext = _ExternalSub(
+      uid: _externalUidSeq++,
+      path: path,
+      name: ExternalSubtitleLoader.fileNameOf(path),
+      kind: ExternalSubtitleLoader.kindOf(path),
+      plainText: plainText,
+      offsetMs: offsetMs,
+    );
+
+    // 纯文本模式的先解析出内容再入列：读不出来的话加进来也只是个永远不显示的项
+    if (!ext.rendersNatively) {
+      final ok = await _ensureExternalTextLoaded(ext);
+      if (!ok) return null;
+    }
+
+    _externalSubs.add(ext);
+    if (mounted) setState(() {});
+    return ext;
+  }
+
+  /// 「加载外挂字幕…」：选文件 → 加载 → 挂为主字幕。
+  Future<void> _pickExternalSubtitle() async {
+    if (_externalPicking) return;
+    _externalPicking = true;
+    try {
+      final picked = await NativeFileHelper.pickSubtitleFile(
+        allowedExtensions: kExternalSubtitleExtensions.toList(),
+      );
+      if (picked == null) return;
+      if (!ExternalSubtitleLoader.isSupported(picked.path)) {
+        if (mounted) {
+          _showOsd(
+            '不支持的字幕格式：${picked.name}（支持 srt / vtt / ass / ssa / sup / idx）',
+          );
+        }
+        return;
+      }
+      if (mounted) _showOsd('正在加载字幕：${picked.name}');
+
+      final ext = await _loadExternalSubtitle(picked.path);
+      if (ext == null || !mounted) return;
+
+      await _selectPrimarySubtitle(_externalIdOf(ext), showOsd: false);
+      if (!mounted) return;
+      // 渲染方式（原生特效 / 纯文本）在面板里能看到，这里只报一句结果；
+      // 挂不上时 _handleExternalAttachFailed 已经报过原因，不再重复
+      if (_hasExternalPrimary) _showOsd('已加载外挂字幕：${ext.name}');
+    } catch (e) {
+      if (mounted) _showOsd('加载外挂字幕失败：$e');
+    } finally {
+      _externalPicking = false;
+    }
+  }
+
+  /// 卸载一份外挂字幕（并把它从主/副通道上摘掉）。
+  Future<void> _removeExternalSubtitle(String id) async {
+    final ext = _externalById(id);
+    if (ext == null) return;
+    if (_primarySubId == id) await _selectPrimarySubtitle('none', showOsd: false);
+    if (_secondarySubId == id) {
+      await _selectSecondarySubtitle('none', showOsd: false);
+    }
+    _externalSubs.remove(ext);
+    if (mounted) {
+      setState(() {});
+      _showOsd('已移除外挂字幕：${ext.name}');
+    }
+    unawaited(_persistExternalSubtitles());
+  }
+
+  /// 微调外挂字幕的时间轴偏移（正数 = 字幕整体延后）。
+  Future<void> _nudgeExternalOffset(String id, int deltaMs) async {
+    final ext = _externalById(id);
+    if (ext == null) return;
+    final next = (ext.offsetMs + deltaMs).clamp(-30000, 30000);
+    if (next == ext.offsetMs) return;
+    ext.offsetMs = next;
+    _applyExternalOffset(ext);
+    if (ext.rendersNatively && _primarySubId == id) {
+      await _syncMpvSubtitleDelay();
+    }
+    if (mounted) {
+      setState(() {});
+      _showOsd('${ext.name} 偏移 ${_formatOffsetLabel(next)}');
+    }
+    unawaited(_persistExternalSubtitles());
+  }
+
+  /// 把外挂字幕的时间轴偏移归零。
+  Future<void> _resetExternalOffset(String id) async {
+    final ext = _externalById(id);
+    if (ext == null || ext.offsetMs == 0) return;
+    ext.offsetMs = 0;
+    _applyExternalOffset(ext);
+    if (ext.rendersNatively && _primarySubId == id) {
+      await _syncMpvSubtitleDelay();
+    }
+    if (mounted) {
+      setState(() {});
+      _showOsd('${ext.name} 偏移已归零');
+    }
+    unawaited(_persistExternalSubtitles());
+  }
+
+  /// 「改为纯文本模式」：把当前主字幕从原生渲染降级成叠层文本。
+  ///
+  /// 特效/图形字幕走原生渲染虽然保真，但会挡住 AI 字幕；这一步用 ffmpeg 把文字
+  /// 抠出来（样式、定位、特效丢失），换回"可以和 AI 字幕并排"的能力。
+  Future<void> _convertPrimaryToPlainText() async {
+    if (!_isExclusivePrimary || !_canConvertPrimaryToText) return;
+    final id = _primarySubId;
+    final builtin = _parseBuiltinId(id);
+
+    if (builtin != null) {
+      final label = _primarySubtitleLabel();
+      // 内置轨没有"模式"可言：改选它的文本化变体即可
+      await _selectPrimarySubtitle(
+        'builtin_${builtin.index}_text',
+        showOsd: false,
+      );
+      if (!mounted) return;
+      if (_parseBuiltinId(_primarySubId)?.text != true) return; // 提取失败已自行提示
+      _showOsd('已将 $label 切换为纯文本模式');
+    } else {
+      final ext = _externalById(id);
+      if (ext == null) return;
+      if (ext.kind == ExternalSubtitleKind.graphics) {
+        if (mounted) _showOsd('图形位图字幕无法转为文本，只能由底层原生渲染');
+        return;
+      }
+      ext.plainText = true;
+      final ok = await _ensureExternalTextLoaded(ext);
+      if (!ok) {
+        ext.plainText = false;
+        if (mounted) _showOsd('该字幕无法转为文本，仍按原生特效渲染');
+        return;
+      }
+      await _selectPrimarySubtitle(id, showOsd: false);
+      if (!mounted) return;
+      _showOsd('已将 ${ext.name} 切换为纯文本模式');
+      unawaited(_persistExternalSubtitles());
+    }
+
+    // 顺手把已经就绪的 AI 字幕挂成副字幕，省得用户再点一次
+    String? aiLabel;
+    if (_hasTranslation) {
+      await _selectSecondarySubtitle('ai_translation', showOsd: false);
+      aiLabel = 'AI 翻译字幕';
+    } else if (_hasAiOriginal) {
+      await _selectSecondarySubtitle('ai_original', showOsd: false);
+      aiLabel = 'AI 语音原字幕';
+    }
+    if (!mounted) return;
+    _showOsd(
+      aiLabel == null
+          ? '已切换为纯文本模式，现在可以选择 AI 字幕了'
+          : '已切换为纯文本模式，并把 $aiLabel 挂为副字幕',
+    );
+  }
+
+  /// 打探这个视频该不该自动挂外挂字幕（只看路径，不读字幕内容）。
+  ///
+  /// 优先用"上次的选择"记忆（含模式与偏移），没有记忆才扫同目录同名文件。
+  /// 返回 null 表示这次没有任何可用的外挂字幕。
+  Future<({ExternalSubtitleMemory memory, List<String> paths, bool fromMemory})?>
+      _planExternalSubtitles(String videoPath) async {
+    try {
+      final memory = await ExternalSubtitleStore.load(videoPath);
+      final paths = <String>[];
+      for (final record in memory.records) {
+        if (await ExternalSubtitleLoader.exists(record.path)) {
+          paths.add(record.path);
+        }
+      }
+      if (paths.isNotEmpty) {
+        return (memory: memory, paths: paths, fromMemory: true);
+      }
+      final siblings = await ExternalSubtitleLoader.findSiblingSubtitles(
+        videoPath,
+        limit: 2,
+      );
+      if (siblings.isEmpty) return null;
+      return (
+        memory: const ExternalSubtitleMemory(),
+        paths: siblings,
+        fromMemory: false,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 外挂字幕没挂上时，把"外挂字幕优先"的位子还给内嵌 / AI 字幕的自动选择。
+  Future<void> _releaseExternalPriority() async {
+    if (_externalPlan == null) return;
+    _externalPlan = null;
+    _autoSubtitleApplied = false;
+    await _maybeAutoSelectSubtitle();
+    if (!mounted) return;
+    _aiCacheChecked = false;
+    _scheduleAiSubtitleRestore();
+  }
+
+  /// 等媒体元数据到位（时长或字幕轨已经报上来）。
+  ///
+  /// 自动挂外挂字幕发生在 `open()` 刚返回时，此时 mpv 可能还没解析完文件头，
+  /// 这个时机调 `sub-add` 会失败；等一小会儿再挂就稳了。
+  Future<void> _awaitMediaReady({
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (mounted && !_durationKnown && _subtitleTracks.isEmpty) {
+      if (DateTime.now().isAfter(deadline)) return;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
+  /// 打开视频后恢复 / 匹配外挂字幕。
+  ///
+  /// 优先级：**外挂字幕 > 内嵌字幕 > AI 字幕**。
+  ///  1. 上次给这个视频挂过外挂字幕（记忆里存着）→ 按原样恢复（模式、偏移、所在通道）；
+  ///  2. 没有记忆 → 在同目录找同名外挂字幕（`movie.mp4` → `movie.srt`），命中就自动挂上；
+  ///  3. 都没有 → 什么都不做，交回给内嵌 / AI 字幕的既有自动选择逻辑。
+  Future<void> _maybeAutoLoadExternalSubtitles(String videoPath) async {
+    if (_externalRestoreApplied) return;
+    _externalRestoreApplied = true;
+
+    final plan = _externalPlan;
+    if (plan == null) return; // 起播前打探过：这个视频没有可用的外挂字幕
+
+    try {
+      await _awaitMediaReady();
+      if (!mounted) return;
+
+      if (plan.fromMemory) {
+        final memory = plan.memory;
+        final restored = <({int index, _ExternalSub ext})>[];
+        for (var i = 0; i < memory.records.length; i++) {
+          final record = memory.records[i];
+          if (!await ExternalSubtitleLoader.exists(record.path)) continue;
+          final ext = await _loadExternalSubtitle(
+            record.path,
+            plainText: record.plainText,
+            offsetMs: record.offsetMs,
+          );
+          if (ext != null) restored.add((index: i, ext: ext));
+        }
+
+        if (restored.isNotEmpty) {
+          // 记忆里存的是"当时那份清单的下标"，有文件加载失败时下标会错位，
+          // 所以按原下标回查，最多退化成"只把文件备着不显示"。
+          final primary = restored
+              .where((r) => r.index == memory.primaryIndex)
+              .firstOrNull
+              ?.ext;
+          final secondary = restored
+              .where((r) => r.index == memory.secondaryIndex)
+              .firstOrNull
+              ?.ext;
+
+          if (primary == null && secondary == null) {
+            // 上次这些文件挂着但没用在任何通道上（用户后来关掉了全部字幕之类）：
+            // 只把它们放回列表备选，不擅自弹出来显示。
+            return;
+          }
+          if (primary != null) {
+            await _selectPrimarySubtitle(_externalIdOf(primary), showOsd: false);
+          }
+          if (secondary != null && secondary != primary) {
+            await _selectSecondarySubtitle(
+              _externalIdOf(secondary),
+              showOsd: false,
+            );
+          }
+          if (!mounted) return;
+          if (_hasExternalActive) {
+            _showOsd('已恢复外挂字幕：${restored.map((r) => r.ext.name).join('、')}');
+            return;
+          }
+        }
+      } else {
+        // 同目录同名：最多自动挂 2 份（原文 + 译文这种组合），第一份作主字幕
+        _ExternalSub? first;
+        for (final path in plan.paths) {
+          final ext = await _loadExternalSubtitle(path);
+          first ??= ext;
+        }
+        if (first != null && mounted) {
+          await _selectPrimarySubtitle(_externalIdOf(first), showOsd: false);
+          if (!mounted) return;
+          if (_hasExternalPrimary) {
+            _showOsd('已自动加载同名字幕：${first.name}');
+            return;
+          }
+        }
+      }
+
+      // 一份都没挂上（文件损坏、格式不受支持、mpv 拒收…）：
+      // 把优先权还给内嵌 / AI 字幕，别让这个视频一条字幕都没有。
+      await _releaseExternalPriority();
+    } catch (_) {
+      // 自动匹配失败不影响播放
+      await _releaseExternalPriority();
+    }
+  }
+
+  /// 把当前的外挂字幕状态记到磁盘（路径、模式、偏移、所在通道）。
+  Future<void> _persistExternalSubtitles() async {
+    try {
+      if (_externalSubs.isEmpty) {
+        await ExternalSubtitleStore.clear(_sourcePath);
+        return;
+      }
+      final primary = _externalById(_primarySubId);
+      final secondary = _externalById(_secondarySubId);
+      await ExternalSubtitleStore.save(
+        _sourcePath,
+        ExternalSubtitleMemory(
+          records: _externalSubs
+              .map((e) => ExternalSubtitleRecord(
+                    path: e.path,
+                    plainText: e.plainText,
+                    offsetMs: e.offsetMs,
+                  ))
+              .toList(growable: false),
+          primaryIndex:
+              primary == null ? null : _externalSubs.indexOf(primary),
+          secondaryIndex:
+              secondary == null ? null : _externalSubs.indexOf(secondary),
+        ),
+      );
+    } catch (_) {
+      // 落盘失败不影响本次播放
     }
   }
 
@@ -941,6 +1920,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     final tracks = _subtitleTracks;
     if (tracks.isEmpty) return;
     _autoSubtitleApplied = true;
+    // 外挂字幕优先：已经挂上、或者这次预计会自动挂外挂字幕（[_externalPlan]）时，
+    // 内嵌字幕都不去抢主字幕位——否则两条 mpv 命令抢 sid，谁后到谁赢，
+    // 会出现"面板里勾着外挂字幕、画面却是内置字幕"。
+    if (_hasExternalPrimary || _externalPlan != null) return;
     final defaultIdx = tracks.indexWhere((t) => t.isDefault == true);
     final targetIdx = defaultIdx >= 0 ? defaultIdx : 0;
     await _selectPrimarySubtitle('builtin_$targetIdx', showOsd: false);
@@ -985,7 +1968,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
 
     // 生成器里已经载着本视频的字幕（刚识别完就退出、又进来）：直接按需显示
     if (generator.holdsEntriesFor(activeKey)) {
-      if (_subtitleTracks.isEmpty && _primarySubId == 'none') {
+      if (_subtitleTracks.isEmpty &&
+          _primarySubId == 'none' &&
+          !_hasExternalActive) {
         final targetSubId = _hasTranslation ? 'ai_translation' : 'ai_original';
         final subLabel = _hasTranslation ? 'AI 翻译字幕' : 'AI 语音识别字幕';
         await _selectPrimarySubtitle(targetSubId, showOsd: false);
@@ -1001,8 +1986,9 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     );
     if (restored == null || !mounted) return;
 
-    if (_subtitleTracks.isNotEmpty) {
-      // 视频已有内嵌字幕时，内嵌字幕为主，AI字幕静默就绪，不强行弹出干扰
+    if (_subtitleTracks.isNotEmpty || _hasExternalActive || _externalPlan != null) {
+      // 已有内嵌字幕 / 已挂（或将挂）外挂字幕时它们为主，AI 字幕只做"静默就绪"
+      // —— 缓存已经读进生成器，用户点一下 AI 字幕就能立刻显示。
       return;
     }
 
@@ -1679,9 +2665,12 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           SubtitleOverlay(
             position: currentPosition,
             visible: true,
-            primaryEntries: _isBuiltinPrimary ? null : _getEntriesForSubId(_primarySubId),
+            // 主字幕走 mpv 原生渲染时（内置轨 / 原生特效外挂），叠层不再画主通道，
+            // 并整体抬高，给画面底部那些原生字幕让位。
+            primaryEntries:
+                _isNativePrimary ? null : _getEntriesForSubId(_primarySubId),
             secondaryEntries: _getEntriesForSubId(_secondarySubId),
-            bottomOffset: _isBuiltinPrimary ? 132 : 80,
+            bottomOffset: _isNativePrimary ? 132 : 80,
           ),
         _PlayerScrim(showControls: _controlsVisible),
         _PlayerTopBar(
@@ -1926,6 +2915,10 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 底部弹窗：设置主字幕与副字幕通道。
   Future<void> _showSubtitleSettingsSheet() async {
     setState(() => _controlsVisible = true);
+    // 有几步操作要"先关面板 → 执行 → 再弹回来"（选文件、移除、转纯文本）：
+    // 系统文件选择器会被模态面板压住点不到，而执行完用户也要立刻看到列表刷新。
+    Future<void> Function()? pendingAction;
+
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF202027),
@@ -1942,13 +2935,49 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           hasTranslation: _hasTranslation,
           hasAiOriginal: _hasAiOriginal,
           subtitleTracks: _subtitleTracks,
+          externalSubs: _externalSubs
+              .map((e) => _ExternalSubItem(
+                    id: _externalIdOf(e),
+                    name: e.name,
+                    plainTextMode: !e.rendersNatively,
+                    graphics: e.kind == ExternalSubtitleKind.graphics,
+                    bitmapUnsupported: e.kind == ExternalSubtitleKind.graphics &&
+                        _bitmapSubtitleUnsupported,
+                    offsetMs: e.offsetMs,
+                  ))
+              .toList(growable: false),
+          aiDisabled: _isExclusivePrimary,
+          aiDisabledHint: _exclusivePrimaryHint,
+          canConvertToText: _isExclusivePrimary && _canConvertPrimaryToText,
+          bitmapUnsupported: _bitmapSubtitleUnsupported,
           onSelectPrimary: (id) => _selectPrimarySubtitle(id),
           onSelectSecondary: (id) => _selectSecondarySubtitle(id),
           onCloseAll: _closeAllSubtitles,
           formatTrackLabel: _subtitleLabel,
+          onLoadExternal: () {
+            pendingAction = _pickExternalSubtitle;
+            Navigator.of(context).pop();
+          },
+          onRemoveExternal: (id) {
+            pendingAction = () => _removeExternalSubtitle(id);
+            Navigator.of(context).pop();
+          },
+          onConvertToPlainText: () {
+            pendingAction = _convertPrimaryToPlainText;
+            Navigator.of(context).pop();
+          },
+          onNudgeOffset: (id, deltaMs) => _nudgeExternalOffset(id, deltaMs),
+          onResetOffset: (id) => _resetExternalOffset(id),
         ),
       ),
     );
+
+    final action = pendingAction;
+    if (action == null || !mounted) return;
+    await action();
+    if (!mounted) return;
+    // 回到字幕面板：用户能立刻看到新条目 / 新的模式与偏移
+    await _showSubtitleSettingsSheet();
   }
 
   /// 桌面端控制条右侧附加区：音量滑块 + 音轨 + 字幕。
@@ -3072,6 +4101,59 @@ class _PlayerTaskBadgeState extends State<_PlayerTaskBadge> {
   }
 }
 
+/// 播放页已加载的一份外挂字幕。
+class _ExternalSub {
+  _ExternalSub({
+    required this.uid,
+    required this.path,
+    required this.name,
+    required this.kind,
+    this.plainText = false,
+    this.offsetMs = 0,
+  });
+
+  /// 稳定标识（自增编号），用来拼出字幕源 ID。
+  ///
+  /// 不用列表下标：移掉一份外挂字幕后其余下标会整体前移，
+  /// 已经选在主/副通道上的那个 ID 就会指到别人身上。
+  final int uid;
+
+  /// 字幕文件路径。
+  final String path;
+
+  /// 文件名（界面显示用）。
+  final String name;
+
+  /// 文件本身的渲染类别（`.ass` / `.ssa` 是特效字幕）。
+  final ExternalSubtitleKind kind;
+
+  /// 是否被用户切成了"纯文本模式"（只对特效字幕有意义）。
+  bool plainText;
+
+  /// 时间轴偏移（毫秒，正数 = 字幕整体延后）。
+  int offsetMs;
+
+  /// 交给 mpv 的地址：非 UTF-8 的 `.ass` 会先转成 UTF-8 副本。
+  String? mpvPath;
+
+  /// 成功挂到 mpv 上之后，那条轨在 mpv 里的 id（用于避免重复 `sub-add`）。
+  String? mpvTrackId;
+
+  /// 解析出来的条目（不含偏移）。
+  List<SubtitleEntry>? baseEntries;
+
+  /// 叠加过偏移、可直接喂给叠层的条目（偏移一变就整批重建）。
+  List<SubtitleEntry>? displayEntries;
+
+  /// 是否交给 mpv 原生渲染。
+  ///
+  /// 图形位图字幕（`.sup`/VobSub）只能走这条路；特效字幕（`.ass`）默认也走，
+  /// 但可以切成纯文本模式改走叠层。
+  bool get rendersNatively =>
+      kind == ExternalSubtitleKind.graphics ||
+      (kind == ExternalSubtitleKind.effects && !plainText);
+}
+
 /// 主/副字幕通道设置面板。
 ///
 /// 视觉与交互全面升级：支持独立配置主字幕（上方 · 主要阅读）与副字幕（下方 · 对照辅助），
@@ -3083,9 +4165,19 @@ class _SubtitleSettingsSheet extends StatefulWidget {
     required this.hasTranslation,
     required this.hasAiOriginal,
     required this.subtitleTracks,
+    required this.externalSubs,
+    required this.aiDisabled,
+    required this.aiDisabledHint,
+    required this.canConvertToText,
+    required this.bitmapUnsupported,
     required this.onSelectPrimary,
     required this.onSelectSecondary,
     required this.onCloseAll,
+    required this.onLoadExternal,
+    required this.onRemoveExternal,
+    required this.onConvertToPlainText,
+    required this.onNudgeOffset,
+    required this.onResetOffset,
     required this.formatTrackLabel,
   });
 
@@ -3094,18 +4186,66 @@ class _SubtitleSettingsSheet extends StatefulWidget {
   final bool hasTranslation;
   final bool hasAiOriginal;
   final List<SubtitleTrack> subtitleTracks;
+
+  /// 已加载的外挂字幕（主/副下拉里的候选 + 面板下方的偏移调节）。
+  final List<_ExternalSubItem> externalSubs;
+
+  /// 当前主字幕是特效/图形原生字幕：AI 字幕不可选（见 [aiDisabledHint]）。
+  final bool aiDisabled;
+  final String aiDisabledHint;
+
+  /// 能否把当前主字幕降级成纯文本（图形位图字幕做不到）。
+  final bool canConvertToText;
+
+  /// 本机播放内核已证实渲染不了图形位图字幕（面板里如实标出来）。
+  final bool bitmapUnsupported;
+
   final ValueChanged<String> onSelectPrimary;
   final ValueChanged<String> onSelectSecondary;
   final VoidCallback onCloseAll;
+  final VoidCallback onLoadExternal;
+  final ValueChanged<String> onRemoveExternal;
+  final VoidCallback onConvertToPlainText;
+  final void Function(String id, int deltaMs) onNudgeOffset;
+  final ValueChanged<String> onResetOffset;
   final String Function(SubtitleTrack) formatTrackLabel;
 
   @override
   State<_SubtitleSettingsSheet> createState() => _SubtitleSettingsSheetState();
 }
 
+/// 面板用的外挂字幕条目（只带界面需要的信息）。
+class _ExternalSubItem {
+  const _ExternalSubItem({
+    required this.id,
+    required this.name,
+    required this.plainTextMode,
+    this.graphics = false,
+    this.bitmapUnsupported = false,
+    required this.offsetMs,
+  });
+
+  final String id;
+  final String name;
+
+  /// 是否处于纯文本模式（false = 交底层原生渲染，保特效但独占画面）。
+  final bool plainTextMode;
+
+  /// 图形位图字幕（`.sup` / VobSub）：原生渲染、且无法转文本。
+  final bool graphics;
+
+  /// 本机播放内核已证实渲染不了这类图形字幕（面板里如实标出来）。
+  final bool bitmapUnsupported;
+
+  final int offsetMs;
+}
+
 class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
   late String _currentPrimary;
   late String _currentSecondary;
+
+  /// 点了置灰项时的临时提示（null 表示不显示）。
+  String? _disabledNotice;
 
   @override
   void initState() {
@@ -3115,7 +4255,12 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
   }
 
   void _choosePrimary(String id) {
+    if (_isDisabled(id)) {
+      setState(() => _disabledNotice = widget.aiDisabledHint);
+      return;
+    }
     setState(() {
+      _disabledNotice = null;
       _currentPrimary = id;
       // 若副字幕正好选了同一个有效字幕，则自动重置副字幕为关闭
       if (id != 'none' && _currentSecondary == id) {
@@ -3127,7 +4272,12 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
   }
 
   void _chooseSecondary(String id) {
+    if (_isDisabled(id)) {
+      setState(() => _disabledNotice = widget.aiDisabledHint);
+      return;
+    }
     setState(() {
+      _disabledNotice = null;
       _currentSecondary = id;
       // 若主字幕正好选了同一个有效字幕，则自动重置主字幕为关闭
       if (id != 'none' && _currentPrimary == id) {
@@ -3136,6 +4286,49 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
       }
     });
     widget.onSelectSecondary(id);
+  }
+
+  /// AI 字幕在主字幕是特效/图形原生字幕时不可选（会互相遮挡）。
+  bool _isDisabled(String id) =>
+      widget.aiDisabled && (id == 'ai_original' || id == 'ai_translation');
+
+  /// 外挂字幕在下拉里的条目：区分外挂·图形 / 外挂·特效 / 外挂（纯文本）。
+  _SubDropdownItem _externalItem(_ExternalSubItem sub) => _SubDropdownItem(
+        id: sub.id,
+        label: sub.name,
+        badge: sub.graphics ? '外挂·图形' : (sub.plainTextMode ? '外挂' : '外挂·特效'),
+        badgeColor: sub.graphics
+            ? const Color(0xFFBF360C)
+            : (sub.plainTextMode
+                ? const Color(0xFF1565C0)
+                : const Color(0xFF8E24AA)),
+      );
+
+  /// 内置轨的"纯文本"条目。
+  ///
+  /// 它只能通过提示条上的按钮切过去（不是常规候选），所以只在正被选中时补进
+  /// 下拉——否则列表里会凭空多出一条几乎没人用的项。
+  List<_SubDropdownItem> _plainTextBuiltinItems(String currentPrimary) {
+    if (!currentPrimary.startsWith('builtin_') ||
+        !currentPrimary.endsWith('_text')) {
+      return const [];
+    }
+    final index = int.tryParse(
+      currentPrimary.substring(8, currentPrimary.length - '_text'.length),
+    );
+    if (index == null ||
+        index < 0 ||
+        index >= widget.subtitleTracks.length) {
+      return const [];
+    }
+    return [
+      _SubDropdownItem(
+        id: currentPrimary,
+        label: '${widget.formatTrackLabel(widget.subtitleTracks[index])}（纯文本）',
+        badge: '纯文本',
+        badgeColor: const Color(0xFF1565C0),
+      ),
+    ];
   }
 
   void _closeAll() {
@@ -3154,19 +4347,23 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
     // 构建主字幕候选池
     final allPrimaryItems = <_SubDropdownItem>[
       const _SubDropdownItem(id: 'none', label: '关闭主字幕'),
+      // 外挂字幕排在最上面：它是用户手动挑的 / 同目录同名匹配来的，优先级最高
+      ...widget.externalSubs.map(_externalItem),
       if (widget.hasTranslation)
-        const _SubDropdownItem(
+        _SubDropdownItem(
           id: 'ai_translation',
           label: 'AI 翻译字幕',
           badge: '已翻译',
-          badgeColor: Color(0xFF00796B),
+          badgeColor: const Color(0xFF00796B),
+          disabled: widget.aiDisabled,
         ),
       if (widget.hasAiOriginal)
-        const _SubDropdownItem(
+        _SubDropdownItem(
           id: 'ai_original',
           label: 'AI 语音原字幕',
           badge: '已识别',
           badgeColor: PolyFlixColors.violet,
+          disabled: widget.aiDisabled,
         ),
       ...widget.subtitleTracks.asMap().entries.map((entry) {
         final i = entry.key;
@@ -3175,28 +4372,37 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
         return _SubDropdownItem(
           id: 'builtin_$i',
           label: widget.formatTrackLabel(track),
-          badge: isGraphic ? '图形' : null,
+          badge: isGraphic
+              ? (widget.bitmapUnsupported ? '图形·本机不支持' : '图形')
+              : null,
           badgeColor: const Color(0xFFBF360C),
         );
       }),
+      // 内置轨的"纯文本"变体只在正被选中时列出来（它是从提示按钮切过去的，
+      // 平时不该在列表里多占一行）
+      ..._plainTextBuiltinItems(_currentPrimary),
     ];
 
     // 构建副字幕候选池（过滤掉图形字幕，副字幕仅提供可文本渲染的轨道）
     final allSecondaryItems = <_SubDropdownItem>[
       const _SubDropdownItem(id: 'none', label: '关闭副字幕'),
+      // 外挂字幕同样排最上面
+      ...widget.externalSubs.where((e) => e.plainTextMode).map(_externalItem),
       if (widget.hasAiOriginal)
-        const _SubDropdownItem(
+        _SubDropdownItem(
           id: 'ai_original',
           label: 'AI 语音原字幕',
           badge: '已识别',
           badgeColor: PolyFlixColors.violet,
+          disabled: widget.aiDisabled,
         ),
       if (widget.hasTranslation)
-        const _SubDropdownItem(
+        _SubDropdownItem(
           id: 'ai_translation',
           label: 'AI 翻译字幕',
           badge: '已翻译',
-          badgeColor: Color(0xFF00796B),
+          badgeColor: const Color(0xFF00796B),
+          disabled: widget.aiDisabled,
         ),
       ...widget.subtitleTracks.asMap().entries
           .where((e) => !BuiltInSubtitleExtractor.isGraphicSubtitle(e.value))
@@ -3247,7 +4453,7 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // 顶栏：标题 + 一键关闭全部
+            // 顶栏：标题 + 加载外挂字幕 + 一键关闭全部
             Row(
               children: [
                 Container(
@@ -3263,15 +4469,32 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
                   ),
                 ),
                 SizedBox(width: isMobile ? 8 : 10),
-                Text(
-                  '字幕设置',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: isMobile ? 15.5 : 18,
-                    fontWeight: FontWeight.w700,
+                // 用 Expanded 吃掉剩余宽度：窄屏上先省略标题，右侧按钮不会被挤爆
+                Expanded(
+                  child: Text(
+                    '字幕设置',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: isMobile ? 15.5 : 18,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
-                const Spacer(),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    foregroundColor: theme.colorScheme.primary,
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.symmetric(horizontal: isMobile ? 6 : 8),
+                  ),
+                  onPressed: widget.onLoadExternal,
+                  icon: Icon(Icons.add_rounded, size: isMobile ? 14 : 16),
+                  label: Text(
+                    '加载字幕',
+                    style: TextStyle(fontSize: isMobile ? 11.5 : 12.5),
+                  ),
+                ),
                 if (!isNone)
                   TextButton.icon(
                     style: TextButton.styleFrom(
@@ -3281,7 +4504,7 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
                     onPressed: _closeAll,
                     icon: Icon(Icons.subtitles_off_outlined, size: isMobile ? 14 : 16),
                     label: Text(
-                      '关闭全部字幕',
+                      '关闭全部',
                       style: TextStyle(fontSize: isMobile ? 11.5 : 12.5),
                     ),
                   ),
@@ -3327,6 +4550,18 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
               isMobile: isMobile,
             ),
 
+            // 3. 特效/图形字幕独占时的说明与"降级成纯文本"入口
+            if (widget.aiDisabled) ...[
+              SizedBox(height: isMobile ? 10 : 14),
+              _buildExclusiveHint(theme, isMobile),
+            ],
+
+            // 4. 已加载的外挂字幕：模式说明 + 时间轴偏移微调 + 移除
+            if (widget.externalSubs.isNotEmpty) ...[
+              SizedBox(height: isMobile ? 10 : 14),
+              _buildExternalCard(theme, isMobile),
+            ],
+
             SizedBox(height: isMobile ? 10 : 14),
             Center(
               child: Text(
@@ -3340,6 +4575,205 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
           ],
         ),
       ),
+    );
+  }
+
+  /// 主字幕是特效/图形原生字幕时的说明卡片。
+  ///
+  /// 顺带承载"点了置灰项"的即时反馈：文案换成对应提示并高亮，
+  /// 让用户知道不是点不动，而是这条路当前走不通。
+  Widget _buildExclusiveHint(ThemeData theme, bool isMobile) {
+    final notice = _disabledNotice;
+    final emphasized = notice != null;
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF2B2422),
+        borderRadius: BorderRadius.circular(isMobile ? 10 : 12),
+        border: Border.all(
+          color: const Color(0xFFFFB74D).withValues(alpha: emphasized ? .75 : .35),
+        ),
+      ),
+      padding: EdgeInsets.all(isMobile ? 10 : 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                emphasized
+                    ? Icons.report_problem_outlined
+                    : Icons.info_outline_rounded,
+                size: isMobile ? 14 : 16,
+                color: const Color(0xFFFFB74D),
+              ),
+              SizedBox(width: isMobile ? 6 : 8),
+              Expanded(
+                child: Text(
+                  notice ?? widget.aiDisabledHint,
+                  style: TextStyle(
+                    color: emphasized ? const Color(0xFFFFCC80) : Colors.white70,
+                    fontSize: isMobile ? 11 : 12,
+                    height: 1.45,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (widget.canConvertToText) ...[
+            SizedBox(height: isMobile ? 8 : 10),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.tonalIcon(
+                style: FilledButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.symmetric(horizontal: isMobile ? 10 : 12),
+                ),
+                onPressed: widget.onConvertToPlainText,
+                icon: Icon(Icons.text_fields_rounded, size: isMobile ? 14 : 16),
+                label: Text(
+                  '改为纯文本并显示 AI 字幕',
+                  style: TextStyle(fontSize: isMobile ? 11 : 12),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 已加载的外挂字幕卡片：模式说明 + 时间轴偏移微调 + 移除。
+  Widget _buildExternalCard(ThemeData theme, bool isMobile) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF262630),
+        borderRadius: BorderRadius.circular(isMobile ? 10 : 12),
+        border: Border.all(color: Colors.white12),
+      ),
+      padding: EdgeInsets.all(isMobile ? 10 : 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.folder_open_rounded,
+                size: isMobile ? 14 : 16,
+                color: Colors.white54,
+              ),
+              SizedBox(width: isMobile ? 6 : 8),
+              Text(
+                '外挂字幕',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: isMobile ? 12.5 : 13.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              SizedBox(width: isMobile ? 6 : 8),
+              Expanded(
+                child: Text(
+                  '时间轴偏移按文件单独记忆',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Colors.white38,
+                    fontSize: isMobile ? 10 : 11,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          for (final sub in widget.externalSubs) ...[
+            SizedBox(height: isMobile ? 8 : 10),
+            _buildExternalRow(sub, theme, isMobile),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildExternalRow(_ExternalSubItem sub, ThemeData theme, bool isMobile) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                sub.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: isMobile ? 12 : 13,
+                ),
+              ),
+            ),
+            SizedBox(width: isMobile ? 6 : 8),
+            Text(
+              sub.graphics
+                  ? (sub.bitmapUnsupported
+                      ? '图形字幕 · 本机内核不支持'
+                      : '图形字幕 · 独占画面')
+                  : (sub.plainTextMode ? '纯文本 · 可与 AI 并排' : '原生特效 · 独占画面'),
+              style: TextStyle(
+                color: Colors.white38,
+                fontSize: isMobile ? 9.5 : 10.5,
+              ),
+            ),
+          ],
+        ),
+        SizedBox(height: isMobile ? 6 : 8),
+        Row(
+          children: [
+            _buildOffsetButton('-0.5s', () => widget.onNudgeOffset(sub.id, -500), isMobile),
+            SizedBox(width: isMobile ? 5 : 6),
+            Text(
+              _formatOffsetLabel(sub.offsetMs),
+              style: TextStyle(
+                color: sub.offsetMs == 0 ? Colors.white38 : theme.colorScheme.primary,
+                fontSize: isMobile ? 11 : 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            SizedBox(width: isMobile ? 5 : 6),
+            _buildOffsetButton('+0.5s', () => widget.onNudgeOffset(sub.id, 500), isMobile),
+            SizedBox(width: isMobile ? 5 : 6),
+            _buildOffsetButton('归零', () => widget.onResetOffset(sub.id), isMobile),
+            const Spacer(),
+            IconButton(
+              onPressed: () => widget.onRemoveExternal(sub.id),
+              tooltip: '移除此字幕',
+              visualDensity: VisualDensity.compact,
+              iconSize: isMobile ? 16 : 18,
+              color: Colors.redAccent.shade100,
+              icon: const Icon(Icons.delete_outline_rounded),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 时间轴偏移微调用的小按钮。
+  Widget _buildOffsetButton(String label, VoidCallback onTap, bool isMobile) {
+    return TextButton(
+      style: TextButton.styleFrom(
+        foregroundColor: Colors.white70,
+        visualDensity: VisualDensity.compact,
+        padding: EdgeInsets.symmetric(
+          horizontal: isMobile ? 8 : 10,
+          vertical: 2,
+        ),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        side: const BorderSide(color: Colors.white24),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+      ),
+      onPressed: onTap,
+      child: Text(label, style: TextStyle(fontSize: isMobile ? 10.5 : 11.5)),
     );
   }
 
@@ -3428,7 +4862,10 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: isMobile ? 12 : 13,
-                        color: isSelected ? Colors.white : Colors.white70,
+                        // 置灰项：看得见但选不了（点了会在下方给出原因）
+                        color: item.disabled
+                            ? Colors.white24
+                            : (isSelected ? Colors.white : Colors.white70),
                         fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
                       ),
                     ),
@@ -3441,7 +4878,9 @@ class _SubtitleSettingsSheetState extends State<_SubtitleSettingsSheet> {
                         vertical: isMobile ? 1 : 1.5,
                       ),
                       decoration: BoxDecoration(
-                        color: item.badgeColor ?? Colors.white24,
+                        color: item.disabled
+                            ? Colors.white12
+                            : (item.badgeColor ?? Colors.white24),
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
@@ -3473,10 +4912,15 @@ class _SubDropdownItem {
     required this.label,
     this.badge,
     this.badgeColor,
+    this.disabled = false,
   });
 
   final String id;
   final String label;
   final String? badge;
   final Color? badgeColor;
+
+  /// 置灰不可选（例如主字幕是特效/图形原生字幕时的 AI 字幕）。
+  /// 仍然列在下拉里给出提示，而不是直接消失——否则用户会以为功能丢了。
+  final bool disabled;
 }
