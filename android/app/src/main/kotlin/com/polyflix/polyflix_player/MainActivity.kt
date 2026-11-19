@@ -82,7 +82,7 @@ class MainActivity : FlutterActivity() {
                             addCategory(Intent.CATEGORY_OPENABLE)
                             type = "*/*"
                             putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "application/octet-stream", "*/*"))
+                            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("video/*", "audio/*", "application/octet-stream", "*/*"))
                         }
                         startActivityForResult(intent, REQUEST_CODE_PICK_VIDEOS)
                     } catch (e: Exception) {

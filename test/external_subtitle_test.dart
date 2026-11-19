@@ -16,6 +16,7 @@ void main() {
       expect(ExternalSubtitleLoader.isSupported('/subs/movie.srt'), isTrue);
       expect(ExternalSubtitleLoader.isSupported('/subs/movie.ASS'), isTrue);
       expect(ExternalSubtitleLoader.isSupported('/subs/movie.vtt'), isTrue);
+      expect(ExternalSubtitleLoader.isSupported('/subs/song.lrc'), isTrue);
       expect(ExternalSubtitleLoader.isSupported('/subs/movie.sup'), isTrue);
       expect(ExternalSubtitleLoader.isSupported('/subs/movie.idx'), isTrue);
       expect(ExternalSubtitleLoader.isSupported('/subs/movie.sub'), isTrue);
@@ -27,6 +28,10 @@ void main() {
       );
       expect(
         ExternalSubtitleLoader.kindOf('/subs/movie.vtt'),
+        ExternalSubtitleKind.text,
+      );
+      expect(
+        ExternalSubtitleLoader.kindOf('/subs/song.lrc'),
         ExternalSubtitleKind.text,
       );
       expect(
@@ -128,6 +133,34 @@ void main() {
       );
       expect(entries.single.start, const Duration(milliseconds: 2500));
       expect(entries.single.end, const Duration(milliseconds: 3500));
+    });
+
+    test('UTF-8 与 UTF-16LE 的 lrc 文件解析（含双语同时间戳合并）', () async {
+      final utf8Lrc = File('${dir.path}${Platform.pathSeparator}song.lrc');
+      utf8Lrc.writeAsStringSync(
+        '[00:01.00]First line\n'
+        '[00:01.00]第一行\n'
+        '[00:04.50]Second line\n',
+        encoding: utf8,
+      );
+      final entries = await ExternalSubtitleLoader.loadEntries(utf8Lrc.path);
+      expect(entries.length, 2);
+      expect(entries[0].text, 'First line');
+      expect(entries[0].translatedText, '第一行');
+      expect(entries[1].text, 'Second line');
+
+      // 构造 UTF-16LE (BOM FF FE)
+      final utf16Lrc = File('${dir.path}${Platform.pathSeparator}song16.lrc');
+      const content = '[00:02.00]测试歌词\n';
+      final bytes = <int>[0xFF, 0xFE];
+      for (final unit in content.codeUnits) {
+        bytes.add(unit & 0xFF);
+        bytes.add((unit >> 8) & 0xFF);
+      }
+      utf16Lrc.writeAsBytesSync(bytes);
+      final entries16 = await ExternalSubtitleLoader.loadEntries(utf16Lrc.path);
+      expect(entries16.single.text, '测试歌词');
+      expect(entries16.single.start, const Duration(seconds: 2));
     });
 
     test('文件不存在时抛出可读异常', () {
@@ -279,6 +312,21 @@ void main() {
         limit: 2,
       );
       expect(found.length, 2);
+    });
+
+    test('音频文件同目录匹配优先返回 .lrc 歌词', () async {
+      final audio = touch('song.mp3');
+      touch('song.srt');
+      touch('song.ass');
+      touch('song.lrc');
+
+      final found = await ExternalSubtitleLoader.findSiblingSubtitles(
+        audio.path,
+      );
+      expect(
+        found.map(ExternalSubtitleLoader.fileNameOf).toList(),
+        ['song.lrc', 'song.ass', 'song.srt'],
+      );
     });
   });
 }

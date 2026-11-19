@@ -1,9 +1,20 @@
 allprojects {
+    buildscript {
+        repositories {
+            maven { url = uri("https://maven.aliyun.com/repository/google") }
+            maven { url = uri("https://maven.aliyun.com/repository/central") }
+            maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+            maven { url = uri("https://storage.flutter-io.cn/download.flutter.io") }
+            google()
+            mavenCentral()
+        }
+    }
     repositories {
         // 国内镜像（加速首次构建），原源作为兜底保留
         maven { url = uri("https://maven.aliyun.com/repository/google") }
         maven { url = uri("https://maven.aliyun.com/repository/central") }
         maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+        maven { url = uri("https://storage.flutter-io.cn/download.flutter.io") }
         google()
         mavenCentral()
     }

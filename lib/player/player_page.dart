@@ -13,6 +13,7 @@
 library;
 
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
@@ -38,6 +39,7 @@ import '../subtitle/translation/translation_service.dart';
 import '../utils/native_file_helper.dart';
 import '../utils/platform_media_helper.dart';
 import '../utils/platform_utils.dart';
+import 'audio_stage_view.dart';
 
 /// 移动端手势调节类型（左侧亮度，右侧音量）。
 enum _VerticalDragType { brightness, volume }
@@ -78,42 +80,6 @@ const Size _kFitBaseClientSize = Size(1280, 720);
 /// 这次重绘可能落在 media_kit 渲染纹理已经释放之后，会直接崩掉整个进程
 /// （表现为点退出后应用闪退）。等回到首页、播放器彻底销毁后再改就安全了。
 bool windowFitAppliedInPlayer = false;
-
-/// 支持拖入播放的视频扩展名。
-const Set<String> _kSupportedVideoExtensions = {
-  'mp4',
-  'mkv',
-  'mov',
-  'avi',
-  'flv',
-  'wmv',
-  'webm',
-  'ts',
-  'm4v',
-  '3gp',
-  'rmvb',
-  'f4v',
-  'mpg',
-  'mpeg',
-  'vob',
-  'ogv',
-  'm2ts',
-  'mts',
-  'divx',
-  'asf',
-  'rm',
-  'dat',
-  'h264',
-  'h265',
-  'hevc',
-};
-
-bool _isVideoPath(String path) {
-  final dotIndex = path.lastIndexOf('.');
-  if (dotIndex < 0 || dotIndex >= path.length - 1) return false;
-  final ext = path.substring(dotIndex + 1).toLowerCase();
-  return _kSupportedVideoExtensions.contains(ext);
-}
 
 String _fileNameOf(String path) => path.replaceAll('\\', '/').split('/').last;
 
@@ -175,8 +141,20 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   /// 每次切换播放源重置；同一次播放内只调一次，避免覆盖用户手动改动的窗口尺寸。
   bool _windowFitApplied = false;
 
+  /// 移动端是否已按当前媒体类型/视频宽高比应用过自动横竖屏。
+  /// 每次切换播放源重置；同一片源内只自动切一次，避免覆盖用户手动切换的方向。
+  bool _autoOrientationApplied = false;
+
   /// 正在退出播放页，防止退出流程被重复触发。
   bool _closing = false;
+
+  /// 音频模式下用户是否强制切回波形视图（即使存在激活字幕或歌词）。
+  bool _audioForceWaveform = false;
+
+  bool get _isAudioSource => !_sourceIsPflx && isAudioPath(_sourcePath);
+
+  bool get _isShowingAudioLyrics =>
+      _isAudioSource && _hasAnyActiveSubtitle && !_audioForceWaveform;
 
   // ---------------- 主/副字幕状态 ----------------
   /// 当前主字幕源 ID。
@@ -306,6 +284,14 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   double _dragStartX = 0.0;
   Duration _seekDragStartPosition = Duration.zero;
   Duration _seekDragTargetPosition = Duration.zero;
+
+  /// 移动端长按 2X 倍速播放与下滑锁定。
+  static const double _kLongPressLockDistance = 100.0;
+  bool _longPress2xActive = false;
+  bool _longPress2xLocked = false;
+  double _longPress2xProgress = 0.0;
+  double _longPressStartY = 0.0;
+  double _speedBeforeLongPress = 1.0;
 
   // ---------------- 播放进度（续播） ----------------
   /// 读到续播位置后暂存，等媒体加载完再 seek（此时 seek 才生效）。
@@ -517,11 +503,14 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     super.dispose();
   }
 
-  Future<void> _toggleOrientation() async {
-    // 屏幕方向是移动端概念，桌面端窗口没有"竖屏/横屏"之分。
+  Future<void> _applyMobileOrientation({required bool landscape}) async {
     if (!isMobilePlatform) return;
-    setState(() => _isLandscape = !_isLandscape);
-    if (_isLandscape) {
+    if (mounted && _isLandscape != landscape) {
+      setState(() => _isLandscape = landscape);
+    } else {
+      _isLandscape = landscape;
+    }
+    if (landscape) {
       await SystemChrome.setPreferredOrientations([
         DeviceOrientation.landscapeLeft,
         DeviceOrientation.landscapeRight,
@@ -532,7 +521,37 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         DeviceOrientation.portraitDown,
       ]);
     }
+  }
+
+  Future<void> _toggleOrientation() async {
+    // 屏幕方向是移动端概念，桌面端窗口没有"竖屏/横屏"之分。
+    if (!isMobilePlatform) return;
+    _autoOrientationApplied = true;
+    await _applyMobileOrientation(landscape: !_isLandscape);
     _scheduleAutoHide();
+  }
+
+  /// 移动端根据媒体类型与视频真实显示宽高自动选择横竖屏：
+  /// - 音频：默认保持竖屏；
+  /// - 横版视频（宽 > 高）：自动切横屏；
+  /// - 竖版 / 方形视频（宽 <= 高）：保持竖屏。
+  /// （media_kit 已结合 rotate 元数据对 width/height 做过旋转修正。）
+  Future<void> _maybeAutoOrientForMedia() async {
+    if (!isMobilePlatform || !mounted || _closing || _autoOrientationApplied) {
+      return;
+    }
+    if (_isAudioSource) {
+      _autoOrientationApplied = true;
+      await _applyMobileOrientation(landscape: false);
+      return;
+    }
+    final videoWidth = _player.state.width;
+    final videoHeight = _player.state.height;
+    if (videoWidth == null || videoHeight == null) return;
+    if (videoWidth <= 0 || videoHeight <= 0) return;
+
+    _autoOrientationApplied = true;
+    await _applyMobileOrientation(landscape: videoWidth > videoHeight);
   }
 
   Future<void> _initPlayer() async {
@@ -589,9 +608,15 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       _maybeAutoSelectSubtitle();
       _scheduleAiSubtitleRestore();
     });
-    // 视频尺寸到位后，按设置把窗口调成视频比例。
-    _player.stream.width.listen((_) => _maybeFitWindowToVideo());
-    _player.stream.height.listen((_) => _maybeFitWindowToVideo());
+    // 视频尺寸到位后，桌面端按设置调窗口比例，移动端按横/竖版自动匹配屏幕方向。
+    _player.stream.width.listen((_) {
+      _maybeFitWindowToVideo();
+      _maybeAutoOrientForMedia();
+    });
+    _player.stream.height.listen((_) {
+      _maybeFitWindowToVideo();
+      _maybeAutoOrientForMedia();
+    });
     _player.stream.track.listen((value) {
       if (mounted) setState(() => _currentTrack = value);
     });
@@ -614,8 +639,13 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     // 先认下新播放源：拖放换片时调用方要等本方法返回才更新 _sourcePath，
     // 而下面那些异步动作（外挂字幕恢复、落盘）都用它当身份，晚了会写到上一个视频头上。
     _sourcePath = path;
+    _audioForceWaveform = false;
     _autoSubtitleApplied = false;
     _windowFitApplied = false;
+    _autoOrientationApplied = false;
+    if (isMobilePlatform && _isAudioSource) {
+      unawaited(_maybeAutoOrientForMedia());
+    }
     _aiCacheChecked = false;
     _durationKnown = false;
     _primarySubId = 'none';
@@ -658,8 +688,8 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   Future<void> _handleDroppedFile(String path) async {
     if (_switchingSource) return;
     final name = _fileNameOf(path);
-    if (!_isVideoPath(path)) {
-      _showOsd('不是视频文件：$name');
+    if (!isMediaPath(path)) {
+      _showOsd('不支持的媒体格式：$name');
       return;
     }
     setState(() {
@@ -988,6 +1018,41 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     }
     // 外挂字幕：只有纯文本模式才有条目，原生模式的由 mpv 直接画
     return _externalById(id)?.displayEntries;
+  }
+
+  /// 为音频舞台解析主/副字幕条目。
+  ///
+  /// 音频播放时，若主字幕选了 `ai_translation` 且未另设副字幕，保留原声与译文
+  /// 供 `AudioStageView` 渲染成上下对照的双语滚动歌词；若只选了 `ai_original`
+  /// 且未设副字幕，则只显示原词，遵循用户在面板里的单语选择。
+  ({List<SubtitleEntry>? primary, List<SubtitleEntry>? secondary})
+      _resolveAudioStageEntries() {
+    final activeKey = _streamServer?.url ?? _sourcePath;
+    if (_primarySubId == 'ai_translation' && _secondarySubId == 'none') {
+      if (SubtitleGenerator.instance.holdsEntriesFor(activeKey)) {
+        return (primary: SubtitleGenerator.instance.entries, secondary: null);
+      }
+      return (primary: null, secondary: null);
+    }
+    if (_primarySubId == 'ai_original' && _secondarySubId == 'none') {
+      if (SubtitleGenerator.instance.holdsEntriesFor(activeKey)) {
+        final raw = SubtitleGenerator.instance.entries;
+        final stripped = raw
+            .map(
+              (e) => SubtitleEntry(start: e.start, end: e.end, text: e.text),
+            )
+            .toList(growable: false);
+        return (primary: stripped, secondary: null);
+      }
+      return (primary: null, secondary: null);
+    }
+    var primary = _getEntriesForSubId(_primarySubId);
+    final secondary = _getEntriesForSubId(_secondarySubId);
+    if (primary == null && secondary != null) {
+      primary = secondary;
+      return (primary: primary, secondary: null);
+    }
+    return (primary: primary, secondary: secondary);
   }
 
   /// 提取并缓存指定的内置字幕轨（用于作为副字幕、主字幕文本化或翻译）。
@@ -1555,7 +1620,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
       if (!ExternalSubtitleLoader.isSupported(picked.path)) {
         if (mounted) {
           _showOsd(
-            '不支持的字幕格式：${picked.name}（支持 srt / vtt / ass / ssa / sup / idx）',
+            '不支持的字幕格式：${picked.name}（支持 srt / vtt / lrc / ass / ssa / sup / idx）',
           );
         }
         return;
@@ -2113,6 +2178,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
   Future<void> _maybeFitWindowToVideo() async {
     if (!isDesktopPlatform) return;
     if (!mounted) return;
+    if (_isAudioSource) return;
     if (!fitWindowToVideo.value) return;
     if (_windowFitApplied) return;
     // 全屏时改窗口尺寸会跟全屏状态打架（还可能把全屏顶掉）
@@ -2419,6 +2485,74 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     _horizontalDragging = false;
   }
 
+  void _handleLongPressStart(LongPressStartDetails details) {
+    if (!_ready || _switchingSource) return;
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final padding = MediaQuery.paddingOf(context);
+    final dy = details.globalPosition.dy;
+    // 排除顶部标题栏与底部控制栏区域，避免操作按钮或进度条时误触发长按倍速。
+    if (dy < padding.top + 56 || dy > screenHeight - padding.bottom - 112) {
+      return;
+    }
+    _speedBeforeLongPress = (_speed == 2.0) ? 1.0 : _speed;
+    _osdTimer?.cancel();
+    setState(() {
+      _osdText = null;
+      _osdIcon = null;
+      _longPress2xActive = true;
+      _longPress2xLocked = false;
+      _longPress2xProgress = 0.0;
+      _longPressStartY = dy;
+      _speed = 2.0;
+    });
+    HapticFeedback.lightImpact();
+    unawaited(_player.setRate(2.0));
+  }
+
+  void _handleLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
+    if (!_longPress2xActive || _longPress2xLocked) return;
+    final deltaY = (details.globalPosition.dy - _longPressStartY)
+        .clamp(0.0, _kLongPressLockDistance);
+    final progress = (deltaY / _kLongPressLockDistance).clamp(0.0, 1.0);
+    final reachedLock = progress >= 1.0;
+    setState(() {
+      _longPress2xProgress = reachedLock ? 1.0 : progress;
+      if (reachedLock) {
+        _longPress2xLocked = true;
+      }
+    });
+    if (reachedLock) {
+      HapticFeedback.mediumImpact();
+    }
+  }
+
+  void _handleLongPressEnd(LongPressEndDetails details) {
+    unawaited(_finishLongPress2x(allowLock: true));
+  }
+
+  void _handleLongPressCancel() {
+    unawaited(_finishLongPress2x(allowLock: false));
+  }
+
+  Future<void> _finishLongPress2x({required bool allowLock}) async {
+    if (!_longPress2xActive) return;
+    final locked = allowLock && _longPress2xLocked;
+    final restoreSpeed = _speedBeforeLongPress;
+    setState(() {
+      _longPress2xActive = false;
+      _longPress2xLocked = false;
+      _longPress2xProgress = 0.0;
+    });
+    if (locked) {
+      await _setSpeed(2.0);
+      if (mounted) {
+        _showOsd('已锁定 2.0x 倍速播放', icon: Icons.lock_rounded);
+      }
+    } else {
+      await _setSpeed(restoreSpeed);
+    }
+  }
+
   // ------------------------------------------------------------ 播放进度（续播）
 
   /// 媒体加载完成后跳到上次的播放位置（每个播放源只做一次）。
@@ -2654,14 +2788,38 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
     final isEffectiveLandscape = _isLandscape && (screenSize.width > screenSize.height);
     final isPortraitMobile = isMobilePlatform && !isEffectiveLandscape;
     final currentPosition = _scrubbing ? _scrubPosition : _position;
+    final audioEntries = _isAudioSource ? _resolveAudioStageEntries() : null;
     final content = Stack(
       fit: StackFit.expand,
       children: [
         Center(
           child: Video(controller: _controller, controls: NoVideoControls),
         ),
+        if (_isAudioSource)
+          Positioned.fill(
+            child: AudioStageView(
+              sourcePath: _sourcePath,
+              title: _title,
+              position: currentPosition,
+              duration: _duration,
+              playing: _playing,
+              primaryEntries: audioEntries?.primary,
+              secondaryEntries: audioEntries?.secondary,
+              forceWaveform: _audioForceWaveform,
+              onSeek: (target) {
+                final clamped = _duration > Duration.zero
+                    ? _clampDuration(target, Duration.zero, _duration)
+                    : target;
+                _player.seek(clamped);
+                if (mounted) {
+                  setState(() => _controlsVisible = true);
+                  _scheduleAutoHide();
+                }
+              },
+            ),
+          ),
         // 画面字幕叠加层（统一由 Flutter 渲染在视频画面上，主字幕在上、副字幕在下）
-        if (_hasAnyActiveSubtitle)
+        if (_hasAnyActiveSubtitle && !_isAudioSource)
           SubtitleOverlay(
             position: currentPosition,
             visible: true,
@@ -2677,6 +2835,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           visible: _controlsVisible,
           title: _title,
           isPflx: _sourceIsPflx,
+          isAudio: _isAudioSource,
           closeIcon: Icons.arrow_back_rounded,
           onClose: _closePlayer,
         ),
@@ -2686,7 +2845,7 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
         if (!isDesktopPlatform)
           Center(
             child: AnimatedOpacity(
-              opacity: _controlsVisible ? 1 : 0,
+              opacity: _controlsVisible ? 0.6 : 0,
               duration: const Duration(milliseconds: 180),
               child: IgnorePointer(
                 ignoring: !_controlsVisible,
@@ -2744,19 +2903,31 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
             ),
           ),
         if (_osdText != null) _PlayerOsd(text: _osdText!, icon: _osdIcon),
+        if (_longPress2xActive)
+          _LongPress2xIndicator(
+            progress: _longPress2xProgress,
+            locked: _longPress2xLocked,
+          ),
       ],
     );
 
+    final allowVerticalDrag = !isDesktopPlatform && !_isShowingAudioLyrics;
     final player = GestureDetector(
       behavior: HitTestBehavior.opaque,
       // 用 onTapUp 而不是 onTap：需要拿到点击位置来识别"双击画面"（桌面端切全屏）
       onTapUp: (details) => _handleSurfaceTap(details.globalPosition),
-      onVerticalDragStart: !isDesktopPlatform ? _handleVerticalDragStart : null,
-      onVerticalDragUpdate: !isDesktopPlatform
+      onLongPressStart: !isDesktopPlatform ? _handleLongPressStart : null,
+      onLongPressMoveUpdate: !isDesktopPlatform
+          ? _handleLongPressMoveUpdate
+          : null,
+      onLongPressEnd: !isDesktopPlatform ? _handleLongPressEnd : null,
+      onLongPressCancel: !isDesktopPlatform ? _handleLongPressCancel : null,
+      onVerticalDragStart: allowVerticalDrag ? _handleVerticalDragStart : null,
+      onVerticalDragUpdate: allowVerticalDrag
           ? _handleVerticalDragUpdate
           : null,
-      onVerticalDragEnd: !isDesktopPlatform ? _handleVerticalDragEnd : null,
-      onVerticalDragCancel: !isDesktopPlatform
+      onVerticalDragEnd: allowVerticalDrag ? _handleVerticalDragEnd : null,
+      onVerticalDragCancel: allowVerticalDrag
           ? _handleVerticalDragCancel
           : null,
       onHorizontalDragStart: !isDesktopPlatform
@@ -2855,6 +3026,25 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
             color: Colors.white,
           ),
         ),
+        // 音频模式下有激活字幕/歌词时，提供频谱 / 歌词视图快捷切换
+        if (_isAudioSource && _hasAnyActiveSubtitle)
+          IconButton(
+            constraints: iconConstraints,
+            padding: iconPadding,
+            visualDensity: visualDensity,
+            iconSize: iconSize,
+            onPressed: () {
+              setState(() => _audioForceWaveform = !_audioForceWaveform);
+              _showOsd(_audioForceWaveform ? '已切换到频谱视图' : '已切换到歌词视图');
+            },
+            tooltip: _audioForceWaveform ? '切换到歌词视图' : '切换到频谱视图',
+            icon: Icon(
+              _audioForceWaveform
+                  ? Icons.lyrics_outlined
+                  : Icons.equalizer_rounded,
+              color: Colors.white,
+            ),
+          ),
         // AI 字幕按钮（总开关打开时常驻可见，点击弹出控制面板）
         if (_aiFeatureEnabled)
           IconButton(
@@ -3049,6 +3239,21 @@ class _PlayerPageState extends State<PlayerPage> with WindowListener {
           ),
           onPressed: _showSubtitleSettingsSheet,
         ),
+        // 音频模式下有激活字幕/歌词时，提供频谱 / 歌词视图快捷切换
+        if (_isAudioSource && _hasAnyActiveSubtitle)
+          IconButton(
+            tooltip: _audioForceWaveform ? '切换到歌词视图' : '切换到频谱视图',
+            icon: Icon(
+              _audioForceWaveform
+                  ? Icons.lyrics_outlined
+                  : Icons.equalizer_rounded,
+              color: Colors.white,
+            ),
+            onPressed: () {
+              setState(() => _audioForceWaveform = !_audioForceWaveform);
+              _showOsd(_audioForceWaveform ? '已切换到频谱视图' : '已切换到歌词视图');
+            },
+          ),
         // 桌面端独立的 AI 字幕与翻译快捷按钮（只要启用了识别或翻译就显示）
         if (_aiFeatureEnabled)
           IconButton(
@@ -3178,7 +3383,7 @@ class _PlayerDropHint extends StatelessWidget {
             ),
             SizedBox(height: 16),
             Text(
-              '松开即可播放这个视频',
+              '松开即可播放该媒体文件',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 22,
@@ -3189,6 +3394,129 @@ class _PlayerDropHint extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// 移动端长按 2X 倍速与下滑锁定指示器：顶部居中圆环（仅显示 2X），随下滑距离填充白色描边；
+/// 底部进度条上方显示状态提示文案。
+class _LongPress2xIndicator extends StatelessWidget {
+  const _LongPress2xIndicator({
+    required this.progress,
+    required this.locked,
+  });
+
+  final double progress;
+  final bool locked;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: SafeArea(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            Align(
+              alignment: Alignment.topCenter,
+              child: Padding(
+                padding: const EdgeInsets.only(top: 20),
+                child: SizedBox(
+                  width: 64,
+                  height: 64,
+                  child: DecoratedBox(
+                    decoration: const BoxDecoration(
+                      color: Color(0xCC181822),
+                      shape: BoxShape.circle,
+                    ),
+                    child: CustomPaint(
+                      painter: _CircleStrokeProgressPainter(
+                        progress: progress,
+                      ),
+                      child: const Center(
+                        child: Text(
+                          '2X',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 19,
+                            fontWeight: FontWeight.w800,
+                            height: 1.0,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Align(
+              alignment: Alignment.bottomCenter,
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 48),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: const Color(0xCC181822),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 6,
+                    ),
+                    child: Text(
+                      locked ? '已锁定 2X 倍速' : '2X 倍速中 下滑锁定',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CircleStrokeProgressPainter extends CustomPainter {
+  const _CircleStrokeProgressPainter({required this.progress});
+
+  final double progress;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const strokeWidth = 3.2;
+    final center = size.center(Offset.zero);
+    final radius = (math.min(size.width, size.height) - strokeWidth) / 2;
+
+    final trackPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.22)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth;
+    canvas.drawCircle(center, radius, trackPaint);
+
+    final clamped = progress.clamp(0.0, 1.0);
+    if (clamped > 0) {
+      final activePaint = Paint()
+        ..color = Colors.white
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth
+        ..strokeCap = StrokeCap.round;
+      canvas.drawArc(
+        Rect.fromCircle(center: center, radius: radius),
+        -math.pi / 2,
+        2 * math.pi * clamped,
+        false,
+        activePaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _CircleStrokeProgressPainter oldDelegate) {
+    return oldDelegate.progress != progress;
   }
 }
 
@@ -3288,6 +3616,7 @@ class _PlayerTopBar extends StatelessWidget {
     required this.visible,
     required this.title,
     required this.isPflx,
+    this.isAudio = false,
     required this.closeIcon,
     required this.onClose,
   });
@@ -3295,6 +3624,7 @@ class _PlayerTopBar extends StatelessWidget {
   final bool visible;
   final String title;
   final bool isPflx;
+  final bool isAudio;
   final IconData closeIcon;
   final VoidCallback onClose;
 
@@ -3345,13 +3675,17 @@ class _PlayerTopBar extends StatelessWidget {
                               Icon(
                                 isPflx
                                     ? Icons.auto_awesome_rounded
-                                    : Icons.movie_outlined,
+                                    : (isAudio
+                                        ? Icons.audiotrack_outlined
+                                        : Icons.movie_outlined),
                                 color: const Color(0xFFD5D1FF),
                                 size: 13,
                               ),
                               const SizedBox(width: 4),
                               Text(
-                                isPflx ? 'PFLX 隐藏视频' : '本地视频',
+                                isPflx
+                                    ? 'PFLX 隐藏视频'
+                                    : (isAudio ? '本地音频' : '本地视频'),
                                 style: const TextStyle(
                                   color: Color(0xFFD5D1FF),
                                   fontSize: 12,

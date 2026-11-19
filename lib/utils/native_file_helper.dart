@@ -3,6 +3,69 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 
+const Set<String> kSupportedVideoExtensions = {
+  'mp4',
+  'mkv',
+  'mov',
+  'avi',
+  'flv',
+  'wmv',
+  'webm',
+  'ts',
+  'm4v',
+  '3gp',
+  'rmvb',
+  'f4v',
+  'mpg',
+  'mpeg',
+  'vob',
+  'ogv',
+  'm2ts',
+  'mts',
+  'divx',
+  'asf',
+  'rm',
+  'dat',
+  'h264',
+  'h265',
+  'hevc',
+};
+
+const Set<String> kSupportedAudioExtensions = {
+  'mp3',
+  'wav',
+  'flac',
+  'aac',
+  'm4a',
+  'ogg',
+  'opus',
+  'wma',
+  'ape',
+  'alac',
+  'aiff',
+  'amr',
+  'mka',
+};
+
+String? mediaExtensionOf(String path) {
+  final name = path.replaceAll('\\', '/').split('/').last;
+  final dotIndex = name.lastIndexOf('.');
+  if (dotIndex <= 0 || dotIndex >= name.length - 1) return null;
+  return name.substring(dotIndex + 1).toLowerCase();
+}
+
+bool isVideoPath(String path) {
+  final ext = mediaExtensionOf(path);
+  return ext != null && kSupportedVideoExtensions.contains(ext);
+}
+
+bool isAudioPath(String path) {
+  final ext = mediaExtensionOf(path);
+  return ext != null && kSupportedAudioExtensions.contains(ext);
+}
+
+bool isMediaPath(String path) => isVideoPath(path) || isAudioPath(path);
+
 class SelectedVideoFile {
   const SelectedVideoFile({
     required this.path,
@@ -39,7 +102,11 @@ abstract final class NativeFileHelper {
 
     // 默认 / 其他平台回退
     final files = await FilePicker.pickFiles(
-      type: FileType.video,
+      type: FileType.custom,
+      allowedExtensions: [
+        ...kSupportedVideoExtensions,
+        ...kSupportedAudioExtensions,
+      ],
     );
     if (files.isEmpty) return const [];
 

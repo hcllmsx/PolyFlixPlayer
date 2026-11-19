@@ -12,12 +12,14 @@ import '../main.dart';
 import '../settings/app_settings.dart';
 import '../settings/settings_page.dart';
 import '../utils/app_toast.dart';
+import '../utils/native_file_helper.dart';
 import 'device_capability.dart';
 import 'engine_pack.dart';
 import 'model_catalog_sheet.dart';
 import 'model_manager.dart';
 import 'subtitle_generator.dart';
 import 'translation/builtin_subtitle_extractor.dart';
+import 'translation/lrc_parser.dart';
 import 'translation/srt_parser.dart';
 import 'translation/translation_engine.dart';
 import 'translation/translation_service.dart';
@@ -36,6 +38,10 @@ enum SubtitleExportMode {
 /// 播放器几乎不会显示，用文本编辑器打开可见。
 const String kSrtHeaderComment =
     '本字幕由 影现播放器（PolyFlixPlayer）导出\n'
+    '作者B站：火车啦啦 https://space.bilibili.com/255947051';
+
+const String kLrcHeaderComment =
+    '本歌词由 影现播放器（PolyFlixPlayer）导出\n'
     '作者B站：火车啦啦 https://space.bilibili.com/255947051';
 
 class AiSubtitleSheet extends StatefulWidget {
@@ -118,6 +124,8 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
   /// PFLX 时它是 .pflx 文件路径（稳定），而 [AiSubtitleSheet.videoPath] 是
   /// 带随机端口的本次会话流地址 —— 拿后者当缓存键就再也找不到上次的缓存。
   String get _cacheKey => widget.cacheKey ?? widget.videoPath;
+
+  bool get _isAudio => isAudioPath(_cacheKey);
 
   String _selectedModel = aiAsrModelId.value;
   String _selectedLanguage = 'auto';
@@ -689,45 +697,51 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
     if (entries.isEmpty) return;
 
     try {
-      String srtContent;
+      final isAudio = _isAudio;
+      final ext = isAudio ? 'lrc' : 'srt';
+      String exportedContent;
       String dialogTitle;
       String suffix;
 
+      String serialize(bool bilingual, bool translationOnly) {
+        if (isAudio) {
+          return LrcParser.serialize(
+            entries,
+            bilingual: bilingual,
+            translationOnly: translationOnly,
+            headerComment: kLrcHeaderComment,
+          );
+        }
+        return SrtParser.serialize(
+          entries,
+          bilingual: bilingual,
+          translationOnly: translationOnly,
+          headerComment: kSrtHeaderComment,
+        );
+      }
+
       switch (mode) {
         case SubtitleExportMode.original:
-          srtContent = SrtParser.serialize(
-            entries,
-            bilingual: false,
-            translationOnly: false,
-            headerComment: kSrtHeaderComment,
-          );
-          dialogTitle = '导出原字幕 SRT 文件';
+          exportedContent = serialize(false, false);
+          dialogTitle = isAudio ? '导出原歌词 LRC 文件' : '导出原字幕 SRT 文件';
           suffix = 'original';
           break;
         case SubtitleExportMode.translated:
-          srtContent = SrtParser.serialize(
-            entries,
-            translationOnly: true,
-            headerComment: kSrtHeaderComment,
-          );
-          dialogTitle = '导出翻译字幕 SRT 文件';
+          exportedContent = serialize(false, true);
+          dialogTitle = isAudio ? '导出翻译歌词 LRC 文件' : '导出翻译字幕 SRT 文件';
           suffix = 'translated';
           break;
         case SubtitleExportMode.bilingual:
-          srtContent = SrtParser.serialize(
-            entries,
-            bilingual: true,
-            headerComment: kSrtHeaderComment,
-          );
-          dialogTitle = '导出双语 SRT 文件';
+          exportedContent = serialize(true, false);
+          dialogTitle = isAudio ? '导出双语歌词 LRC 文件' : '导出双语 SRT 文件';
           suffix = 'bilingual';
           break;
       }
 
-      final srtBytes = Uint8List.fromList(utf8.encode(srtContent));
+      final exportedBytes = Uint8List.fromList(utf8.encode(exportedContent));
 
       // 提取建议的导出文件名
-      String baseName = 'subtitle';
+      String baseName = isAudio ? 'lyric' : 'subtitle';
       if (widget.videoTitle != null && widget.videoTitle!.trim().isNotEmpty) {
         baseName = widget.videoTitle!
             .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
@@ -740,14 +754,14 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
         baseName = dotIdx > 0 ? base.substring(0, dotIdx) : base;
       }
 
-      final defaultName = '${baseName}_$suffix.srt';
+      final defaultName = '${baseName}_$suffix.$ext';
 
       final savedUri = await FilePicker.saveFile(
         dialogTitle: dialogTitle,
         fileName: defaultName,
-        bytes: srtBytes,
+        bytes: exportedBytes,
         type: FileType.custom,
-        allowedExtensions: ['srt'],
+        allowedExtensions: [ext],
       );
 
       if (savedUri == null) return; // 用户取消
@@ -760,7 +774,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
       }
 
       if (mounted) {
-        AppToast.show(context, '已成功导出字幕至：$displayPath');
+        AppToast.show(
+          context,
+          isAudio ? '已成功导出歌词至：$displayPath' : '已成功导出字幕至：$displayPath',
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -2001,7 +2018,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               ),
               onPressed: () => _exportSrt(SubtitleExportMode.original),
               icon: const Icon(Icons.file_download_outlined, size: 15),
-              label: const Text('导出原字幕', style: TextStyle(fontSize: 12)),
+              label: Text(
+                _isAudio ? '导出原歌词 (LRC)' : '导出原字幕',
+                style: const TextStyle(fontSize: 12),
+              ),
             ),
           ] else ...[
             OutlinedButton.icon(
@@ -2013,7 +2033,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               ),
               onPressed: () => _exportSrt(SubtitleExportMode.original),
               icon: const Icon(Icons.file_download_outlined, size: 15),
-              label: const Text('导出原字幕', style: TextStyle(fontSize: 12)),
+              label: Text(
+                _isAudio ? '导出原歌词 (LRC)' : '导出原字幕',
+                style: const TextStyle(fontSize: 12),
+              ),
             ),
             OutlinedButton.icon(
               style: OutlinedButton.styleFrom(
@@ -2024,7 +2047,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               ),
               onPressed: () => _exportSrt(SubtitleExportMode.translated),
               icon: const Icon(Icons.file_download_outlined, size: 15),
-              label: const Text('导出翻译字幕', style: TextStyle(fontSize: 12)),
+              label: Text(
+                _isAudio ? '导出翻译歌词 (LRC)' : '导出翻译字幕',
+                style: const TextStyle(fontSize: 12),
+              ),
             ),
             OutlinedButton.icon(
               style: OutlinedButton.styleFrom(
@@ -2035,7 +2061,10 @@ class _AiSubtitleSheetState extends State<AiSubtitleSheet> {
               ),
               onPressed: () => _exportSrt(SubtitleExportMode.bilingual),
               icon: const Icon(Icons.file_download_outlined, size: 15),
-              label: const Text('导出双语字幕', style: TextStyle(fontSize: 12)),
+              label: Text(
+                _isAudio ? '导出双语歌词 (LRC)' : '导出双语字幕',
+                style: const TextStyle(fontSize: 12),
+              ),
             ),
           ],
 

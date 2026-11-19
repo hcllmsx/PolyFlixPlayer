@@ -25,41 +25,6 @@ import '../utils/native_file_helper.dart';
 import '../utils/platform_utils.dart';
 import 'ai_task_panel.dart';
 
-const Set<String> _kSupportedVideoExtensions = {
-  'mp4',
-  'mkv',
-  'mov',
-  'avi',
-  'flv',
-  'wmv',
-  'webm',
-  'ts',
-  'm4v',
-  '3gp',
-  'rmvb',
-  'f4v',
-  'mpg',
-  'mpeg',
-  'vob',
-  'ogv',
-  'm2ts',
-  'mts',
-  'divx',
-  'asf',
-  'rm',
-  'dat',
-  'h264',
-  'h265',
-  'hevc',
-};
-
-bool _isVideoPath(String path) {
-  final dotIndex = path.lastIndexOf('.');
-  if (dotIndex < 0 || dotIndex >= path.length - 1) return false;
-  final ext = path.substring(dotIndex + 1).toLowerCase();
-  return _kSupportedVideoExtensions.contains(ext);
-}
-
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -218,11 +183,11 @@ class _HomePageState extends State<HomePage> {
       final files = await NativeFileHelper.pickVideos();
       if (files.isEmpty) return;
 
-      int skippedNonVideo = 0;
+      int skippedUnsupported = 0;
       final selections = <_LibraryItem>[];
       for (final file in files) {
-        if (!_isVideoPath(file.path)) {
-          skippedNonVideo++;
+        if (!isMediaPath(file.path)) {
+          skippedUnsupported++;
           continue;
         }
         final info = scan(file.path);
@@ -241,8 +206,8 @@ class _HomePageState extends State<HomePage> {
 
       if (!mounted) return;
 
-      if (selections.isEmpty && skippedNonVideo > 0) {
-        _showTip('仅支持导入视频文件（如 MP4、MKV、MOV 等格式）。');
+      if (selections.isEmpty && skippedUnsupported > 0) {
+        _showTip('仅支持导入视频或音频文件（如 MP4、MKV、MP3、FLAC 等格式）。');
         return;
       }
       if (selections.isEmpty) return;
@@ -256,16 +221,16 @@ class _HomePageState extends State<HomePage> {
         if (autoOpen) {
           _open(selections.first);
         } else {
-          _showTip('所选视频已在你的媒体库中。');
+          _showTip('所选文件已在你的媒体库中。');
         }
         return;
       }
       setState(() => _items.insertAll(0, freshItems));
       await _LibraryStorage.save(_items);
 
-      final notice = skippedNonVideo > 0
-          ? '已跳过非视频文件，添加了 ${freshItems.length} 个视频。'
-          : '已添加 ${freshItems.length} 个视频。';
+      final notice = skippedUnsupported > 0
+          ? '已跳过不支持的文件，添加了 ${freshItems.length} 个媒体文件。'
+          : '已添加 ${freshItems.length} 个媒体文件。';
 
       if (autoOpen) {
         // 自动直接打开播放时不在首页弹底部 SnackBar（避免飘到播放页底部遮挡控制按钮），
@@ -284,8 +249,8 @@ class _HomePageState extends State<HomePage> {
   /// 拖放打开：拖进窗口的文件立即播放。
   void _openDroppedFile(String path) {
     final name = path.replaceAll('\\', '/').split('/').last;
-    if (!_isVideoPath(path)) {
-      _showTip('仅支持视频文件：$name');
+    if (!isMediaPath(path)) {
+      _showTip('仅支持视频或音频文件：$name');
       return;
     }
     _playPath(path, name);
@@ -551,7 +516,7 @@ class _HomePageState extends State<HomePage> {
               const Divider(),
               ListTile(
                 leading: const Icon(Icons.play_circle_outline_rounded),
-                title: const Text('播放视频'),
+                title: Text(isAudioPath(item.path) ? '播放音频' : '播放视频'),
                 onTap: () {
                   Navigator.of(ctx).pop();
                   _open(item);
@@ -881,7 +846,7 @@ class _HomePageState extends State<HomePage> {
                 ),
                 const SizedBox(height: 18),
                 Text(
-                  '拖拽视频到此处播放',
+                  '拖拽视频或音频到此处播放',
                   style: TextStyle(
                     fontSize: 20,
                     fontWeight: FontWeight.w700,
@@ -890,7 +855,7 @@ class _HomePageState extends State<HomePage> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  '或点击此处选择本地视频',
+                  '或点击此处选择本地视频或音频',
                   style: TextStyle(
                     fontSize: 13,
                     color: scheme.onSurfaceVariant,
@@ -901,7 +866,7 @@ class _HomePageState extends State<HomePage> {
                 FilledButton.tonalIcon(
                   onPressed: () => _pickFiles(),
                   icon: const Icon(Icons.file_open_rounded, size: 18),
-                  label: const Text('选择视频文件'),
+                  label: const Text('选择媒体文件'),
                 ),
               ],
             ),
@@ -947,7 +912,7 @@ class _HomePageState extends State<HomePage> {
               ),
               IconButton(
                 icon: const Icon(Icons.add_rounded),
-                tooltip: '添加视频',
+                tooltip: '添加媒体文件',
                 onPressed: _scanning ? null : () => _pickFiles(),
               ),
               IconButton(
@@ -988,7 +953,7 @@ class _HomePageState extends State<HomePage> {
                               OutlinedButton.icon(
                                 onPressed: () => _pickFiles(),
                                 icon: const Icon(Icons.add_rounded, size: 18),
-                                label: const Text('添加视频'),
+                                label: const Text('添加媒体文件'),
                               ),
                             ],
                           ),
@@ -1223,7 +1188,7 @@ class _DropHintOverlay extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Text(
-                '支持拖入单个视频文件，PFLX 产物会自动识别',
+                '支持拖入视频或音频文件，PFLX 产物会自动识别',
                 style: TextStyle(color: scheme.onSurfaceVariant),
               ),
             ],
@@ -1357,7 +1322,7 @@ class _EmptyLibrary extends StatelessWidget {
             FilledButton.icon(
               onPressed: onPickFiles,
               icon: const Icon(Icons.folder_open_rounded),
-              label: const Text('选择视频文件'),
+              label: const Text('选择媒体文件'),
             ),
           ],
         ),
@@ -1594,10 +1559,11 @@ class _VideoThumbnailBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isPflx = item.isPflx;
+    final isAudio = !isPflx && isAudioPath(item.path);
     final dotIndex = item.name.lastIndexOf('.');
     final ext = (dotIndex >= 0 && dotIndex < item.name.length - 1)
         ? item.name.substring(dotIndex + 1).toUpperCase()
-        : 'VIDEO';
+        : (isAudio ? 'AUDIO' : 'VIDEO');
 
     if (isPflx) {
       return Container(
@@ -1629,6 +1595,14 @@ class _VideoThumbnailBadge extends StatelessWidget {
     }
 
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final gradientColors = isAudio
+        ? (isDark
+              ? const [Color(0xFF312E5E), Color(0xFF1F2B47)]
+              : const [Color(0xFFE0E7FF), Color(0xFFDDD6FE)])
+        : (isDark
+              ? const [Color(0xFF283046), Color(0xFF1B2234)]
+              : const [Color(0xFFE2E8F0), Color(0xFFCBD5E1)]);
+
     return Container(
       width: 54,
       height: 54,
@@ -1636,9 +1610,7 @@ class _VideoThumbnailBadge extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: isDark
-              ? const [Color(0xFF283046), Color(0xFF1B2234)]
-              : const [Color(0xFFE2E8F0), Color(0xFFCBD5E1)],
+          colors: gradientColors,
         ),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
@@ -1649,8 +1621,10 @@ class _VideoThumbnailBadge extends StatelessWidget {
         alignment: Alignment.center,
         children: [
           Icon(
-            Icons.smart_display_rounded,
-            color: isDark ? const Color(0xFF94A3B8) : const Color(0xFF475569),
+            isAudio ? Icons.audiotrack_rounded : Icons.smart_display_rounded,
+            color: isAudio
+                ? (isDark ? const Color(0xFFC4B5FD) : const Color(0xFF4F46E5))
+                : (isDark ? const Color(0xFF94A3B8) : const Color(0xFF475569)),
             size: 28,
           ),
           Positioned(

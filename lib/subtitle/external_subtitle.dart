@@ -30,11 +30,12 @@ import 'package:media_kit/media_kit.dart';
 
 import '../utils/native_file_helper.dart';
 import 'subtitle_generator.dart';
+import 'translation/lrc_parser.dart';
 import 'translation/srt_parser.dart';
 
 /// 支持的外挂字幕扩展名（小写，不含点）。
 ///
-/// - 文本类：`srt` / `vtt`
+/// - 文本类：`srt` / `vtt` / `lrc`
 /// - 特效类：`ass` / `ssa`
 /// - 图形类：`sup`（蓝光 PGS）/ `idx`（VobSub 索引，配合同名 `.sub`）
 ///   / `sub`（VobSub 数据，也可能是 MicroDVD 文本，统一按 mpv 原生渲染处理）
@@ -43,6 +44,7 @@ const Set<String> kExternalSubtitleExtensions = {
   'ass',
   'ssa',
   'vtt',
+  'lrc',
   'sup',
   'idx',
   'sub',
@@ -144,12 +146,35 @@ abstract final class ExternalSubtitleLoader {
       throw const ExternalSubtitleException('字幕文件不存在或已被移动');
     }
 
+    final ext = extensionOf(path);
+
     // 1. 快路径：UTF-8 的 .srt 直接本地解析，不外呼 ffmpeg（瞬时完成）。
     //    .vtt 不走这条：它的时间戳尾随 `align:middle` 之类的设置，交给 ffmpeg 更稳。
-    if (extensionOf(path) == 'srt') {
+    if (ext == 'srt') {
       final text = _tryDecodeUtf8(await file.readAsBytes());
       if (text != null) {
         final entries = _clean(SrtParser.parse(text));
+        if (entries.isNotEmpty) return applyOffset(entries, offset);
+      }
+    }
+
+    // 1.5 LRC 歌词快路径：支持 UTF-8（含 BOM）与 UTF-16（含 BOM），
+    //     其它编码走 ffmpeg 转 UTF-8 LRC（回退 SRT）以兼容 GBK/Big5。
+    if (ext == 'lrc') {
+      final bytes = await file.readAsBytes();
+      final decoded = _tryDecodeUtf8(bytes) ?? _tryDecodeUtf16(bytes);
+      if (decoded != null) {
+        final entries = _clean(LrcParser.parse(decoded));
+        if (entries.isNotEmpty) return applyOffset(entries, offset);
+      }
+      final converted = await _convertToUtf8(
+        input: path,
+        outputFormat: 'lrc',
+        outputExtension: 'lrc',
+      );
+      if (converted != null) {
+        final lrcText = await File(converted).readAsString();
+        final entries = _clean(LrcParser.parse(lrcText));
         if (entries.isNotEmpty) return applyOffset(entries, offset);
       }
     }
@@ -285,9 +310,15 @@ abstract final class ExternalSubtitleLoader {
         matches.add((rank: rank, path: entity.path));
       }
 
+      final preferLrc = isAudioPath(videoPath);
       matches.sort((a, b) {
         final byRank = a.rank.compareTo(b.rank);
         if (byRank != 0) return byRank;
+        if (preferLrc) {
+          final aIsLrc = extensionOf(a.path) == 'lrc';
+          final bIsLrc = extensionOf(b.path) == 'lrc';
+          if (aIsLrc != bIsLrc) return aIsLrc ? -1 : 1;
+        }
         return a.path.toLowerCase().compareTo(b.path.toLowerCase());
       });
       return matches.take(limit).map((m) => m.path).toList(growable: false);
@@ -336,6 +367,23 @@ abstract final class ExternalSubtitleLoader {
     } catch (_) {
       return null;
     }
+  }
+
+  /// 基于 BOM 的 UTF-16 LE / BE 解码；非 UTF-16 返回 null。
+  static String? _tryDecodeUtf16(List<int> bytes) {
+    if (bytes.length < 2) return null;
+    final isLe = bytes[0] == 0xFF && bytes[1] == 0xFE;
+    final isBe = bytes[0] == 0xFE && bytes[1] == 0xFF;
+    if (!isLe && !isBe) return null;
+
+    final codeUnits = <int>[];
+    for (var i = 2; i + 1 < bytes.length; i += 2) {
+      final unit = isLe
+          ? (bytes[i] | (bytes[i + 1] << 8))
+          : ((bytes[i] << 8) | bytes[i + 1]);
+      codeUnits.add(unit);
+    }
+    return String.fromCharCodes(codeUnits);
   }
 
   /// 剥掉 ASS 覆盖标签（`{\an8}` / `{\pos(..)}`）、常见 HTML 标签（`<i>` 等），

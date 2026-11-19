@@ -23,6 +23,9 @@ abstract final class UpdateChecker {
   static const String releaseUrl =
       'https://github.com/hcllmsx/PolyFlixPlayer/releases';
 
+  /// 官网（与影藏 PolyFlix 共用）。
+  static const String officialUrl = 'https://polyflix.sxrec.com/';
+
   static Future<String> getLocalVersion() async {
     try {
       final text = await rootBundle.loadString('VERSION');
@@ -96,28 +99,34 @@ class ForceUpdateDialog extends StatefulWidget {
 }
 
 class _ForceUpdateDialogState extends State<ForceUpdateDialog> {
-  /// 是否处于"复制兜底"状态：系统浏览器打开发布页失败时，退回复制地址到
+  /// 是否处于"复制兜底"状态：系统浏览器打开链接失败时，退回复制地址到
   /// 剪贴板，并临时把按钮文字换成复制成功的反馈。
+  /// [_lastFallbackUrl] 记录进入兜底状态的是哪个按钮的链接，用于还原按钮文案。
   bool _copyFallback = false;
+  String? _lastFallbackUrl;
   Timer? _resetTimer;
 
-  /// 「前往下载」：优先调用系统默认浏览器直接打开发布页；
+  /// 「前往下载 / 前往官网」：优先调用系统默认浏览器直接打开对应页面；
   /// 打开失败（无默认浏览器关联、被拦截等）才退回复制地址。
   ///
   /// 反馈不能走 SnackBar：本弹窗挂在 Navigator 的 root overlay 上，蒙版
   /// 层级天然高于 ScaffoldMessenger 的 SnackBar（Windows / Android 一致），
   /// 提示会被黑色蒙版盖住，所以反馈直接画在按钮文字上。
-  Future<void> _openDownload() async {
-    final uri = Uri.parse(UpdateChecker.releaseUrl);
+  ///
+  /// [url] 要打开的链接；[fallbackLabel] 为空串表示该按钮没有复制兜底状态
+  /// （官网按钮），否则进入复制兜底并临时显示该文案。
+  Future<void> _openUrl(String url, {String fallbackLabel = ''}) async {
+    final uri = Uri.parse(url);
     var opened = false;
     try {
       opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
     } catch (_) {
       opened = false;
     }
-    if (opened || !mounted) return;
+    if (opened || !mounted || fallbackLabel.isEmpty) return;
 
-    Clipboard.setData(ClipboardData(text: UpdateChecker.releaseUrl));
+    _lastFallbackUrl = url;
+    Clipboard.setData(ClipboardData(text: url));
     setState(() => _copyFallback = true);
     _resetTimer?.cancel();
     _resetTimer = Timer(const Duration(seconds: 2), () {
@@ -203,9 +212,23 @@ class _ForceUpdateDialogState extends State<ForceUpdateDialog> {
               ),
               const SizedBox(width: 12),
               Expanded(
+                child: OutlinedButton(
+                  onPressed: () => _openUrl(UpdateChecker.officialUrl),
+                  child: const Text('前往官网'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
                 child: FilledButton(
-                  onPressed: _openDownload,
-                  child: Text(_copyFallback ? '已复制地址 ✓' : '前往下载'),
+                  onPressed: () => _openUrl(
+                    UpdateChecker.releaseUrl,
+                    fallbackLabel: '已复制地址 ✓',
+                  ),
+                  child: Text(
+                    _copyFallback && _lastFallbackUrl == UpdateChecker.releaseUrl
+                        ? '已复制地址 ✓'
+                        : '前往 GitHub',
+                  ),
                 ),
               ),
             ],
