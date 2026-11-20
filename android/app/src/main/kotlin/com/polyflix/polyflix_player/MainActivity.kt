@@ -278,10 +278,11 @@ class MainActivity : FlutterActivity() {
             for (uri in uris) {
                 val realPath = UriUtils.getPath(this, uri)
                 val fileName = UriUtils.getFileName(this, uri, realPath)
-                if (realPath != null && File(realPath).exists()) {
+                if (realPath != null && UriUtils.isReadableFile(realPath)) {
                     results.add(mapOf("path" to realPath, "name" to fileName))
                 } else {
-                    // Fallback to file_picker style only if real path cannot be resolved
+                    // 真实路径无法解析或无权直读（如 Android 13+ FUSE 拦截未授权音频）时，
+                    // 利用 SAF 临时授权拷入应用私有缓存目录兜底
                     val copyPath = UriUtils.copyToCacheIfNeeded(this, uri, fileName)
                     if (copyPath != null) {
                         results.add(mapOf("path" to copyPath, "name" to fileName))
@@ -450,14 +451,29 @@ object UriUtils {
         return name
     }
 
+    fun isReadableFile(path: String): Boolean {
+        return try {
+            val file = File(path)
+            if (!file.exists() || !file.isFile || !file.canRead()) return false
+            // Android 11+ FUSE 下 exists()/canRead() 仍可能放行，必须实际打开校验可读性
+            file.inputStream().use { it.read() }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun copyToCacheIfNeeded(context: Context, uri: Uri, fileName: String): String? {
         return try {
-            val cacheFolder = File(context.cacheDir, "picked_media")
+            val uriHash = uri.toString().hashCode().toUInt().toString(16).padStart(8, '0')
+            val safeName = File(fileName).name.ifEmpty { "media_${System.currentTimeMillis()}" }
+            val cacheFolder = File(File(context.cacheDir, "picked_media"), uriHash)
             if (!cacheFolder.exists()) cacheFolder.mkdirs()
-            val targetFile = File(cacheFolder, fileName)
-            context.contentResolver.openInputStream(uri)?.use { input ->
+            val targetFile = File(cacheFolder, safeName)
+            val input = context.contentResolver.openInputStream(uri) ?: return null
+            input.use { stream ->
                 targetFile.outputStream().use { output ->
-                    input.copyTo(output)
+                    stream.copyTo(output)
                 }
             }
             targetFile.absolutePath

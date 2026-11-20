@@ -3,8 +3,9 @@
     <!-- 本地回环 HTTP 服务（流式播放隐藏视频）需要联网权限与明文流量放行 -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
-    <!-- 安卓 13+ 媒体视频读取 -->
+    <!-- 安卓 13+ 媒体视频与音频读取 -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
     <!-- 安卓 12- 外部存储读取与写入 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
