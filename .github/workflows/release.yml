@@ -53,15 +53,13 @@ jobs:
             '> 抱歉以网盘形式发布，希望这是暂时的。转存至网盘能为我带来一点微薄收益以维持项目更新，感谢理解。指着这个吃饭是不够的，但每周能买一包泡面是可以的。万一如果有多的，那都用来充 TOKEN 啦。',
             '',
             '<p align="center">',
-            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer.svg`" width=`"200`" alt=`"夸克网盘下载二维码（Windows 版）`" />",
-            '  &nbsp;&nbsp;&nbsp;&nbsp;',
-            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer-Android.svg`" width=`"200`" alt=`"夸克网盘下载二维码（Android 版）`" />",
-            '</p>',
-            '',
-            '<p align="center">',
-            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer-ggml.svg`" width=`"200`" alt=`"夸克网盘下载二维码（AI 语音模型 ggml）`" />",
-            '  &nbsp;&nbsp;&nbsp;&nbsp;',
-            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer-whisper_cpp.svg`" width=`"200`" alt=`"夸克网盘下载二维码（识别引擎 whisper.cpp）`" />",
+            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer.svg`" width=`"180`" alt=`"夸克网盘下载二维码（Windows 版）`" />",
+            '  &nbsp;&nbsp;',
+            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer-Android.svg`" width=`"180`" alt=`"夸克网盘下载二维码（Android 版）`" />",
+            '  &nbsp;&nbsp;',
+            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer-ggml.svg`" width=`"180`" alt=`"夸克网盘下载二维码（AI 语音模型 ggml）`" />",
+            '  &nbsp;&nbsp;',
+            "  <img src=`"https://raw.githubusercontent.com/$repo/main/docs/media/qr-quark-PolyFlixPlayer-whisper_cpp.svg`" width=`"180`" alt=`"夸克网盘下载二维码（识别引擎 whisper.cpp）`" />",
             '</p>'
           )
           $finalNotes = $bodyLines -join [Environment]::NewLine
