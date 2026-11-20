@@ -38,11 +38,11 @@ enum SubtitleExportMode {
 /// 播放器几乎不会显示，用文本编辑器打开可见。
 const String kSrtHeaderComment =
     '本字幕由 影现播放器（PolyFlixPlayer）导出\n'
-    '作者B站：火车啦啦 https://space.bilibili.com/255947051';
+    '作者B站：莫莫先生 https://space.bilibili.com/255947051';
 
 const String kLrcHeaderComment =
     '本歌词由 影现播放器（PolyFlixPlayer）导出\n'
-    '作者B站：火车啦啦 https://space.bilibili.com/255947051';
+    '作者B站：莫莫先生 https://space.bilibili.com/255947051';
 
 class AiSubtitleSheet extends StatefulWidget {
   const AiSubtitleSheet({

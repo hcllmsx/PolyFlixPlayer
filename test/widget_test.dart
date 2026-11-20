@@ -9,6 +9,6 @@ void main() {
 
     // 主页标题与主文案应存在
     expect(find.text('影现播放器'), findsWidgets);
-    expect(find.text('一个特殊的万能视频播放器'), findsOneWidget);
+    expect(find.text('一个特殊的万能播放器'), findsOneWidget);
   });
 }

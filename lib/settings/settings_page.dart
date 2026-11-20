@@ -565,7 +565,7 @@ class _SettingsPageState extends State<SettingsPage> {
         const SizedBox(height: 24),
         Center(
           child: Text(
-            'PolyFlixPlayer · by hcllmsx\n一个"会识别自己人"的万能视频播放器',
+            'PolyFlixPlayer · by 莫莫先生\n一个"会识别自己人"的万能播放器',
             textAlign: TextAlign.center,
             style: TextStyle(
               color: scheme.onSurfaceVariant.withValues(alpha: .7),

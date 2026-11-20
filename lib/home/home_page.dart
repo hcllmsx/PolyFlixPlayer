@@ -135,15 +135,18 @@ class _HomePageState extends State<HomePage> {
   Future<void> _silentCheckUpdate() async {
     try {
       final current = await UpdateChecker.getLocalVersion();
-      final remote = await UpdateChecker.fetchRemoteVersion();
-      if (!mounted || remote == null) return;
-      if (UpdateChecker.isNewerVersion(remote, current)) {
+      final latest = await UpdateChecker.fetchLatestRelease();
+      if (!mounted || latest == null) return;
+      if (UpdateChecker.isNewerVersion(latest.version, current)) {
         if (!mounted) return;
         showDialog<void>(
           context: context,
           barrierDismissible: false,
-          builder: (_) =>
-              ForceUpdateDialog(remoteVersion: remote, currentVersion: current),
+          builder: (_) => ForceUpdateDialog(
+            remoteVersion: latest.version,
+            currentVersion: current,
+            releaseNotes: latest.notes,
+          ),
         );
       }
     } catch (_) {}
@@ -1313,7 +1316,7 @@ class _EmptyLibrary extends StatelessWidget {
             ),
             const SizedBox(height: 20),
             Text(
-              '一个特殊的万能视频播放器',
+              '一个特殊的万能播放器',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleLarge
                   ?.copyWith(fontWeight: FontWeight.w700),

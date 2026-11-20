@@ -49,18 +49,22 @@ class _AboutPageState extends State<AboutPage> {
     setState(() => _checkingUpdate = true);
 
     try {
-      final remoteVersion = await UpdateChecker.fetchRemoteVersion();
+      final latest = await UpdateChecker.fetchLatestRelease();
       if (!mounted) return;
 
-      if (remoteVersion == null || remoteVersion.isEmpty) {
-        _showUpdateDialog(title: '检查更新', content: '未检测到新版本或暂未发布更新。');
-      } else if (UpdateChecker.isNewerVersion(remoteVersion, _currentVersion)) {
+      if (latest == null) {
+        _showUpdateDialog(
+          title: '检查更新',
+          content: '检查更新失败，请检查网络或前往 Release 页面查看最新版本。',
+        );
+      } else if (UpdateChecker.isNewerVersion(latest.version, _currentVersion)) {
         showDialog<void>(
           context: context,
           barrierDismissible: false,
           builder: (_) => ForceUpdateDialog(
-            remoteVersion: remoteVersion,
+            remoteVersion: latest.version,
             currentVersion: _currentVersion,
+            releaseNotes: latest.notes,
           ),
         );
       } else {
@@ -71,7 +75,10 @@ class _AboutPageState extends State<AboutPage> {
       }
     } catch (_) {
       if (mounted) {
-        _showUpdateDialog(title: '检查更新', content: '连接更新服务器失败，请检查网络后重试。');
+        _showUpdateDialog(
+          title: '检查更新',
+          content: '检查更新失败，请检查网络或前往 Release 页面查看最新版本。',
+        );
       }
     } finally {
       if (mounted) setState(() => _checkingUpdate = false);
@@ -130,7 +137,7 @@ class _AboutPageState extends State<AboutPage> {
           fit: BoxFit.cover,
         ),
       ),
-      applicationLegalese: 'PolyFlixPlayer · by hcllmsx\n本项目基于 GPL-3.0 协议开源',
+      applicationLegalese: 'PolyFlixPlayer · by 莫莫先生\n本项目基于 GPL-3.0 协议开源',
     );
   }
 
@@ -213,7 +220,7 @@ class _AboutPageState extends State<AboutPage> {
                 ListTile(
                   leading: const Icon(Icons.person_outline_rounded),
                   title: const Text('联系作者'),
-                  subtitle: const Text('bilibili 火车啦啦'),
+                  subtitle: const Text('bilibili 莫莫先生'),
                   trailing: const Icon(Icons.open_in_new_rounded, size: 18),
                   onTap: () => _openUrl('https://space.bilibili.com/255947051'),
                 ),
@@ -223,7 +230,7 @@ class _AboutPageState extends State<AboutPage> {
           const SizedBox(height: 24),
           Center(
             child: Text(
-              'PolyFlixPlayer · by hcllmsx\n一个"会识别自己人"的万能视频播放器',
+              'PolyFlixPlayer · by 莫莫先生\n一个"会识别自己人"的万能播放器',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: scheme.onSurfaceVariant.withValues(alpha: .7),

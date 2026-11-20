@@ -24,15 +24,11 @@ class NetdiskLink {
   final String url;
 }
 
-/// 语音模型（ggml-*.bin）的网盘；两个盘内容一样，挑一个下载就行。
+/// 语音模型（ggml-*.bin）的网盘。
 const List<NetdiskLink> kModelNetdiskLinks = [
   NetdiskLink(
     name: '夸克网盘',
     url: 'https://pan.quark.cn/s/f140317c7abf',
-  ),
-  NetdiskLink(
-    name: '百度网盘',
-    url: 'https://pan.baidu.com/s/5S3hOE8dHoWEAih3wefTYWg',
   ),
 ];
 
@@ -41,9 +37,5 @@ const List<NetdiskLink> kEngineNetdiskLinks = [
   NetdiskLink(
     name: '夸克网盘',
     url: 'https://pan.quark.cn/s/0f91d08f5084',
-  ),
-  NetdiskLink(
-    name: '百度网盘',
-    url: 'https://pan.baidu.com/s/5SfBHQP5hgMRtbHlkbG3vZw',
   ),
 ];

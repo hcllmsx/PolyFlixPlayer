@@ -50,6 +50,7 @@ build/
 **/build/
 dist/
 **/dist/
+out_put/
 /coverage/
 
 # Android related
